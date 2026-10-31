@@ -29,6 +29,10 @@ interface Paper {
         get() = false
     val refreshArticleWhenBylineMissing: Boolean
         get() = false
+    val articleFontFamily: String
+        get() = "Georgia, serif"
+    val articleTextDirection: String
+        get() = "ltr"
 
     fun articleImageDetailTarget(storyId: String): String? = null
     fun inlineArticleImageTarget(articleId: String, imageIndex: Int): String? = null
@@ -238,6 +242,8 @@ private class JangLahorePaper : Paper {
     override val supportsInlineArticleImages = true
     override val requiresPageVerification = true
     override val refreshArticleWhenBylineMissing = true
+    override val articleFontFamily = "'AliNastaliq', serif"
+    override val articleTextDirection = "rtl"
     override val backgroundJob = PaperBackgroundJob(
         periodicJobId = 2843,
         nineAmJobId = 2844,

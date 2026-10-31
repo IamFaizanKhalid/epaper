@@ -149,10 +149,25 @@ class WebPaperViewer : PaperViewer {
                 <a class="image-button" href="${escape(target)}">Display as image</a>
             """.trimIndent()
         }.orEmpty()
+        val fontFace = if (paper.articleFontFamily.contains("AliNastaliq")) {
+            """
+                @font-face{font-family:'AliNastaliq';src:url('file:///android_asset/fonts/ali_nastaliq.woff') format('woff');font-weight:400;font-style:normal}
+            """.trimIndent()
+        } else {
+            ""
+        }
+        val articleTypography = if (paper.articleTextDirection == "rtl") {
+            "font:22px/2.1 ${paper.articleFontFamily};"
+        } else {
+            "font:18px/1.65 ${paper.articleFontFamily};"
+        }
+        val headingLineHeight = if (paper.articleTextDirection == "rtl") "1.8" else "1.2"
         return """
             <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-            <style>body{max-width:760px;margin:24px auto;padding:0 20px;font:18px/1.65 Georgia,serif;color:#222}
-            h1{font-size:30px;line-height:1.2}.byline{color:#666;font:14px Arial,sans-serif;margin:12px 0 24px}
+            <style>$fontFace
+            body{max-width:760px;margin:24px auto;padding:0 20px;$articleTypography color:#222;
+            direction:${paper.articleTextDirection};text-align:start}
+            h1{font-size:30px;line-height:$headingLineHeight}.byline{color:#666;font-size:.85em;margin:12px 0 24px}
             p{margin:0 0 1em}img{display:block;max-width:100%;height:auto;margin:20px auto}
             .image-button{display:inline-block;margin:8px 0 18px;padding:10px 16px;
             border-radius:4px;background:#244d70;color:#fff;text-decoration:none;font:14px Arial,sans-serif}
