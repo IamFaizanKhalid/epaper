@@ -52,6 +52,11 @@ class DailyEditionCheckJobService : JobService() {
                 }
             }
         }
+        if (!NewspaperAvailability.checksAreAllowed(today)) {
+            scheduleNineAmCheck(this)
+            jobFinished(params, false)
+            return false
+        }
 
         val browser = WebView(this)
         webView = browser
@@ -187,12 +192,37 @@ class DailyEditionCheckJobService : JobService() {
 
     companion object {
         private const val JOB_ID = 2841
+        private const val NINE_AM_JOB_ID = 2842
         private const val INTERVAL_MILLIS = 15 * 60 * 1000L
         private const val CHANNEL_ID = "newspaper_availability"
         private const val NOTIFICATION_ID = 2841
         private const val PREFERENCES = "newspaper_check"
         private const val TAG = "DailyEditionCheck"
         private val DATE_FORMAT = SimpleDateFormat("dd_MM_yyyy", Locale.US)
+
+        private fun scheduleNineAmCheck(context: Context) {
+            val now = Calendar.getInstance()
+            val nextCheck = (now.clone() as Calendar).apply {
+                set(Calendar.HOUR_OF_DAY, 9)
+                set(Calendar.MINUTE, 0)
+                set(Calendar.SECOND, 0)
+                set(Calendar.MILLISECOND, 0)
+            }
+            val delayMillis = (nextCheck.timeInMillis - now.timeInMillis).coerceAtLeast(0L)
+            val scheduler = context.getSystemService(Context.JOB_SCHEDULER_SERVICE) as JobScheduler
+            val job = JobInfo.Builder(
+                NINE_AM_JOB_ID,
+                ComponentName(context, DailyEditionCheckJobService::class.java)
+            )
+                .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
+                .setPersisted(true)
+                .setMinimumLatency(delayMillis)
+                .setOverrideDeadline(delayMillis + 5 * 60 * 1000L)
+                .build()
+            if (scheduler.schedule(job) != JobScheduler.RESULT_SUCCESS) {
+                Log.e(TAG, "Could not schedule Dawn's 9 AM availability check.")
+            }
+        }
 
         fun schedule(context: Context) {
             val scheduler = context.getSystemService(Context.JOB_SCHEDULER_SERVICE) as JobScheduler

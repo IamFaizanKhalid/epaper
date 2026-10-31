@@ -750,6 +750,13 @@ class MainActivity : Activity() {
             jangStatusLabel.text = "Checking availability…"
             return
         }
+        if (!NewspaperAvailability.checksAreAllowed(requestedDate)) {
+            jangAvailabilityCheckInProgress = false
+            openJangWhenAvailable = false
+            jangStatusLabel.text = "Not available"
+            jangStatusLabel.setTextColor(Color.GRAY)
+            return
+        }
         jangCheckDate = requestedDate
         jangAvailabilityCheckInProgress = true
         openJangWhenAvailable = openWhenAvailable
@@ -934,6 +941,14 @@ class MainActivity : Activity() {
             } catch (error: Exception) {
                 showMessage(error.message ?: "Could not read the saved edition.")
             }
+        }
+        if (!NewspaperAvailability.checksAreAllowed(requestedDate)) {
+            availabilityCheckInProgress = false
+            latestEditionStatus = "Not available"
+            dawnStatusLabel.text = "Not available"
+            dawnStatusLabel.setTextColor(Color.GRAY)
+            pageLabel.text = "Dawn is not available before 9:00 AM"
+            return
         }
         availabilityCheckInProgress = true
         latestEditionStatus = null
