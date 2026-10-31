@@ -2,6 +2,7 @@ package com.faizan.epaper
 
 import org.json.JSONArray
 import org.json.JSONObject
+import android.app.job.JobService
 import java.io.File
 
 enum class NewspaperId(val storageName: String, val displayName: String) {
@@ -9,10 +10,29 @@ enum class NewspaperId(val storageName: String, val displayName: String) {
     JANG_LAHORE("jang", "Jang Lahore")
 }
 
-interface NewspaperFetcher {
+data class PaperBackgroundJob(
+    val periodicJobId: Int,
+    val nineAmJobId: Int,
+    val serviceClass: Class<out JobService>
+)
+
+interface Paper {
     val id: NewspaperId
     val supportsImageDetail: Boolean
     val offlineOrigin: String
+    val backgroundJob: PaperBackgroundJob
+    val supportsInlineArticleImages: Boolean
+        get() = false
+    val supportsForegroundEditionPrefetch: Boolean
+        get() = false
+    val requiresPageVerification: Boolean
+        get() = false
+    val refreshArticleWhenBylineMissing: Boolean
+        get() = false
+
+    fun articleImageDetailTarget(storyId: String): String? = null
+    fun inlineArticleImageTarget(articleId: String, imageIndex: Int): String? = null
+    fun localArticleImageUrl(articleId: String, imageIndex: Int): String? = null
 
     fun editionDirectory(root: File, date: String): File
     fun availabilityUrl(date: String): String
@@ -43,25 +63,37 @@ interface NewspaperFetcher {
     fun parseHotspots(json: String, edition: NewspaperEdition, page: NewspaperPage): List<NewspaperHotspot>
 }
 
-object NewspaperFetchers {
-    private val fetchers: Map<NewspaperId, NewspaperFetcher> = listOf(
-        DawnFetcher(),
-        JangLahoreFetcher()
-    ).associateBy { it.id }
+object Papers {
+    val all: List<Paper> = listOf(
+        DawnPaper(),
+        JangLahorePaper()
+    )
 
-    val all: List<NewspaperFetcher> = fetchers.values.toList()
+    private val byId: Map<NewspaperId, Paper> = all.associateBy { it.id }
 
-    operator fun get(id: NewspaperId): NewspaperFetcher =
-        fetchers[id] ?: error("No fetcher is registered for $id.")
+    operator fun get(id: NewspaperId): Paper =
+        byId[id] ?: error("No paper is registered for $id.")
 
-    fun forEdition(edition: NewspaperEdition): NewspaperFetcher =
-        get(if (edition.isJangEdition) NewspaperId.JANG_LAHORE else NewspaperId.DAWN)
+    fun forEdition(edition: NewspaperEdition): Paper =
+        get(edition.paperId)
 }
 
-private class DawnFetcher : NewspaperFetcher {
+private class DawnPaper : Paper {
     override val id = NewspaperId.DAWN
     override val supportsImageDetail = true
     override val offlineOrigin = "https://offline.dawn/"
+    override val supportsForegroundEditionPrefetch = true
+    override val backgroundJob = PaperBackgroundJob(
+        periodicJobId = 2841,
+        nineAmJobId = 2842,
+        serviceClass = DailyEditionCheckJobService::class.java
+    )
+    override fun articleImageDetailTarget(storyId: String): String? =
+        if (DAWN_STORY_ID_PATTERN.matches(storyId)) {
+            "${offlineOrigin}article-image/$storyId"
+        } else {
+            null
+        }
 
     override fun editionDirectory(root: File, date: String): File =
         File(root, date)
@@ -193,12 +225,30 @@ private class DawnFetcher : NewspaperFetcher {
             )
         }
     }
+
+    private companion object {
+        val DAWN_STORY_ID_PATTERN = Regex("\\d{2}_\\d{2}_\\d{4}_\\d{3}_\\d{3}")
+    }
 }
 
-private class JangLahoreFetcher : NewspaperFetcher {
+private class JangLahorePaper : Paper {
     override val id = NewspaperId.JANG_LAHORE
     override val supportsImageDetail = false
     override val offlineOrigin = "https://offline.jang/"
+    override val supportsInlineArticleImages = true
+    override val requiresPageVerification = true
+    override val refreshArticleWhenBylineMissing = true
+    override val backgroundJob = PaperBackgroundJob(
+        periodicJobId = 2843,
+        nineAmJobId = 2844,
+        serviceClass = JangEditionCheckJobService::class.java
+    )
+
+    override fun inlineArticleImageTarget(articleId: String, imageIndex: Int): String =
+        "${offlineOrigin}article-image/$articleId/$imageIndex"
+
+    override fun localArticleImageUrl(articleId: String, imageIndex: Int): String =
+        "${offlineOrigin}article-asset/${android.net.Uri.encode(articleId)}/$imageIndex"
 
     override fun editionDirectory(root: File, date: String): File =
         File(File(root, id.storageName), date)

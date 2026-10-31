@@ -44,7 +44,12 @@ data class NewspaperEdition(
     val articles: List<NewspaperArticle> = emptyList(),
     val processedPageIds: List<String> = emptyList(),
     val isJangEdition: Boolean = false,
-    val jangImageAreasVersion: Int = 0
+    val jangImageAreasVersion: Int = 0,
+    val paperId: NewspaperId = if (isJangEdition) {
+        NewspaperId.JANG_LAHORE
+    } else {
+        NewspaperId.DAWN
+    }
 ) {
     val readingOrder: List<NewspaperPage>
         get() {
@@ -385,6 +390,7 @@ data class NewspaperEdition(
         val metadata = JSONObject().apply {
             put("date", date)
             put("latestDate", latestDate)
+            put("paperId", paperId.name)
             put("isJangEdition", isJangEdition)
             put("jangImageAreasVersion", jangImageAreasVersion)
             put("pages", JSONArray().apply {
@@ -646,7 +652,19 @@ data class NewspaperEdition(
             val data = JSONObject(json)
             val date = data.getString("date")
             val latestDate = data.getString("latestDate")
-            val isJangEdition = data.optBoolean("isJangEdition", false)
+            val legacyJangEdition = data.optBoolean("isJangEdition", false)
+            val paperId = if (data.has("paperId")) {
+                runCatching { NewspaperId.valueOf(data.getString("paperId")) }
+                    .getOrElse { throw IllegalArgumentException("The saved paper ID is invalid.", it) }
+            } else if (legacyJangEdition) {
+                NewspaperId.JANG_LAHORE
+            } else {
+                NewspaperId.DAWN
+            }
+            val isJangEdition = paperId == NewspaperId.JANG_LAHORE
+            require(!data.has("paperId") || legacyJangEdition == isJangEdition) {
+                "The saved paper metadata is inconsistent."
+            }
             require(DATE_PATTERN.matches(date) && DATE_PATTERN.matches(latestDate)) {
                 "The newspaper returned an invalid edition date."
             }
@@ -738,7 +756,8 @@ data class NewspaperEdition(
                 articles,
                 processedPageIds.distinct(),
                 isJangEdition,
-                jangImageAreasVersion
+                jangImageAreasVersion,
+                paperId
             )
         }
 

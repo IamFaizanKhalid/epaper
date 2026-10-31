@@ -33,18 +33,30 @@ import java.util.PriorityQueue
 import java.util.concurrent.Executors
 
 class MainActivity : Activity() {
+    private data class PaperHomeItem(
+        val paper: Paper,
+        val status: TextView,
+        val downloadIndicator: ProgressBar
+    )
+
     private lateinit var webView: WebView
     private lateinit var inspectionWebView: WebView
     private lateinit var jangWebView: WebView
     private lateinit var detailWebView: WebView
     private lateinit var pageLabel: TextView
     private lateinit var dateButton: Button
-    private lateinit var dawnStatusLabel: TextView
-    private lateinit var dawnDownloadIndicator: ProgressBar
-    private lateinit var jangStatusLabel: TextView
     private lateinit var homeScreen: LinearLayout
     private lateinit var readerScreen: LinearLayout
+    private lateinit var webViewContainer: FrameLayout
     private lateinit var pageSpinner: Spinner
+    private lateinit var paperList: LinearLayout
+    private val paperViewer: PaperViewer = WebPaperViewer()
+    private val papers = Papers.all
+    private val paperHomeItems = linkedMapOf<NewspaperId, PaperHomeItem>()
+    private val availabilityWebViews = linkedMapOf<NewspaperId, WebView>()
+    private val availabilityCheckDates = mutableMapOf<NewspaperId, String>()
+    private val availabilityAttempts = mutableMapOf<NewspaperId, Int>()
+    private val papersToOpenWhenAvailable = mutableSetOf<NewspaperId>()
     private val downloadExecutor = Executors.newFixedThreadPool(2)
     private val pageDownloadLock = Any()
     private val pageDownloadQueue = PriorityQueue<PageDownloadRequest>(
@@ -53,6 +65,7 @@ class MainActivity : Activity() {
     private val queuedPageIds = mutableSetOf<String>()
     private var pageDownloadWorkerRunning = false
     private var pageDownloadSequence = 0L
+    private var pageDownloadInProgressPaperId: NewspaperId? = null
     private var selectedDate = Calendar.getInstance()
     private var pageNumber = 1
     private var readerMode = false
@@ -79,12 +92,6 @@ class MainActivity : Activity() {
     private var processingContentId: String? = null
     private var offlineEdition: NewspaperEdition? = null
     private var offlineDirectory: File? = null
-    private var latestEditionStatus: String? = null
-    private var checkedEditionDate: String? = null
-    private var availabilityCheckInProgress = false
-    private var jangCheckDate: String? = null
-    private var jangAvailabilityCheckInProgress = false
-    private var openJangWhenAvailable = false
     private var jangVerificationKey: String? = null
     private var jangVerificationGeneration = 0
     private var pageScanInProgress = false
@@ -108,10 +115,10 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         createReaderView()
+        createPaperAvailabilityWebViews()
         DailyEditionCheckScheduler.schedule(this)
         NotificationPermission.requestIfNeeded(this)
-        checkAvailability()
-        checkJangAvailability()
+        checkPaperAvailabilities()
     }
 
     private fun showStoryLoadingDialog() {
@@ -129,6 +136,205 @@ class MainActivity : Activity() {
             }
             show()
         }
+    }
+
+    private fun openPaper(paper: Paper) {
+        checkPaperAvailability(paper, openWhenAvailable = true)
+    }
+
+    private fun createPaperAvailabilityWebViews() {
+        papers.forEach { paper ->
+                    val browser = WebView(this).apply {
+                        settings.javaScriptEnabled = true
+                        settings.domStorageEnabled = true
+                        alpha = 0f
+                        importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+                        webViewClient = object : WebViewClient() {
+                            override fun onPageFinished(view: WebView, url: String) {
+                                val date = availabilityCheckDates[paper.id] ?: return
+                                val expectedHost = Uri.parse(paper.availabilityUrl(date)).host
+                                val actualHost = Uri.parse(url).host
+                                if (paper.isAvailabilityPageUrl(url, date) ||
+                                    actualHost == expectedHost || actualHost == "www.$expectedHost"
+                                ) {
+                                    readPaperAvailability(paper, view, date)
+                                }
+                            }
+
+                            override fun onReceivedError(
+                                view: WebView,
+                                request: WebResourceRequest,
+                                error: android.webkit.WebResourceError
+                            ) {
+                                if (!request.isForMainFrame) return
+                                val date = availabilityCheckDates[paper.id] ?: return
+                                if (availabilityCheckDates[paper.id] != date) return
+                                availabilityCheckDates.remove(paper.id)
+                                papersToOpenWhenAvailable.remove(paper.id)
+                                setPaperStatus(paper, "Could not check availability", Color.RED)
+                                showMessage(
+                                    "${paper.id.displayName}: ${error.description}"
+                                )
+                            }
+                        }
+                    }
+                    availabilityWebViews[paper.id] = browser
+                    webViewContainer.addView(
+                        browser,
+                        FrameLayout.LayoutParams(
+                            FrameLayout.LayoutParams.MATCH_PARENT,
+                            FrameLayout.LayoutParams.MATCH_PARENT
+                        )
+                    )
+                }
+        }
+
+    private fun checkPaperAvailability(paper: Paper, openWhenAvailable: Boolean = false) {
+                val requestedDate = selectedDateKey()
+                val directory = paper.editionDirectory(File(filesDir, "editions"), requestedDate)
+                val metadata = File(directory, "edition.json")
+                if (metadata.isFile) {
+                    try {
+                        val edition = NewspaperEdition.readMetadata(metadata)
+                        require(edition.paperId == paper.id) {
+                            "Saved ${paper.id.displayName} edition metadata is invalid."
+                        }
+                        if (requestedDate == selectedDateKey()) {
+                            availableEdition = edition
+                            setPaperStatus(paper, "Available", Color.rgb(30, 125, 70))
+                        }
+                        if (openWhenAvailable) openEdition(edition)
+                        if (requestedDate == dateFormat.format(Calendar.getInstance().time) &&
+                            paper.supportsForegroundEditionPrefetch &&
+                            !File(directory, "complete").isFile
+                        ) {
+                            downloadEdition(edition)
+                        }
+                        return
+                    } catch (error: Exception) {
+                        showMessage(error.message ?: "Could not read the saved edition.")
+                    }
+                }
+                if (availabilityCheckDates[paper.id] == requestedDate) {
+                    if (openWhenAvailable) papersToOpenWhenAvailable += paper.id
+                    setPaperStatus(paper, "Checking availability…", Color.DKGRAY)
+                    return
+                }
+                if (!NewspaperAvailability.checksAreAllowed(requestedDate)) {
+                    papersToOpenWhenAvailable.remove(paper.id)
+                    setPaperStatus(paper, "Not available", Color.GRAY)
+                    if (openWhenAvailable) {
+                        showMessage("${paper.id.displayName} is not available before 9:00 AM.")
+                    }
+                    return
+                }
+                availabilityCheckDates[paper.id] = requestedDate
+                availabilityAttempts[paper.id] = 0
+                if (openWhenAvailable) papersToOpenWhenAvailable += paper.id
+                setPaperStatus(paper, "Checking availability…", Color.DKGRAY)
+                val browser = availabilityWebViews[paper.id]
+                    ?: throw IllegalStateException("No availability browser is registered for ${paper.id}.")
+                browser.loadUrl(paper.availabilityUrl(requestedDate))
+    }
+
+    private fun readPaperAvailability(paper: Paper, browser: WebView, date: String) {
+                if (availabilityCheckDates[paper.id] != date) return
+                browser.evaluateJavascript(paper.availabilityDiscoveryScript(date)) { result ->
+                    if (availabilityCheckDates[paper.id] != date) return@evaluateJavascript
+                    try {
+                        val json = JSONTokener(result).nextValue() as? String
+                            ?: throw IllegalStateException("Could not read availability data.")
+                        val response = JSONObject(json)
+                        when (response.optString("error")) {
+                            "VERIFYING" -> {
+                                val attempt = availabilityAttempts[paper.id] ?: 0
+                                if (attempt < MAX_AVAILABILITY_ATTEMPTS) {
+                                    availabilityAttempts[paper.id] = attempt + 1
+                                    browser.postDelayed({
+                                        readPaperAvailability(paper, browser, date)
+                                    }, AVAILABILITY_RETRY_MILLIS)
+                                } else {
+                                    failPaperAvailability(paper, date, "Request verification timed out.")
+                                }
+                                return@evaluateJavascript
+                            }
+                            "NOT_AVAILABLE" -> {
+                                availabilityCheckDates.remove(paper.id)
+                                papersToOpenWhenAvailable.remove(paper.id)
+                                setPaperStatus(paper, "Not available", Color.GRAY)
+                                return@evaluateJavascript
+                            }
+                            "" -> Unit
+                            else -> throw IllegalStateException(response.getString("error"))
+                        }
+                        val discovered = paper.parseAvailability(json)
+                        require(discovered.paperId == paper.id && discovered.date == date) {
+                            "The availability response belongs to a different edition."
+                        }
+                        val directory = paper.editionDirectory(File(filesDir, "editions"), date)
+                        if (!directory.exists() && !directory.mkdirs()) {
+                            throw IllegalStateException("Could not create edition storage.")
+                        }
+                        val metadata = File(directory, "edition.json")
+                        val previous = if (metadata.isFile) {
+                            runCatching { NewspaperEdition.readMetadata(metadata) }
+                                .getOrNull()
+                                ?.takeIf { it.paperId == paper.id && it.date == date }
+                        } else {
+                            null
+                        }
+                        val edition = if (previous == null) discovered else discovered.copy(
+                            fullImageIds = previous.fullImageIds,
+                            hotspots = previous.hotspots,
+                            articles = previous.articles,
+                            processedPageIds = previous.processedPageIds,
+                            jangImageAreasVersion = previous.jangImageAreasVersion
+                        )
+                        edition.saveMetadata(directory)
+                        availabilityCheckDates.remove(paper.id)
+                        availabilityAttempts.remove(paper.id)
+                        setPaperStatus(paper, "Available", Color.rgb(30, 125, 70))
+                        if (date == selectedDateKey()) {
+                            availableEdition = edition
+                            updatePagePicker(edition)
+                            updatePageLabel()
+                        }
+                        if (date == dateFormat.format(Calendar.getInstance().time) &&
+                            paper.supportsForegroundEditionPrefetch
+                        ) {
+                            downloadEdition(edition)
+                        }
+                        if (papersToOpenWhenAvailable.remove(paper.id) && date == selectedDateKey()) {
+                            openEdition(edition)
+                        }
+                    } catch (error: Exception) {
+                        failPaperAvailability(
+                            paper,
+                            date,
+                            error.message ?: "Could not check availability."
+                        )
+                    }
+                }
+    }
+
+    private fun failPaperAvailability(paper: Paper, date: String, message: String) {
+                if (availabilityCheckDates[paper.id] != date) return
+                availabilityCheckDates.remove(paper.id)
+                availabilityAttempts.remove(paper.id)
+                papersToOpenWhenAvailable.remove(paper.id)
+                setPaperStatus(paper, "Could not check availability", Color.RED)
+                showMessage("${paper.id.displayName}: $message")
+    }
+
+    private fun setPaperStatus(paper: Paper, text: String, color: Int) {
+                paperHomeItems[paper.id]?.status?.apply {
+                    this.text = text
+                    setTextColor(color)
+                }
+    }
+
+    private fun checkPaperAvailabilities() {
+        papers.forEach { paper -> checkPaperAvailability(paper) }
     }
 
     private fun createReaderView() {
@@ -153,64 +359,54 @@ class MainActivity : Activity() {
             setTextColor(Color.DKGRAY)
             setPadding(0, dp(4), 0, dp(6))
         }
-        val paperRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(12), dp(10), dp(12), dp(10))
-            setBackgroundColor(Color.WHITE)
-            isClickable = true
-            isFocusable = true
-            setOnClickListener { openDawnEdition() }
-        }
-        val dawnTitle = TextView(this).apply {
-            text = NewspaperFetchers[NewspaperId.DAWN].id.displayName
-            textSize = 18f
-            setTextColor(Color.rgb(34, 50, 70))
-        }
-        dawnStatusLabel = TextView(this).apply {
-            text = "Checking availability…"
-            textSize = 14f
-            setTextColor(Color.DKGRAY)
-        }
-        val dawnInfo = LinearLayout(this).apply {
+        paperList = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
         }
-        dawnInfo.addView(dawnTitle)
-        dawnInfo.addView(dawnStatusLabel)
-        dawnDownloadIndicator = ProgressBar(this, null, android.R.attr.progressBarStyleSmall).apply {
-            visibility = View.GONE
-            isIndeterminate = true
+        papers.forEach { paper ->
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(12), dp(10), dp(12), dp(10))
+                setBackgroundColor(Color.WHITE)
+                isClickable = true
+                isFocusable = true
+                setOnClickListener { openPaper(paper) }
+            }
+            val info = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+            }
+            val name = TextView(this).apply {
+                text = paper.id.displayName
+                textSize = 18f
+                setTextColor(Color.rgb(34, 50, 70))
+            }
+            val status = TextView(this).apply {
+                text = "Checking availability…"
+                textSize = 14f
+                setTextColor(Color.DKGRAY)
+            }
+            val downloadIndicator = ProgressBar(
+                this,
+                null,
+                android.R.attr.progressBarStyleSmall
+            ).apply {
+                visibility = View.GONE
+                isIndeterminate = true
+            }
+            info.addView(name)
+            info.addView(status)
+            row.addView(
+                info,
+                LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            )
+            row.addView(downloadIndicator, LinearLayout.LayoutParams(dp(32), dp(32)))
+            paperList.addView(row)
+            paperHomeItems[paper.id] = PaperHomeItem(paper, status, downloadIndicator)
         }
-        paperRow.addView(
-            dawnInfo,
-            LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-        )
-        paperRow.addView(dawnDownloadIndicator, LinearLayout.LayoutParams(dp(32), dp(32)))
-        val jangRow = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(12), dp(10), dp(12), dp(10))
-            setBackgroundColor(Color.WHITE)
-            isClickable = true
-            isFocusable = true
-            setOnClickListener { openJangEdition() }
-        }
-        val jangTitle = TextView(this).apply {
-            text =             NewspaperId.JANG_LAHORE.displayName
-            textSize = 18f
-            setTextColor(Color.rgb(34, 50, 70))
-        }
-        jangStatusLabel = TextView(this).apply {
-            text = "Checking availability…"
-            textSize = 14f
-            setTextColor(Color.DKGRAY)
-        }
-        jangRow.addView(jangTitle)
-        jangRow.addView(jangStatusLabel)
 
         homeScreen.addView(dateButton)
         homeScreen.addView(title)
-        homeScreen.addView(paperRow)
-        homeScreen.addView(jangRow)
+        homeScreen.addView(paperList)
 
         readerScreen = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -265,13 +461,16 @@ class MainActivity : Activity() {
                     request: WebResourceRequest
                 ): WebResourceResponse? {
                     val uri = request.url
-                    if (uri.host == "offline.jang" &&
+                    val assetPaper = Papers.all.firstOrNull {
+                        Uri.parse(it.offlineOrigin).host == uri.host
+                    }
+                    if (assetPaper?.supportsInlineArticleImages == true &&
                         uri.pathSegments.firstOrNull() == "article-asset"
                     ) {
                         val parts = uri.pathSegments
                         val edition = offlineEdition
                         val directory = offlineDirectory
-                        if (parts.size == 3 && edition?.isJangEdition == true &&
+                        if (parts.size == 3 && edition?.paperId == assetPaper.id &&
                             directory != null
                         ) {
                             val article = edition.articles.firstOrNull { it.id == parts[1] }
@@ -309,9 +508,7 @@ class MainActivity : Activity() {
                     view: WebView,
                     request: WebResourceRequest
                 ): Boolean {
-                    if (request.url.host == "offline.dawn" ||
-                        request.url.host == "offline.jang"
-                    ) {
+                    if (Papers.all.any { Uri.parse(it.offlineOrigin).host == request.url.host }) {
                         openOfflineTarget(request.url)
                         return true
                     }
@@ -349,7 +546,7 @@ class MainActivity : Activity() {
             override fun onPageFinished(view: WebView, url: String) {
                 val request = activeTextStory ?: return
                 val uri = Uri.parse(url)
-                if (request.edition.isJangEdition) {
+                if (Papers.forEdition(request.edition).requiresPageVerification) {
                     if (uri.host != "e.jang.com.pk" ||
                         uri.path != "/detail/${request.id}" ||
                         parsingJangStoryId == request.id
@@ -369,10 +566,11 @@ class MainActivity : Activity() {
                                 viewingStoryContent
                             ) {
                                 webView.loadDataWithBaseURL(
-                                    NewspaperFetchers.forEdition(request.edition).offlineOrigin,
-                                    renderArticle(
+                                    Papers.forEdition(request.edition).offlineOrigin,
+                                    paperViewer.renderArticle(
+                                        request.edition,
                                         article,
-                                        NewspaperFetchers[NewspaperId.JANG_LAHORE],
+                                        Papers[request.edition.paperId],
                                         request.directory
                                     ),
                                     "text/html",
@@ -401,8 +599,13 @@ class MainActivity : Activity() {
                             viewingStoryContent
                         ) {
                             webView.loadDataWithBaseURL(
-                                NewspaperFetchers.forEdition(request.edition).offlineOrigin,
-                                renderArticle(article, NewspaperFetchers[NewspaperId.DAWN]),
+                                Papers.forEdition(request.edition).offlineOrigin,
+                                paperViewer.renderArticle(
+                                    request.edition,
+                                    article,
+                                    Papers[request.edition.paperId],
+                                    request.directory
+                                ),
                                 "text/html",
                                 "UTF-8",
                                 null
@@ -439,29 +642,29 @@ class MainActivity : Activity() {
             }
         }
 
-        val contentFrame = FrameLayout(this)
-        contentFrame.addView(
+        webViewContainer = FrameLayout(this)
+        webViewContainer.addView(
             inspectionWebView,
             FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT
             )
         )
-        contentFrame.addView(
+        webViewContainer.addView(
             detailWebView,
             FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT
             )
         )
-        contentFrame.addView(
+        webViewContainer.addView(
             jangWebView,
             FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT
             )
         )
-        contentFrame.addView(
+        webViewContainer.addView(
             webView,
             FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
@@ -469,7 +672,7 @@ class MainActivity : Activity() {
             )
         )
         webView.visibility = View.GONE
-        readerScreen.addView(contentFrame, LinearLayout.LayoutParams(
+        readerScreen.addView(webViewContainer, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
             0,
             1f
@@ -492,15 +695,10 @@ class MainActivity : Activity() {
     private fun inspectionClient() = object : WebViewClient() {
         override fun onPageFinished(view: WebView, url: String) {
             val uri = Uri.parse(url)
-            if (availabilityCheckInProgress && uri.host == "epaper.dawn.com") {
-                val requestedDate = checkedEditionDate ?: return
-                if (uri.getQueryParameter("page")?.startsWith("${requestedDate}_") != true) return
-                discoverEdition()
-                return
-            }
             val requestedPage = onDemandPage
-            if (requestedPage != null && !requestedPage.first.isJangEdition &&
-                NewspaperFetchers.forEdition(requestedPage.first).isPageUrl(
+            if (requestedPage != null &&
+                !Papers.forEdition(requestedPage.first).requiresPageVerification &&
+                Papers.forEdition(requestedPage.first).isPageUrl(
                     url,
                     requestedPage.first.date,
                     requestedPage.second.id
@@ -516,7 +714,7 @@ class MainActivity : Activity() {
             val edition = editionInProgress ?: return
             if (pageScanInProgress) {
                 val page = edition.readingOrder.getOrNull(editionPageIndex) ?: return
-                if (NewspaperFetchers.forEdition(edition).isPageUrl(url, edition.date, page.id) &&
+                if (Papers.forEdition(edition).isPageUrl(url, edition.date, page.id) &&
                     processingContentId != page.id
                 ) {
                     processingContentId = page.id
@@ -547,50 +745,37 @@ class MainActivity : Activity() {
 
     private fun jangInspectionClient() = object : WebViewClient() {
         override fun onPageFinished(view: WebView, url: String) {
-            val uri = Uri.parse(url)
-            val requestedDate = jangCheckDate
-            if (jangAvailabilityCheckInProgress && requestedDate != null &&
-                (uri.host == "e.jang.com.pk" || uri.host == "www.e.jang.com.pk")
-            ) {
-                awaitJangVerification(
-                    NewspaperFetchers[NewspaperId.JANG_LAHORE].availabilityUrl(requestedDate),
-                    requestedDate,
-                    null
-                ) { discoverJangEdition(requestedDate) }
-                return
-            }
             val requestedPage = onDemandPage
-            if (requestedPage?.first?.isJangEdition == true &&
-                NewspaperFetchers.forEdition(requestedPage.first).isPageUrl(
+            if (requestedPage != null &&
+                Papers.forEdition(requestedPage.first).requiresPageVerification &&
+                Papers.forEdition(requestedPage.first).isPageUrl(
                     url,
                     requestedPage.first.date,
                     requestedPage.second.id
                 )
             ) {
-                val requestedPageUrl = NewspaperFetchers.forEdition(requestedPage.first)
+                val requestedPageUrl = Papers.forEdition(requestedPage.first)
                     .pageUrl(requestedPage.first.date, requestedPage.second.id)
-                awaitJangVerification(requestedPageUrl, null, requestedPage) {
+                awaitJangVerification(requestedPageUrl, requestedPage) {
                     collectOnDemandPageHotspots(requestedPage.first, requestedPage.second)
                 }
             }
         }
 
         private fun awaitJangVerification(
-                expectedUrl: String,
-                editionDate: String?,
-                requestedPage: Pair<NewspaperEdition, NewspaperPage>?,
-                attempt: Int = 0,
-                onReady: () -> Unit
-            ) {
-                if (editionDate != null && jangCheckDate != editionDate) return
-                if (requestedPage != null && onDemandPage != requestedPage) return
-                val key = expectedUrl
-                if (attempt == 0 && jangVerificationKey != key) {
-                    jangVerificationKey = key
-                    jangVerificationGeneration++
-                }
-                val generation = jangVerificationGeneration
-                val script = """
+            expectedUrl: String,
+            requestedPage: Pair<NewspaperEdition, NewspaperPage>?,
+            attempt: Int = 0,
+            onReady: () -> Unit
+        ) {
+            if (requestedPage != null && onDemandPage != requestedPage) return
+            val key = expectedUrl
+            if (attempt == 0 && jangVerificationKey != key) {
+                jangVerificationKey = key
+                jangVerificationGeneration++
+            }
+            val generation = jangVerificationGeneration
+            val script = """
                     (() => {
                         const title = document.title.toLowerCase();
                         const text = (document.body?.innerText || '').slice(0, 4000).toLowerCase();
@@ -607,47 +792,39 @@ class MainActivity : Activity() {
                             expected: location.pathname === '${Uri.parse(expectedUrl).path}'
                         });
                     })()
-                """.trimIndent()
-                jangWebView.evaluateJavascript(script) { result ->
-                    if (generation != jangVerificationGeneration) return@evaluateJavascript
-                    if (editionDate != null && jangCheckDate != editionDate) return@evaluateJavascript
-                    if (requestedPage != null && onDemandPage != requestedPage) return@evaluateJavascript
-                    try {
-                        val json = JSONTokener(result).nextValue() as? String
-                            ?: throw IllegalStateException("Could not check Jang's verification page.")
-                        val state = JSONObject(json)
-                        if (state.optBoolean("challenge") || !state.optBoolean("expected")) {
-                            if (attempt < 60) {
-                                jangWebView.postDelayed({
-                                    awaitJangVerification(
-                                        expectedUrl,
-                                        editionDate,
-                                        requestedPage,
-                                        attempt + 1,
-                                        onReady
-                                    )
-                                }, 1_000)
-                            } else {
-                                jangVerificationKey = null
-                                jangAvailabilityCheckInProgress = false
-                                openJangWhenAvailable = false
-                                if (editionDate != null) {
-                                    jangStatusLabel.text = "Verification timed out"
-                                    jangStatusLabel.setTextColor(Color.RED)
-                                }
-                                showMessage("Jang's request verification did not finish in time.")
-                            }
-                            return@evaluateJavascript
+            """.trimIndent()
+            jangWebView.evaluateJavascript(script) { result ->
+                if (generation != jangVerificationGeneration) return@evaluateJavascript
+                if (requestedPage != null && onDemandPage != requestedPage) return@evaluateJavascript
+                try {
+                    val json = JSONTokener(result).nextValue() as? String
+                        ?: throw IllegalStateException("Could not check Jang's verification page.")
+                    val state = JSONObject(json)
+                    if (state.optBoolean("challenge") || !state.optBoolean("expected")) {
+                        if (attempt < 60) {
+                            jangWebView.postDelayed({
+                                awaitJangVerification(
+                                    expectedUrl,
+                                    requestedPage,
+                                    attempt + 1,
+                                    onReady
+                                )
+                            }, 1_000)
+                        } else {
+                            jangVerificationKey = null
+                            onDemandPage = null
+                            showMessage("Jang's request verification did not finish in time.")
                         }
-                        jangVerificationKey = null
-                        jangWebView.postDelayed(onReady, 300)
-                    } catch (error: Exception) {
-                        jangVerificationKey = null
-                        jangAvailabilityCheckInProgress = false
-                        openJangWhenAvailable = false
-                        showMessage(error.message ?: "Could not finish Jang verification.")
+                        return@evaluateJavascript
                     }
+                    jangVerificationKey = null
+                    jangWebView.postDelayed(onReady, 300)
+                } catch (error: Exception) {
+                    jangVerificationKey = null
+                    onDemandPage = null
+                    showMessage(error.message ?: "Could not finish Jang verification.")
                 }
+            }
         }
 
         override fun onReceivedError(
@@ -657,13 +834,7 @@ class MainActivity : Activity() {
         ) {
             if (!request.isForMainFrame || request.url.host != "e.jang.com.pk") return
             if (request.url.path?.contains("/cdn-cgi/") == true) return
-            if (jangAvailabilityCheckInProgress) {
-                jangAvailabilityCheckInProgress = false
-                openJangWhenAvailable = false
-                jangStatusLabel.text = "Could not check availability"
-                jangStatusLabel.setTextColor(Color.RED)
-                showMessage("Could not check Jang availability: ${error.description}")
-            } else if (onDemandPage?.first?.isJangEdition == true) {
+            if (onDemandPage?.first?.paperId == NewspaperId.JANG_LAHORE) {
                 onDemandPage = null
                 showMessage("Could not load Jang page details: ${error.description}")
             }
@@ -687,12 +858,14 @@ class MainActivity : Activity() {
                 pageNumber = 1
                 showHome()
                 availableEdition = null
-                jangStatusLabel.text = "Checking availability…"
-                jangStatusLabel.setTextColor(Color.DKGRAY)
+                papers.forEach { setPaperStatus(it, "Checking availability…", Color.DKGRAY) }
                 updateDateButton()
                 pageAdapter?.clear()
-                checkAvailability()
-                checkJangAvailability()
+                availabilityWebViews.values.forEach(WebView::stopLoading)
+                availabilityCheckDates.clear()
+                availabilityAttempts.clear()
+                papersToOpenWhenAvailable.clear()
+                checkPaperAvailabilities()
             },
             selectedDate.get(Calendar.YEAR),
             selectedDate.get(Calendar.MONTH),
@@ -712,36 +885,6 @@ class MainActivity : Activity() {
         webView.visibility = View.GONE
     }
 
-    private fun openDawnEdition() {
-        val requestedDate = selectedDateKey()
-        val cachedEdition = availableEdition?.takeIf {
-            !it.isJangEdition && it.date == requestedDate
-        } ?: run {
-            val metadata = File(File(filesDir, "editions"), requestedDate)
-                .resolve("edition.json")
-            if (!metadata.isFile) null else try {
-                NewspaperEdition.readMetadata(metadata).also {
-                    require(!it.isJangEdition) { "Saved Dawn edition metadata is invalid." }
-                }
-            } catch (error: Exception) {
-                showMessage(error.message ?: "Could not read the saved Dawn edition.")
-                null
-            }
-        }
-        val edition = cachedEdition
-        if (edition == null) {
-            if (!availabilityCheckInProgress || checkedEditionDate != requestedDate) {
-                checkAvailability()
-            }
-            val status = dawnStatusLabel.text.toString()
-            if (status != "Not available") showMessage("Checking Dawn availability…")
-            else showMessage("Dawn is not available for this date.")
-            return
-        }
-        availableEdition = edition
-        openEdition(edition)
-    }
-
     private fun openEdition(edition: NewspaperEdition) {
         availableEdition = edition
         readerMode = true
@@ -751,9 +894,10 @@ class MainActivity : Activity() {
         val directory = editionDirectory(edition)
         offlineEdition = edition
         offlineDirectory = directory
-        val isToday = !edition.isJangEdition &&
-            edition.date == dateFormat.format(Calendar.getInstance().time)
-        if (isToday && editionInProgress?.date != edition.date &&
+        val paper = Papers.forEdition(edition)
+        val isToday = edition.date == dateFormat.format(Calendar.getInstance().time)
+        if (paper.supportsForegroundEditionPrefetch && isToday &&
+            editionInProgress?.paperId != edition.paperId &&
             !File(directory, "complete").isFile
         ) {
             downloadEdition(edition)
@@ -763,133 +907,8 @@ class MainActivity : Activity() {
         loadPage()
     }
 
-    private fun openJangEdition() {
-        checkJangAvailability(openWhenAvailable = true)
-    }
-
-    private fun checkJangAvailability(openWhenAvailable: Boolean = false) {
-        val requestedDate = selectedDateKey()
-        val directory = NewspaperFetchers[NewspaperId.JANG_LAHORE]
-            .editionDirectory(File(filesDir, "editions"), requestedDate)
-        val metadata = File(directory, "edition.json")
-        if (metadata.isFile) {
-            try {
-                val edition = NewspaperEdition.readMetadata(metadata)
-                if (!edition.isJangEdition) {
-                    throw IllegalStateException("Saved Jang edition metadata is invalid.")
-                }
-                jangStatusLabel.text = "Available"
-                jangStatusLabel.setTextColor(Color.rgb(30, 125, 70))
-                if (openWhenAvailable) openEdition(edition)
-                return
-            } catch (error: Exception) {
-                showMessage(error.message ?: "Could not read the saved Jang edition.")
-            }
-        }
-        if (jangAvailabilityCheckInProgress && jangCheckDate == requestedDate) {
-            openJangWhenAvailable = true
-            jangStatusLabel.text = "Checking availability…"
-            return
-        }
-        if (!NewspaperAvailability.checksAreAllowed(requestedDate)) {
-            jangAvailabilityCheckInProgress = false
-            openJangWhenAvailable = false
-            jangStatusLabel.text = "Not available"
-            jangStatusLabel.setTextColor(Color.GRAY)
-            return
-        }
-        jangCheckDate = requestedDate
-        jangAvailabilityCheckInProgress = true
-        openJangWhenAvailable = openWhenAvailable
-        jangStatusLabel.text = "Checking availability…"
-        jangStatusLabel.setTextColor(Color.DKGRAY)
-        jangWebView.loadUrl(
-            NewspaperFetchers[NewspaperId.JANG_LAHORE].availabilityUrl(requestedDate)
-        )
-    }
-
-    private fun discoverJangEdition(requestedDate: String) {
-        val script = """
-            (() => {
-                const pageText = (document.body?.innerText || '').toLowerCase();
-                if (document.title.toLowerCase().includes('moment, please') ||
-                    pageText.includes('verify you are human') ||
-                    pageText.includes('security verification')) {
-                    return JSON.stringify({error: 'Jang is asking to verify this request.'});
-                }
-                const requested = '${requestedDate.replace('_', '-')}';
-                const pages = [];
-                const seen = new Set();
-                for (const link of document.querySelectorAll('a[href*="/lahore/"]')) {
-                    const url = new URL(link.href, location.href);
-                    const match = url.pathname.match(/^\/lahore\/(\d{2}-\d{2}-\d{4})\/page(\d+)$/);
-                    if (!match || match[1] !== requested || seen.has(match[2])) continue;
-                    seen.add(match[2]);
-                    pages.push({number: Number(match[2]), title: link.innerText.trim()});
-                }
-                pages.sort((a, b) => a.number - b.number);
-                return JSON.stringify({pages: pages});
-            })()
-        """.trimIndent()
-        jangWebView.evaluateJavascript(script) { result ->
-            try {
-                if (jangCheckDate != requestedDate) return@evaluateJavascript
-                val json = JSONTokener(result).nextValue() as? String
-                    ?: throw IllegalStateException("Could not read Jang's page list.")
-                val response = JSONObject(json)
-                if (response.has("error")) {
-                    throw IllegalStateException(response.getString("error"))
-                }
-                val pageEntries = response.getJSONArray("pages")
-                if (pageEntries.length() == 0) {
-                    jangAvailabilityCheckInProgress = false
-                    jangStatusLabel.text = "Not available"
-                    jangStatusLabel.setTextColor(Color.GRAY)
-                    openJangWhenAvailable = false
-                    return@evaluateJavascript
-                }
-                val pages = (0 until pageEntries.length()).map { index ->
-                    val entry = pageEntries.getJSONObject(index)
-                    val number = entry.getInt("number")
-                    require(number in 1..99) { "Jang returned an invalid page number." }
-                    NewspaperPage(
-                        "J${requestedDate}_${number.toString().padStart(3, '0')}",
-                        entry.optString("title").ifBlank { "Page $number" }
-                    )
-                }
-                val edition = NewspaperEdition(
-                    date = requestedDate,
-                    latestDate = requestedDate,
-                    pages = pages,
-                    isJangEdition = true
-                )
-                val directory = NewspaperFetchers[NewspaperId.JANG_LAHORE]
-                    .editionDirectory(File(filesDir, "editions"), requestedDate)
-                if (!directory.exists() && !directory.mkdirs()) {
-                    throw IllegalStateException("Could not create Jang edition storage.")
-                }
-                edition.saveMetadata(directory)
-                availableEdition = edition
-                jangAvailabilityCheckInProgress = false
-                jangStatusLabel.text = "Available"
-                jangStatusLabel.setTextColor(Color.rgb(30, 125, 70))
-                if (openJangWhenAvailable && selectedDateKey() == requestedDate) {
-                    openJangWhenAvailable = false
-                    openEdition(edition)
-                }
-            } catch (error: Exception) {
-                if (jangCheckDate != requestedDate) return@evaluateJavascript
-                jangAvailabilityCheckInProgress = false
-                openJangWhenAvailable = false
-                jangStatusLabel.text = "Could not check availability"
-                jangStatusLabel.setTextColor(Color.RED)
-                showMessage(error.message ?: "Could not read Jang's page list.")
-            }
-        }
-    }
-
     private fun editionDirectory(edition: NewspaperEdition): File =
-        NewspaperFetchers.forEdition(edition)
+        Papers.forEdition(edition)
             .editionDirectory(File(filesDir, "editions"), edition.date)
 
     private fun updatePagePicker(edition: NewspaperEdition) {
@@ -923,7 +942,7 @@ class MainActivity : Activity() {
             openOfflinePage(edition, page, directory)
         } else {
             webView.loadData(
-                renderPageLoading(page),
+                paperViewer.renderLoadingPage(page),
                 "text/html",
                 "UTF-8"
             )
@@ -933,18 +952,15 @@ class MainActivity : Activity() {
         prefetchPageStories(edition, page)
     }
 
-    private fun renderPageLoading(page: NewspaperPage): String =
-        "<html><body style='font:18px sans-serif;padding:24px'>Loading ${htmlEscape(page.title)}…</body></html>"
-
     private fun isRequestedPageVisible(request: PageDownloadRequest): Boolean =
         readerMode && !viewingStoryContent &&
             selectedDateKey() == request.edition.date &&
-            readerEdition()?.isJangEdition == request.edition.isJangEdition &&
+            readerEdition()?.paperId == request.edition.paperId &&
             pageNumber == request.page.id.takeLast(3).toIntOrNull()
 
     private fun showPageLoadFailure(page: NewspaperPage, message: String?) {
         val edition = readerEdition() ?: return
-        val host = if (edition.isJangEdition) "offline.jang" else "offline.dawn"
+        val paper = Papers.forEdition(edition)
         val details = message?.takeIf { it.isNotBlank() } ?: "The page image could not be downloaded."
         val html = """
             <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -953,182 +969,16 @@ class MainActivity : Activity() {
             color:#fff;text-decoration:none;border-radius:4px}</style></head>
             <body><h2>Could not load ${htmlEscape(page.title)}</h2>
             <p>${htmlEscape(details)}</p>
-            <a href="https://$host/retry/${page.id}">Try again</a></body></html>
+            <a href="${paper.offlineOrigin}retry/${page.id}">Try again</a></body></html>
         """.trimIndent()
-        webView.loadDataWithBaseURL("https://$host/", html, "text/html", "UTF-8", null)
-    }
-
-    private fun checkAvailability() {
-        val requestedDate = dateFormat.format(selectedDate.time)
-        checkedEditionDate = requestedDate
-        refreshDownloadIndicator()
-        availableEdition = null
-        val directory = File(File(filesDir, "editions"), requestedDate)
-        val metadata = File(directory, "edition.json")
-        if (metadata.isFile) {
-            try {
-                val savedEdition = NewspaperEdition.readMetadata(metadata)
-                availableEdition = savedEdition
-                updatePagePicker(savedEdition)
-                dawnStatusLabel.text = "Available"
-                dawnStatusLabel.setTextColor(Color.rgb(30, 125, 70))
-                refreshDownloadIndicator()
-                availabilityCheckInProgress = false
-                updatePageLabel()
-                if (requestedDate == dateFormat.format(Calendar.getInstance().time) &&
-                    !File(directory, "complete").isFile
-                ) downloadEdition(savedEdition)
-                return
-            } catch (error: Exception) {
-                showMessage(error.message ?: "Could not read the saved edition.")
-            }
-        }
-        if (!NewspaperAvailability.checksAreAllowed(requestedDate)) {
-            availabilityCheckInProgress = false
-            latestEditionStatus = "Not available"
-            dawnStatusLabel.text = "Not available"
-            dawnStatusLabel.setTextColor(Color.GRAY)
-            pageLabel.text = "Dawn is not available before 9:00 AM"
-            return
-        }
-        availabilityCheckInProgress = true
-        latestEditionStatus = null
-        dawnStatusLabel.text = "Checking availability…"
-        dawnStatusLabel.setTextColor(Color.DKGRAY)
-        pageLabel.text = "Checking Dawn for ${requestedDate.replace('_', '-')}"
-        inspectionWebView.loadUrl("https://epaper.dawn.com/?page=${requestedDate}_001")
-    }
-
-    private fun discoverEdition() {
-        val requestedDate = checkedEditionDate ?: return
-        val script = """
-            (function() {
-                const requestedDate = '$requestedDate';
-                const datePattern = /^\d{2}_\d{2}_\d{4}_001$/;
-                const datePicker = Array.from(document.querySelectorAll('select'))
-                    .find(select => Array.from(select.options).some(option => datePattern.test(option.value)));
-                if (!datePicker || !datePicker.options.length) {
-                    return JSON.stringify({error: 'Could not find Dawn edition dates on this page.'});
-                }
-                const availableDates = Array.from(datePicker.options)
-                    .map(option => option.value.substring(0, 10));
-                const latestDate = datePicker.options[0].value.substring(0, 10);
-                if (!availableDates.includes(requestedDate)) {
-                    return JSON.stringify({error: 'NOT_AVAILABLE', latestDate: latestDate});
-                }
-                const pages = [];
-                const seen = new Set();
-                for (const link of document.querySelectorAll('a[href*="page="]')) {
-                    const url = new URL(link.href, location.href);
-                    const id = url.searchParams.get('page');
-                    if (id && id.startsWith(requestedDate + '_') &&
-                        /^\d{2}_\d{2}_\d{4}_\d{3}$/.test(id) && !seen.has(id)) {
-                        seen.add(id);
-                        pages.push({id: id, title: link.innerText.trim()});
-                    }
-                }
-                if (!pages.length) {
-                    return JSON.stringify({error: 'NOT_AVAILABLE', latestDate: latestDate});
-                }
-                return JSON.stringify({
-                    date: requestedDate,
-                    latestDate: latestDate,
-                    pages: pages
-                });
-            })();
-        """.trimIndent()
-        inspectionWebView.evaluateJavascript(script) { result ->
-            try {
-                if (checkedEditionDate != requestedDate) return@evaluateJavascript
-                val json = JSONTokener(result).nextValue() as? String
-                    ?: throw IllegalStateException("Could not read the Dawn edition page list.")
-                val response = JSONObject(json)
-                availabilityCheckInProgress = false
-                if (response.optString("error") == "NOT_AVAILABLE") {
-                    latestEditionStatus = "Not available"
-                    dawnStatusLabel.text = "Not available"
-                    dawnStatusLabel.setTextColor(Color.GRAY)
-                    pageLabel.text = "Dawn is not available for ${requestedDate.replace('_', '-')}"
-                    return@evaluateJavascript
-                } else if (response.has("error")) {
-                    val message = response.getString("error")
-                    latestEditionStatus = message
-                    dawnStatusLabel.text = "Could not check availability"
-                    dawnStatusLabel.setTextColor(Color.RED)
-                    pageLabel.text = message
-                } else {
-                    val discoveredEdition = NewspaperEdition.fromJson(json)
-                    val directory = editionDirectory(discoveredEdition)
-                    if (!directory.exists() && !directory.mkdirs()) {
-                        throw IllegalStateException("Could not create Dawn edition storage.")
-                    }
-                    val metadata = File(directory, "edition.json")
-                    val previousEdition = if (metadata.isFile) {
-                        try {
-                            NewspaperEdition.readMetadata(metadata).takeIf {
-                                !it.isJangEdition && it.date == requestedDate
-                            }
-                        } catch (error: Exception) {
-                            showMessage(error.message ?: "Saved edition metadata is invalid and will be rebuilt.")
-                            null
-                        }
-                    } else null
-                    val edition = if (previousEdition == null) {
-                        discoveredEdition
-                    } else {
-                        discoveredEdition.copy(
-                            fullImageIds = previousEdition.fullImageIds,
-                            hotspots = previousEdition.hotspots,
-                            articles = previousEdition.articles,
-                            processedPageIds = previousEdition.processedPageIds
-                        )
-                    }
-                    edition.saveMetadata(directory)
-                    val jangIsActive = readerMode && offlineEdition?.isJangEdition == true
-                    if (!jangIsActive) {
-                        availableEdition = edition
-                        updatePagePicker(edition)
-                    }
-                    val savedEdition = if (metadata.isFile) {
-                        try {
-                            NewspaperEdition.readMetadata(metadata)
-                        } catch (error: Exception) {
-                            showMessage(error.message ?: "Saved edition metadata is invalid and will be rebuilt.")
-                            null
-                        }
-                    } else null
-                    val pagesSaved = savedEdition != null &&
-                        File(directory, "complete").isFile &&
-                        savedEdition.pages.all { savedEdition.hasPageImage(directory, it.id) }
-                    if (pagesSaved) {
-                        if (!jangIsActive) {
-                            availableEdition = savedEdition
-                            updatePagePicker(savedEdition!!)
-                        }
-                        dawnStatusLabel.text = "Available"
-                        dawnStatusLabel.setTextColor(Color.rgb(30, 125, 70))
-                    } else {
-                        dawnStatusLabel.text = "Available"
-                        dawnStatusLabel.setTextColor(Color.rgb(30, 125, 70))
-                        if (requestedDate == dateFormat.format(Calendar.getInstance().time)) {
-                            downloadEdition(edition)
-                        }
-                    }
-                }
-                updatePageLabel()
-            } catch (error: Exception) {
-                availabilityCheckInProgress = false
-                latestEditionStatus = error.message ?: "Could not check Dawn's edition."
-                dawnStatusLabel.text = "Could not check availability"
-                dawnStatusLabel.setTextColor(Color.RED)
-                updatePageLabel()
-                showMessage(error.message ?: "Could not read Dawn's edition page list.")
-            }
-        }
+        webView.loadDataWithBaseURL(paper.offlineOrigin, html, "text/html", "UTF-8", null)
     }
 
     private fun downloadEdition(edition: NewspaperEdition) {
-        if (editionInProgress?.date == edition.date) return
+        if (editionInProgress?.let {
+                it.date == edition.date && it.paperId == edition.paperId
+            } == true
+        ) return
 
         val directory = editionDirectory(edition)
         synchronized(pageDownloadLock) {
@@ -1221,9 +1071,11 @@ class MainActivity : Activity() {
                     pageDownloadQueue.poll()?.also {
                         queuedPageIds.remove(it.page.id)
                         pageDownloadInProgressId = it.page.id
+                        pageDownloadInProgressPaperId = it.edition.paperId
                     } ?: run {
                         pageDownloadWorkerRunning = false
                         pageDownloadInProgressId = null
+                        pageDownloadInProgressPaperId = null
                         null
                     }
                 } ?: break
@@ -1238,14 +1090,14 @@ class MainActivity : Activity() {
                                 articles = collectedArticles
                             )
                             if (!readerMode ||
-                                offlineEdition?.isJangEdition == request.edition.isJangEdition
+                                offlineEdition?.paperId == request.edition.paperId
                             ) {
                                 availableEdition = updatedEdition
                             }
                             pageDownloadsRemaining = (pageDownloadsRemaining - 1).coerceAtLeast(0)
                         }
                         if (readerMode && !viewingStoryContent &&
-                            offlineEdition?.isJangEdition == request.edition.isJangEdition &&
+                            offlineEdition?.paperId == request.edition.paperId &&
                             selectedDateKey() == request.edition.date &&
                             pageNumber == request.page.id.takeLast(3).toIntOrNull()
                         ) {
@@ -1275,7 +1127,10 @@ class MainActivity : Activity() {
                         }
                     }
                 } finally {
-                    synchronized(pageDownloadLock) { pageDownloadInProgressId = null }
+                    synchronized(pageDownloadLock) {
+                        pageDownloadInProgressId = null
+                        pageDownloadInProgressPaperId = null
+                    }
                 }
             }
             runOnUiThread {
@@ -1307,13 +1162,13 @@ class MainActivity : Activity() {
         }
         processingContentId = null
         inspectionWebView.loadUrl(
-            NewspaperFetchers.forEdition(edition).pageUrl(edition.date, page.id),
+            Papers.forEdition(edition).pageUrl(edition.date, page.id),
             mapOf("Referer" to "https://epaper.dawn.com/")
         )
     }
 
     private fun collectPageHotspots(edition: NewspaperEdition, page: NewspaperPage) {
-        val fetcher = NewspaperFetchers.forEdition(edition)
+        val fetcher = Papers.forEdition(edition)
         inspectionWebView.evaluateJavascript(
             fetcher.hotspotExtractionScript(edition.date, page.id)
         ) { result ->
@@ -1356,13 +1211,13 @@ class MainActivity : Activity() {
             onDemandPage != null
         ) return
         onDemandPage = edition to page
-        if (edition.isJangEdition) {
+        if (Papers.forEdition(edition).requiresPageVerification) {
             jangWebView.loadUrl(
-                NewspaperFetchers.forEdition(edition).pageUrl(edition.date, page.id)
+                Papers.forEdition(edition).pageUrl(edition.date, page.id)
             )
         } else {
             inspectionWebView.loadUrl(
-                NewspaperFetchers.forEdition(edition).pageUrl(edition.date, page.id),
+                Papers.forEdition(edition).pageUrl(edition.date, page.id),
                 mapOf("Referer" to "https://epaper.dawn.com/")
             )
         }
@@ -1471,7 +1326,7 @@ class MainActivity : Activity() {
         val request = pendingTextStories.removeFirst()
         activeTextStory = request
         refreshDownloadIndicator()
-        val url = NewspaperFetchers.forEdition(request.edition).articleUrl(request.id)
+        val url = Papers.forEdition(request.edition).articleUrl(request.id)
         detailWebView.loadUrl(url)
     }
 
@@ -1479,7 +1334,7 @@ class MainActivity : Activity() {
         val directory = request.directory
         try {
             if (editionInProgress?.date == request.edition.date &&
-                editionInProgress?.isJangEdition == request.edition.isJangEdition
+                editionInProgress?.paperId == request.edition.paperId
             ) {
                 collectedArticles = collectedArticles.filterNot { it.id == article.id } + article
                 persistProgress(editionInProgress ?: request.edition)
@@ -1499,16 +1354,16 @@ class MainActivity : Activity() {
 
     private fun updateEditionReferences(edition: NewspaperEdition) {
         if (offlineEdition?.date == edition.date &&
-            offlineEdition?.isJangEdition == edition.isJangEdition
+            offlineEdition?.paperId == edition.paperId
         ) offlineEdition = edition
         if (availableEdition?.date == edition.date &&
-            availableEdition?.isJangEdition == edition.isJangEdition
+            availableEdition?.paperId == edition.paperId
         ) availableEdition = edition
     }
 
     private fun collectOnDemandPageHotspots(edition: NewspaperEdition, page: NewspaperPage) {
-        val fetcher = NewspaperFetchers.forEdition(edition)
-        val source = if (edition.isJangEdition) jangWebView else inspectionWebView
+        val fetcher = Papers.forEdition(edition)
+        val source = if (fetcher.requiresPageVerification) jangWebView else inspectionWebView
         source.evaluateJavascript(fetcher.hotspotExtractionScript(edition.date, page.id)) { result ->
             try {
                 if (onDemandPage != (edition to page)) return@evaluateJavascript
@@ -1528,13 +1383,13 @@ class MainActivity : Activity() {
                 val updated = latest.copy(
                     hotspots = latest.hotspots.filterNot { it.pageId == page.id } + hotspots,
                     processedPageIds = (latest.processedPageIds + page.id).distinct(),
-                    jangImageAreasVersion = if (edition.isJangEdition) 1
+                    jangImageAreasVersion = if (fetcher.requiresPageVerification) 1
                     else latest.jangImageAreasVersion
                 )
                 updated.saveMetadata(directory)
                 availableEdition = updated
                 if (offlineEdition?.date == updated.date &&
-                    offlineEdition?.isJangEdition == updated.isJangEdition
+                    offlineEdition?.paperId == updated.paperId
                 ) offlineEdition = updated
                 if (readerMode && selectedDateKey() == updated.date &&
                     pageNumber == page.id.takeLast(3).toIntOrNull()
@@ -1565,7 +1420,7 @@ class MainActivity : Activity() {
             failEditionDownload("Edition storage is unavailable.")
             return
         }
-        val detailImageIds = if (NewspaperFetchers.forEdition(edition).supportsImageDetail) {
+        val detailImageIds = if (Papers.forEdition(edition).supportsImageDetail) {
             textStoryIds
         } else {
             emptyList()
@@ -1775,7 +1630,7 @@ class MainActivity : Activity() {
             savedEdition.removeLegacyArchives(directory)
             savedEdition.saveMetadata(directory)
             File(directory, "complete").writeText("ok", Charsets.UTF_8)
-            if (!readerMode || offlineEdition?.isJangEdition != true) {
+            if (!readerMode || offlineEdition?.paperId == savedEdition.paperId) {
                 availableEdition = savedEdition
                 offlineEdition = savedEdition
             }
@@ -1784,10 +1639,9 @@ class MainActivity : Activity() {
             archivingStories = false
             pageScanInProgress = false
             storyScanInProgress = false
-            dawnStatusLabel.text = "Available"
-            dawnStatusLabel.setTextColor(Color.rgb(30, 125, 70))
+            setPaperStatus(Papers.forEdition(savedEdition), "Available", Color.rgb(30, 125, 70))
             refreshDownloadIndicator()
-            if (!readerMode || offlineEdition?.isJangEdition != true) {
+            if (!readerMode || offlineEdition?.paperId == savedEdition.paperId) {
                 updatePagePicker(savedEdition)
                 updatePageLabel()
             }
@@ -1797,13 +1651,15 @@ class MainActivity : Activity() {
     }
 
     private fun failEditionDownload(message: String) {
+        val failedEdition = editionInProgress
         editionInProgress = null
         activeEditionDirectory = null
         archivingStories = false
         pageScanInProgress = false
         storyScanInProgress = false
-        dawnStatusLabel.text = "Available"
-        dawnStatusLabel.setTextColor(Color.rgb(180, 90, 20))
+        failedEdition?.let {
+            setPaperStatus(Papers.forEdition(it), "Available", Color.rgb(180, 90, 20))
+        }
         refreshDownloadIndicator()
         showMessage(message)
         updatePageLabel()
@@ -1818,13 +1674,16 @@ class MainActivity : Activity() {
             processedPageIds = processedPageIds
         )
         progress.saveMetadata(directory)
-        val dawnIsActive = readerMode && offlineEdition?.isJangEdition == true
-        if (!dawnIsActive) availableEdition = progress
-        if (offlineEdition?.let { it.date == progress.date && !it.isJangEdition } == true) {
+        val anotherPaperIsActive = readerMode && offlineEdition?.paperId != progress.paperId
+        if (!anotherPaperIsActive) availableEdition = progress
+        if (offlineEdition?.let {
+                it.date == progress.date && it.paperId == progress.paperId
+            } == true
+        ) {
             offlineEdition = progress
         }
-        if (!dawnIsActive) updatePagePicker(progress)
-        if (readerMode && !dawnIsActive && !viewingStoryContent &&
+        if (!anotherPaperIsActive) updatePagePicker(progress)
+        if (readerMode && !anotherPaperIsActive && !viewingStoryContent &&
             selectedDateKey() == progress.date
         ) {
             val page = progress.readingOrder.firstOrNull {
@@ -1886,7 +1745,12 @@ class MainActivity : Activity() {
         }
         viewingStoryContent = false
         val pageHotspots = edition.hotspots.filter { it.pageId == page.id }
-        val html = renderOfflinePage(page, pageHotspots, directory)
+        val html = paperViewer.renderPage(
+            page,
+            pageHotspots,
+            Papers.forEdition(edition),
+            directory
+        )
         displayedPageId = page.id
         displayedEditionDate = edition.date
         paperPageReady = false
@@ -1897,62 +1761,6 @@ class MainActivity : Activity() {
             "UTF-8",
             null
         )
-    }
-
-    private fun renderOfflinePage(
-        page: NewspaperPage,
-        hotspots: List<NewspaperHotspot>,
-        directory: File
-    ): String {
-        val imageFileName = if (File(directory, "${page.id}.jpg").isFile) {
-            "${page.id}.jpg"
-        } else {
-            "${page.id}.png"
-        }
-        val areas = hotspots.joinToString("") { hotspot ->
-            val route = if (hotspot.type == NewspaperHotspotType.TEXT) "text" else "image"
-            """<area shape="${htmlEscape(hotspot.shape)}" coords="${hotspot.coordinates.joinToString(",")}" href="https://offline.dawn/$route/${hotspot.targetId}" alt="${htmlEscape(hotspot.label)}" title="${htmlEscape(hotspot.label)}">"""
-        }
-        return """
-            <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-            <style>body{margin:0;background:#222;text-align:center}
-            area,a{-webkit-tap-highlight-color:transparent;outline:none}
-            area:focus,area:active,a:focus,a:active{outline:none}
-            #paper-container{position:relative;width:100%}
-            #page{display:block;width:100%;height:auto;margin:auto}
-            .hotspot-highlight{position:absolute;z-index:2;pointer-events:none;
-              background:rgba(255,210,0,.32);border:3px solid #ffd400;box-sizing:border-box;
-              box-shadow:0 0 12px rgba(255,212,0,.9)}</style>
-            </head><body><div id="paper-container"><img id="page" src="$imageFileName" usemap="#page-map"><map id="page-map" name="page-map">$areas</map></div>
-            <script>
-            (function(){const img=document.getElementById('page');
-            function scale(){if(!img.naturalWidth)return;const sx=img.clientWidth/img.naturalWidth,sy=img.clientHeight/img.naturalHeight;
-            document.querySelectorAll('area').forEach(a=>{if(!a.dataset.original)a.dataset.original=a.coords;const c=a.dataset.original.split(',').map(Number);
-            a.coords=c.map((n,i)=>Math.round(n*(i%2?sy:sx))).join(',')})}
-            window.updatePageHotspots=function(items){const map=document.getElementById('page-map');map.replaceChildren();
-            items.forEach(item=>{const area=document.createElement('area');area.shape=item.shape;
-            area.coords=item.coordinates.join(',');area.href='https://offline.dawn/'+item.route+'/'+item.targetId;
-            area.alt=item.label;area.title=item.label;map.appendChild(area)});scale()};
-            document.getElementById('page-map').addEventListener('click',function(event){
-            const area=event.target.closest('area');if(!area)return;
-            const shape=area.shape.toLowerCase(),coords=area.coords.split(',').map(Number);
-            if((shape==='circle'&&coords.length<3)||(shape!=='circle'&&coords.length<4))return;
-            event.preventDefault();
-            let left,top,right,bottom;
-            if(shape==='circle'){
-            left=coords[0]-coords[2];top=coords[1]-coords[2];
-            right=coords[0]+coords[2];bottom=coords[1]+coords[2]}
-            else{const xs=coords.filter((_,i)=>i%2===0),ys=coords.filter((_,i)=>i%2===1);
-            left=Math.min(...xs);top=Math.min(...ys);right=Math.max(...xs);bottom=Math.max(...ys)}
-            const mark=document.createElement('div');mark.className='hotspot-highlight';
-            mark.style.left=left+'px';mark.style.top=top+'px';
-            mark.style.width=(right-left)+'px';mark.style.height=(bottom-top)+'px';
-            if(shape==='circle')mark.style.borderRadius='50%';
-            document.getElementById('paper-container').appendChild(mark);const target=area.href;
-            setTimeout(()=>{location.href=target},180)});
-            img.addEventListener('load',scale);new ResizeObserver(scale).observe(img);scale();})();
-            </script></body></html>
-        """.trimIndent()
     }
 
     private fun updateRenderedHotspots() {
@@ -1977,6 +1785,7 @@ class MainActivity : Activity() {
     private fun openOfflineTarget(uri: Uri) {
         val edition = offlineEdition ?: return
         val directory = offlineDirectory ?: return
+        val paper = Papers.forEdition(edition)
         val parts = uri.pathSegments
         if (parts.size == 2 && parts[0] == "retry") {
             val page = edition.pages.firstOrNull { it.id == parts[1] } ?: return
@@ -1985,12 +1794,12 @@ class MainActivity : Activity() {
             return
         }
         if (parts.firstOrNull() == "article-image") {
-            if (edition.isJangEdition) {
+            if (paper.supportsInlineArticleImages) {
                 if (parts.size != 3) return
                 val article = edition.articles.firstOrNull { it.id == parts[1] } ?: return
                 val imageIndex = parts[2].toIntOrNull() ?: return
                 val imageUrl = article.imageUrls.getOrNull(imageIndex) ?: return
-                showJangArticleImage(article, imageUrl, imageIndex, directory)
+                showInlineArticleImage(paper, article, imageUrl, imageIndex, directory)
                 return
             }
         }
@@ -2003,7 +1812,9 @@ class MainActivity : Activity() {
             }
             "text" -> {
                 val article = edition.articles.firstOrNull { it.id == id }
-                if (article == null || (edition.isJangEdition && article.byline.isBlank())) {
+                if (article == null ||
+                    (paper.refreshArticleWhenBylineMissing && article.byline.isBlank())
+                ) {
                     viewingStoryContent = true
                     viewingArticleImage = false
                     displayedArticleId = id
@@ -2014,8 +1825,13 @@ class MainActivity : Activity() {
                 viewingArticleImage = false
                 displayedArticleId = article.id
                 webView.loadDataWithBaseURL(
-                    NewspaperFetchers.forEdition(edition).offlineOrigin,
-                    renderArticle(article, NewspaperFetchers.forEdition(edition), directory),
+                    Papers.forEdition(edition).offlineOrigin,
+                    paperViewer.renderArticle(
+                        edition,
+                        article,
+                        Papers.forEdition(edition),
+                        directory
+                    ),
                     "text/html",
                     "UTF-8",
                     null
@@ -2023,7 +1839,7 @@ class MainActivity : Activity() {
             }
             "article" -> {
                 val article = edition.articles.firstOrNull { it.id == id } ?: return
-                if (edition.isJangEdition && article.byline.isBlank()) {
+                if (paper.refreshArticleWhenBylineMissing && article.byline.isBlank()) {
                     viewingStoryContent = true
                     viewingArticleImage = false
                     displayedArticleId = id
@@ -2034,16 +1850,20 @@ class MainActivity : Activity() {
                 viewingArticleImage = false
                 displayedArticleId = article.id
                 webView.loadDataWithBaseURL(
-                    NewspaperFetchers.forEdition(edition).offlineOrigin,
-                    renderArticle(article, NewspaperFetchers.forEdition(edition), directory),
+                    Papers.forEdition(edition).offlineOrigin,
+                    paperViewer.renderArticle(
+                        edition,
+                        article,
+                        Papers.forEdition(edition),
+                        directory
+                    ),
                     "text/html",
                     "UTF-8",
                     null
                 )
             }
             "article-image" -> {
-                if (!NewspaperFetchers.forEdition(edition).supportsImageDetail ||
-                    !DAWN_STORY_ID_PATTERN.matches(id) ||
+                if (Papers.forEdition(edition).articleImageDetailTarget(id) == null ||
                     edition.hotspots.none {
                         it.targetId == id && it.type == NewspaperHotspotType.TEXT
                     }
@@ -2070,18 +1890,20 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun showJangArticleImage(
+    private fun showInlineArticleImage(
+        paper: Paper,
         article: NewspaperArticle,
         imageUrl: String,
         imageIndex: Int,
         directory: File
     ) {
+        val imageTarget = paper.inlineArticleImageTarget(article.id, imageIndex) ?: return
         viewingStoryContent = true
         viewingArticleImage = true
         displayedArticleId = article.id
         val localImage = offlineEdition?.articleImageFile(directory, article, imageIndex)
             ?.takeIf { it.isFile }
-            ?.let { "https://offline.jang/article-asset/${Uri.encode(article.id)}/$imageIndex" }
+            ?.let { paper.localArticleImageUrl(article.id, imageIndex) }
         val displayedImageUrl = localImage ?: imageUrl
         val html = """
             <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -2089,13 +1911,13 @@ class MainActivity : Activity() {
             header{height:48px;display:flex;align-items:center;padding:0 12px}
             a{color:#fff}img{display:block;width:100%;height:calc(100% - 48px);margin:0 auto;object-fit:contain}
             #error{padding:24px;text-align:center}</style></head>
-            <body><header><a href="https://offline.jang/article/${article.id}">Back to story text</a></header>
+            <body><header><a href="${paper.offlineOrigin}article/${article.id}">Back to story text</a></header>
             <img src="${htmlEscape(displayedImageUrl)}" alt="${htmlEscape(article.title)}"
                 onerror="this.hidden=true;document.getElementById('error').hidden=false">
             <div id="error" hidden>Image could not be displayed.</div></body></html>
         """.trimIndent()
         webView.loadDataWithBaseURL(
-            "https://offline.jang/article-image/${article.id}/$imageIndex",
+            imageTarget,
             html,
             "text/html",
             "UTF-8",
@@ -2109,7 +1931,7 @@ class MainActivity : Activity() {
             ?: return
         val baseUrl = Uri.fromFile(directory).toString().trimEnd('/') + "/"
         val imageFile = edition.fullImageFile(directory, id)
-        val host = if (edition.isJangEdition) "offline.jang" else "offline.dawn"
+        val paper = Papers.forEdition(edition)
         viewingStoryContent = true
         val html = """
             <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -2117,7 +1939,7 @@ class MainActivity : Activity() {
             header{height:48px;display:flex;align-items:center;padding:0 12px}
             a{color:#fff}img{display:block;width:100%;height:calc(100% - 48px);margin:0 auto;object-fit:contain}
             #error{padding:24px;text-align:center}</style></head>
-            <body><header><a href="https://$host/page/$sourcePage">Back to paper</a></header>
+            <body><header><a href="${paper.offlineOrigin}page/$sourcePage">Back to paper</a></header>
             <img src="images/${htmlEscape(imageFile.name)}" alt="Full-size newspaper image"
                 onerror="this.hidden=true;document.getElementById('error').hidden=false">
             <div id="error" hidden>Image could not be displayed.</div></body></html>
@@ -2136,7 +1958,7 @@ class MainActivity : Activity() {
             header{height:48px;display:flex;align-items:center;padding:0 12px}
             a{color:#fff}img{display:block;width:100%;height:calc(100% - 48px);margin:0 auto;object-fit:contain}
             #error{padding:24px;text-align:center}</style></head>
-            <body><header><a href="https://offline.dawn/article/$id">Back to story text</a></header>
+            <body><header><a href="${Papers.forEdition(edition).offlineOrigin}article/$id">Back to story text</a></header>
             <img src="images/$id.jpg" alt="${htmlEscape(edition.articles.firstOrNull { it.id == id }?.title ?: "Story image")}"
                 onerror="this.hidden=true;document.getElementById('error').hidden=false">
             <div id="error" hidden>Image could not be displayed.</div></body></html>
@@ -2302,47 +2124,6 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun renderArticle(
-        article: NewspaperArticle,
-        newspaper: NewspaperFetcher,
-        directory: File? = null
-    ): String {
-        val paragraphs = article.paragraphs.joinToString("") {
-            "<p>${htmlEscape(it)}</p>"
-        }
-        val images = article.imageUrls.mapIndexed { index, imageUrl ->
-            val localImage = directory?.let {
-                offlineEdition?.articleImageFile(it, article, index)
-            }?.takeIf { it.isFile }?.let {
-                "https://offline.jang/article-asset/${Uri.encode(article.id)}/$index"
-            }
-            val displayedImageUrl = localImage ?: imageUrl
-            val image = """<img src="${htmlEscape(displayedImageUrl)}" alt="" loading="lazy">"""
-            if (newspaper.id == NewspaperId.JANG_LAHORE) {
-                """<a href="https://offline.jang/article-image/${article.id}/$index">$image</a>"""
-            } else {
-                image
-            }
-        }.joinToString("")
-        val imageButton = if (newspaper.supportsImageDetail &&
-            DAWN_STORY_ID_PATTERN.matches(article.id)
-        ) """
-            <a class="image-button" href="https://offline.dawn/article-image/${article.id}">
-              Display as image
-            </a>
-        """.trimIndent() else ""
-        return """
-            <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-            <style>body{max-width:760px;margin:24px auto;padding:0 20px;font:18px/1.65 Georgia,serif;color:#222}
-            h1{font-size:30px;line-height:1.2}.byline{color:#666;font:14px Arial,sans-serif;margin:12px 0 24px}
-            p{margin:0 0 1em}img{display:block;max-width:100%;height:auto;margin:20px auto}
-            .image-button{display:inline-block;margin:8px 0 18px;padding:10px 16px;
-            border-radius:4px;background:#244d70;color:#fff;text-decoration:none;font:14px Arial,sans-serif}
-            </style></head><body><h1>${htmlEscape(article.title)}</h1>
-            <div class="byline">${htmlEscape(article.byline)}</div>$imageButton$images$paragraphs</body></html>
-        """.trimIndent()
-    }
-
     private fun htmlEscape(value: String): String =
         value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
             .replace("\"", "&quot;").replace("'", "&#39;")
@@ -2370,26 +2151,36 @@ class MainActivity : Activity() {
         Toast.makeText(this, message, Toast.LENGTH_LONG).show()
     }
 
-    private fun setDownloadingIndicator(downloading: Boolean) {
-        dawnDownloadIndicator.visibility = if (downloading) View.VISIBLE else View.GONE
+    private fun refreshDownloadIndicator() {
+        val date = selectedDateKey()
+        val inProgressPagePaperId = synchronized(pageDownloadLock) {
+            pageDownloadInProgressPaperId
+        }
+        paperHomeItems.values.forEach { item ->
+            val paperId = item.paper.id
+            val pageDownloadActive = synchronized(pageDownloadLock) {
+                pageDownloadQueue.any {
+                    it.edition.paperId == paperId && it.edition.date == date
+                } || (inProgressPagePaperId == paperId &&
+                    pageDownloadInProgressId?.let { it.startsWith(date) } == true)
+            }
+            val storyDownloadActive = activeTextStory?.let {
+                it.edition.paperId == paperId && it.edition.date == date
+            } == true || pendingTextStories.any {
+                it.edition.paperId == paperId && it.edition.date == date
+            }
+            val editionDownloadActive = editionInProgress?.let {
+                it.paperId == paperId && it.date == date
+            } == true
+            item.downloadIndicator.visibility = if (
+                pageDownloadActive || storyDownloadActive || editionDownloadActive
+            ) View.VISIBLE else View.GONE
+        }
     }
 
     private companion object {
-        val DAWN_STORY_ID_PATTERN = Regex("\\d{2}_\\d{2}_\\d{4}_\\d{3}_\\d{3}")
-    }
-
-    private fun refreshDownloadIndicator() {
-        val date = selectedDateKey()
-        val pageDownloadActive = synchronized(pageDownloadLock) {
-            pageDownloadQueue.any { it.edition.date == date && !it.edition.isJangEdition } ||
-                pageDownloadInProgressId?.startsWith("${date}_") == true
-        }
-        val storyDownloadActive = activeTextStory?.edition?.date == date ||
-            pendingTextStories.any { it.edition.date == date } ||
-            prefetchingImageIds.any { it.startsWith("${date}_") }
-        setDownloadingIndicator(
-            editionInProgress?.date == date || pageDownloadActive || storyDownloadActive
-        )
+        const val MAX_AVAILABILITY_ATTEMPTS = 20
+        const val AVAILABILITY_RETRY_MILLIS = 1_500L
     }
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
@@ -2401,6 +2192,7 @@ class MainActivity : Activity() {
         inspectionWebView.destroy()
         jangWebView.destroy()
         detailWebView.destroy()
+        availabilityWebViews.values.forEach(WebView::destroy)
         super.onDestroy()
     }
 
@@ -2413,10 +2205,15 @@ class MainActivity : Activity() {
                 val article = edition?.articles?.firstOrNull { it.id == displayedArticleId }
                 if (edition != null && directory != null && article != null) {
                     viewingArticleImage = false
-                    val newspaper = NewspaperFetchers.forEdition(edition)
+                    val newspaper = Papers.forEdition(edition)
                     webView.loadDataWithBaseURL(
                         newspaper.offlineOrigin,
-                        renderArticle(article, newspaper, directory),
+                        paperViewer.renderArticle(
+                            edition,
+                            article,
+                            newspaper,
+                            directory
+                        ),
                         "text/html",
                         "UTF-8",
                         null

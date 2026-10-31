@@ -29,16 +29,16 @@ import java.util.Locale
 import java.util.concurrent.Executors
 
 abstract class NewspaperEditionCheckJobService : JobService() {
-    protected abstract val fetchersForJob: List<NewspaperFetcher>
+    protected abstract val paperId: NewspaperId
 
     private val worker = Executors.newSingleThreadExecutor()
     private val mainHandler = Handler(Looper.getMainLooper())
     private var webView: WebView? = null
     private var activeJob: JobParameters? = null
     private var checkDate: String? = null
-    private var fetchersToCheck: List<NewspaperFetcher> = emptyList()
-    private var fetcherIndex = 0
-    private var currentFetcher: NewspaperFetcher? = null
+    private var papersToCheck: List<Paper> = emptyList()
+    private var paperIndex = 0
+    private var currentPaper: Paper? = null
     private var verificationAttempts = 0
     private var shouldRetry = false
     private var backgroundEdition: NewspaperEdition? = null
@@ -64,8 +64,8 @@ abstract class NewspaperEditionCheckJobService : JobService() {
         }
 
         checkDate = today
-        fetchersToCheck = fetchersForJob
-        fetcherIndex = 0
+        papersToCheck = listOf(Papers[paperId])
+        paperIndex = 0
         shouldRetry = false
         val browser = WebView(this)
         webView = browser
@@ -73,7 +73,7 @@ abstract class NewspaperEditionCheckJobService : JobService() {
         browser.settings.domStorageEnabled = true
         browser.webViewClient = object : WebViewClient() {
             override fun onPageFinished(view: WebView, url: String) {
-                val fetcher = currentFetcher ?: return
+                val fetcher = currentPaper ?: return
                 val date = checkDate ?: return
                 if (activeJob !== params) return
                 if (fetcher.isAvailabilityPageUrl(url, date)) {
@@ -98,7 +98,7 @@ abstract class NewspaperEditionCheckJobService : JobService() {
                 error: android.webkit.WebResourceError
             ) {
                 if (request.isForMainFrame && activeJob === params) {
-                    val fetcher = currentFetcher ?: return
+                    val fetcher = currentPaper ?: return
                     Log.e(TAG, "Could not check ${fetcher.id.displayName}: ${error.description}")
                     shouldRetry = true
                     if (backgroundEdition != null) {
@@ -115,12 +115,12 @@ abstract class NewspaperEditionCheckJobService : JobService() {
 
     private fun checkNextFetcher(params: JobParameters) {
         if (activeJob !== params) return
-        if (fetcherIndex >= fetchersToCheck.size) {
+        if (paperIndex >= papersToCheck.size) {
             finish(params, shouldRetry)
             return
         }
-        val fetcher = fetchersToCheck[fetcherIndex++]
-        currentFetcher = fetcher
+        val fetcher = papersToCheck[paperIndex++]
+        currentPaper = fetcher
         backgroundEdition = null
         backgroundDirectory = null
         backgroundPages = emptyList()
@@ -135,7 +135,7 @@ abstract class NewspaperEditionCheckJobService : JobService() {
         if (metadataFile.isFile) {
             val savedEdition = try {
                 NewspaperEdition.readMetadata(metadataFile).also {
-                    require(NewspaperFetchers.forEdition(it).id == fetcher.id) {
+                    require(Papers.forEdition(it).id == fetcher.id) {
                         "Saved edition belongs to another newspaper."
                     }
                     require(it.date == date) {
@@ -189,11 +189,11 @@ abstract class NewspaperEditionCheckJobService : JobService() {
     private fun discoverEdition(
         view: WebView,
         params: JobParameters,
-        fetcher: NewspaperFetcher,
+        fetcher: Paper,
         date: String
     ) {
         view.evaluateJavascript(fetcher.availabilityDiscoveryScript(date)) { result ->
-            if (activeJob !== params || currentFetcher != fetcher) return@evaluateJavascript
+            if (activeJob !== params || currentPaper != fetcher) return@evaluateJavascript
             val json = runCatching { JSONTokener(result).nextValue() as? String }.getOrNull()
             if (json == null) {
                 Log.e(TAG, "Could not read ${fetcher.id.displayName}'s availability response.")
@@ -212,7 +212,7 @@ abstract class NewspaperEditionCheckJobService : JobService() {
                 "VERIFYING" -> {
                     if (verificationAttempts++ < MAX_VERIFICATION_ATTEMPTS) {
                         mainHandler.postDelayed({
-                            if (activeJob === params && currentFetcher == fetcher) {
+                            if (activeJob === params && currentPaper == fetcher) {
                                 discoverEdition(view, params, fetcher, date)
                             }
                         }, VERIFICATION_RETRY_MILLIS)
@@ -260,7 +260,7 @@ abstract class NewspaperEditionCheckJobService : JobService() {
 
     private fun downloadKnownEdition(
         params: JobParameters,
-        fetcher: NewspaperFetcher,
+        fetcher: Paper,
         edition: NewspaperEdition,
         targetDirectory: File
     ) {
@@ -287,7 +287,7 @@ abstract class NewspaperEditionCheckJobService : JobService() {
 
     private fun beginBackgroundPageScan(
         params: JobParameters,
-        fetcher: NewspaperFetcher,
+        fetcher: Paper,
         edition: NewspaperEdition,
         directory: File
     ) {
@@ -304,7 +304,7 @@ abstract class NewspaperEditionCheckJobService : JobService() {
 
     private fun loadNextBackgroundPage(
         params: JobParameters,
-        fetcher: NewspaperFetcher,
+        fetcher: Paper,
         edition: NewspaperEdition
     ) {
         if (activeJob !== params || backgroundEdition !== edition) return
@@ -327,7 +327,7 @@ abstract class NewspaperEditionCheckJobService : JobService() {
     private fun collectBackgroundPageHotspots(
         view: WebView,
         params: JobParameters,
-        fetcher: NewspaperFetcher,
+        fetcher: Paper,
         edition: NewspaperEdition,
         page: NewspaperPage,
         attempt: Int = 0
@@ -365,7 +365,7 @@ abstract class NewspaperEditionCheckJobService : JobService() {
 
     private fun retryBackgroundPage(
         params: JobParameters,
-        fetcher: NewspaperFetcher,
+        fetcher: Paper,
         edition: NewspaperEdition,
         page: NewspaperPage,
         attempt: Int
@@ -393,7 +393,7 @@ abstract class NewspaperEditionCheckJobService : JobService() {
 
     private fun beginBackgroundStoryScan(
         params: JobParameters,
-        fetcher: NewspaperFetcher,
+        fetcher: Paper,
         edition: NewspaperEdition,
         directory: File
     ) {
@@ -414,7 +414,7 @@ abstract class NewspaperEditionCheckJobService : JobService() {
 
     private fun loadNextBackgroundStory(
         params: JobParameters,
-        fetcher: NewspaperFetcher,
+        fetcher: Paper,
         edition: NewspaperEdition
     ) {
         if (activeJob !== params || backgroundEdition !== edition) return
@@ -430,7 +430,7 @@ abstract class NewspaperEditionCheckJobService : JobService() {
     private fun collectBackgroundArticle(
         view: WebView,
         params: JobParameters,
-        fetcher: NewspaperFetcher,
+        fetcher: Paper,
         edition: NewspaperEdition,
         storyId: String
     ) {
@@ -479,7 +479,7 @@ abstract class NewspaperEditionCheckJobService : JobService() {
 
     private fun advanceBackgroundStory(
         params: JobParameters,
-        fetcher: NewspaperFetcher,
+        fetcher: Paper,
         edition: NewspaperEdition
     ) {
         backgroundStoryIndex++
@@ -488,7 +488,7 @@ abstract class NewspaperEditionCheckJobService : JobService() {
 
     private fun downloadBackgroundImages(
         params: JobParameters,
-        fetcher: NewspaperFetcher,
+        fetcher: Paper,
         edition: NewspaperEdition,
         directory: File
     ) {
@@ -552,7 +552,7 @@ abstract class NewspaperEditionCheckJobService : JobService() {
 
     private fun completeBackgroundEdition(
         params: JobParameters,
-        fetcher: NewspaperFetcher,
+        fetcher: Paper,
         edition: NewspaperEdition,
         directory: File
     ) {
@@ -572,14 +572,14 @@ abstract class NewspaperEditionCheckJobService : JobService() {
     }
 
     private fun isBackgroundEditionComplete(
-        fetcher: NewspaperFetcher,
+        fetcher: Paper,
         edition: NewspaperEdition,
         directory: File,
         marker: File
     ): Boolean = marker.isFile && isBackgroundContentReady(fetcher, edition, directory)
 
     private fun isBackgroundContentReady(
-        fetcher: NewspaperFetcher,
+        fetcher: Paper,
         edition: NewspaperEdition,
         directory: File
     ): Boolean {
@@ -596,7 +596,7 @@ abstract class NewspaperEditionCheckJobService : JobService() {
 
     private fun skipBackgroundItem(params: JobParameters) {
         shouldRetry = true
-        val fetcher = currentFetcher ?: return
+        val fetcher = currentPaper ?: return
         val edition = backgroundEdition ?: run {
             checkNextFetcher(params)
             return
@@ -616,8 +616,8 @@ abstract class NewspaperEditionCheckJobService : JobService() {
     override fun onStopJob(params: JobParameters): Boolean {
         activeJob = null
         cleanupWebView()
-        currentFetcher = null
-        fetchersToCheck = emptyList()
+        currentPaper = null
+        papersToCheck = emptyList()
         checkDate = null
         backgroundEdition = null
         backgroundDirectory = null
@@ -631,8 +631,8 @@ abstract class NewspaperEditionCheckJobService : JobService() {
             if (activeJob !== params) return@post
             activeJob = null
             cleanupWebView()
-            currentFetcher = null
-            fetchersToCheck = emptyList()
+            currentPaper = null
+            papersToCheck = emptyList()
             checkDate = null
             backgroundEdition = null
             backgroundDirectory = null
@@ -648,7 +648,7 @@ abstract class NewspaperEditionCheckJobService : JobService() {
         webView = null
     }
 
-    private fun notifyEditionAvailable(fetcher: NewspaperFetcher, edition: NewspaperEdition) {
+    private fun notifyEditionAvailable(fetcher: Paper, edition: NewspaperEdition) {
         createNotificationChannel()
         val preferences = getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
         val key = "notified_${fetcher.id.storageName}_${edition.date}"
@@ -702,10 +702,6 @@ abstract class NewspaperEditionCheckJobService : JobService() {
     }
 
     companion object {
-        private const val DAWN_JOB_ID = 2841
-        private const val DAWN_NINE_AM_JOB_ID = 2842
-        private const val JANG_JOB_ID = 2843
-        private const val JANG_NINE_AM_JOB_ID = 2844
         private const val INTERVAL_MILLIS = 15 * 60 * 1000L
         private const val CHANNEL_ID = "newspaper_availability"
         private const val NOTIFICATION_ID = 2841
@@ -723,35 +719,40 @@ abstract class NewspaperEditionCheckJobService : JobService() {
             }
             val delayMillis = (nextCheck.timeInMillis - now.timeInMillis).coerceAtLeast(0L)
             val scheduler = context.getSystemService(Context.JOB_SCHEDULER_SERVICE) as JobScheduler
-            listOf(
-                DAWN_NINE_AM_JOB_ID to DailyEditionCheckJobService::class.java,
-                JANG_NINE_AM_JOB_ID to JangEditionCheckJobService::class.java
-            ).forEach { (jobId, serviceClass) ->
-                val job = JobInfo.Builder(jobId, ComponentName(context, serviceClass))
+            Papers.all.forEach { paper ->
+                val registration = paper.backgroundJob
+                val job = JobInfo.Builder(
+                    registration.nineAmJobId,
+                    ComponentName(context, registration.serviceClass)
+                )
                     .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
                     .setPersisted(true)
                     .setMinimumLatency(delayMillis)
                     .setOverrideDeadline(delayMillis + 5 * 60 * 1000L)
                     .build()
                 if (scheduler.schedule(job) != JobScheduler.RESULT_SUCCESS) {
-                    Log.e(TAG, "Could not schedule the 9 AM availability check for $serviceClass.")
+                    Log.e(
+                        TAG,
+                        "Could not schedule the 9 AM check for ${paper.id.displayName}."
+                    )
                 }
             }
         }
 
         fun schedule(context: Context) {
             val scheduler = context.getSystemService(Context.JOB_SCHEDULER_SERVICE) as JobScheduler
-            listOf(
-                DAWN_JOB_ID to DailyEditionCheckJobService::class.java,
-                JANG_JOB_ID to JangEditionCheckJobService::class.java
-            ).forEach { (jobId, serviceClass) ->
-                val job = JobInfo.Builder(jobId, ComponentName(context, serviceClass))
+            Papers.all.forEach { paper ->
+                val registration = paper.backgroundJob
+                val job = JobInfo.Builder(
+                    registration.periodicJobId,
+                    ComponentName(context, registration.serviceClass)
+                )
                     .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
                     .setPersisted(true)
                     .setPeriodic(INTERVAL_MILLIS)
                     .build()
                 if (scheduler.schedule(job) != JobScheduler.RESULT_SUCCESS) {
-                    Log.e(TAG, "Could not schedule the periodic check for $serviceClass.")
+                    Log.e(TAG, "Could not schedule the periodic check for ${paper.id.displayName}.")
                 }
             }
         }
@@ -761,13 +762,11 @@ abstract class NewspaperEditionCheckJobService : JobService() {
 }
 
 class DailyEditionCheckJobService : NewspaperEditionCheckJobService() {
-    override val fetchersForJob: List<NewspaperFetcher>
-        get() = listOf(NewspaperFetchers[NewspaperId.DAWN])
+    override val paperId = NewspaperId.DAWN
 }
 
 class JangEditionCheckJobService : NewspaperEditionCheckJobService() {
-    override val fetchersForJob: List<NewspaperFetcher>
-        get() = listOf(NewspaperFetchers[NewspaperId.JANG_LAHORE])
+    override val paperId = NewspaperId.JANG_LAHORE
 }
 
 object DailyEditionCheckScheduler {
