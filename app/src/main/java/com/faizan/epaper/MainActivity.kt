@@ -55,6 +55,8 @@ class MainActivity : Activity() {
     private var viewingStoryContent = false
     private var displayedPageId: String? = null
     private var displayedEditionDate: String? = null
+    private var displayedArticleId: String? = null
+    private var viewingArticleImage = false
     private var paperPageReady = false
     private var availableEdition: DawnEdition? = null
     private var pageAdapter: ArrayAdapter<String>? = null
@@ -86,6 +88,7 @@ class MainActivity : Activity() {
     private var activeTextStory: TextStoryRequest? = null
     private val pendingTextStories = ArrayDeque<TextStoryRequest>()
     private val prefetchingImageIds = mutableSetOf<String>()
+    private val pendingArticleImageIds = mutableSetOf<String>()
     private var pageDownloadsRemaining = 0
     private var storyScanComplete = false
     private var pageDownloadFailed = false
@@ -944,6 +947,10 @@ class MainActivity : Activity() {
                             )
                             persistEdition(updated, directory)
                             updateEditionReferences(updated)
+                            if (pendingArticleImageIds.remove(id) &&
+                                readerMode && viewingArticleImage &&
+                                selectedDateKey() == edition.date
+                            ) showArticleImage(updated, directory, id)
                             if (onDemandImageId == id) {
                                 onDemandImageId = null
                                 storyLoadingDialog?.dismiss()
@@ -955,6 +962,9 @@ class MainActivity : Activity() {
                                 }
                             }
                         } catch (error: Exception) {
+                            if (pendingArticleImageIds.remove(id)) {
+                                showMessage(error.message ?: "Could not save this story image.")
+                            }
                             if (onDemandImageId == id) {
                                 onDemandImageId = null
                                 storyLoadingDialog?.dismiss()
@@ -973,6 +983,9 @@ class MainActivity : Activity() {
                     runOnUiThread {
                         prefetchingImageIds.remove(id)
                         refreshDownloadIndicator()
+                        if (pendingArticleImageIds.remove(id)) {
+                            showMessage(error.message ?: "Could not prefetch this story image.")
+                        }
                         if (onDemandImageId == id) {
                             onDemandImageId = null
                             storyLoadingDialog?.dismiss()
@@ -1327,8 +1340,11 @@ class MainActivity : Activity() {
         }
         return """
             <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-            <style>body{margin:0;background:#222;text-align:center}
-            img{display:block;width:100%;height:auto;margin:auto}</style>
+            <style>body{margin:0;background:#222;text-align:center;position:relative}
+            img{display:block;width:100%;height:auto;margin:auto}
+            .hotspot-highlight{position:absolute;z-index:2;pointer-events:none;
+              background:rgba(255,210,0,.32);border:3px solid #ffd400;box-sizing:border-box;
+              box-shadow:0 0 12px rgba(255,212,0,.9)}</style>
             </head><body><img id="page" src="${page.imageFileName}" usemap="#page-map"><map id="page-map" name="page-map">$areas</map>
             <script>
             (function(){const img=document.getElementById('page');
@@ -1339,6 +1355,21 @@ class MainActivity : Activity() {
             items.forEach(item=>{const area=document.createElement('area');area.shape=item.shape;
             area.coords=item.coordinates.join(',');area.href='https://offline.dawn/'+item.route+'/'+item.targetId;
             area.alt=item.label;area.title=item.label;map.appendChild(area)});scale()};
+            document.getElementById('page-map').addEventListener('click',function(event){
+            const area=event.target.closest('area');if(!area)return;event.preventDefault();
+            const coords=area.coords.split(',').map(Number);if(coords.length<4)return;
+            let left,top,right,bottom;
+            if(area.shape.toLowerCase()==='circle'&&coords.length>=3){
+            left=coords[0]-coords[2];top=coords[1]-coords[2];
+            right=coords[0]+coords[2];bottom=coords[1]+coords[2]}
+            else{const xs=coords.filter((_,i)=>i%2===0),ys=coords.filter((_,i)=>i%2===1);
+            left=Math.min(...xs);top=Math.min(...ys);right=Math.max(...xs);bottom=Math.max(...ys)}
+            const mark=document.createElement('div');mark.className='hotspot-highlight';
+            mark.style.left=(img.offsetLeft+left)+'px';mark.style.top=(img.offsetTop+top)+'px';
+            mark.style.width=(right-left)+'px';mark.style.height=(bottom-top)+'px';
+            if(area.shape.toLowerCase()==='circle')mark.style.borderRadius='50%';
+            document.body.appendChild(mark);const target=area.href;
+            setTimeout(()=>{location.href=target},180)});
             img.addEventListener('load',scale);new ResizeObserver(scale).observe(img);scale();})();
             </script></body></html>
         """.trimIndent()
@@ -1377,10 +1408,14 @@ class MainActivity : Activity() {
             "text" -> {
                 val article = edition.articles.firstOrNull { it.id == id } ?: run {
                     viewingStoryContent = true
+                    viewingArticleImage = false
+                    displayedArticleId = id
                     requestStoryText(edition, directory, id)
                     return
                 }
                 viewingStoryContent = true
+                viewingArticleImage = false
+                displayedArticleId = article.id
                 webView.loadDataWithBaseURL(
                     "https://offline.dawn/",
                     renderArticle(article),
@@ -1389,8 +1424,36 @@ class MainActivity : Activity() {
                     null
                 )
             }
+            "article" -> {
+                val article = edition.articles.firstOrNull { it.id == id } ?: return
+                viewingStoryContent = true
+                viewingArticleImage = false
+                displayedArticleId = article.id
+                webView.loadDataWithBaseURL(
+                    "https://offline.dawn/",
+                    renderArticle(article),
+                    "text/html",
+                    "UTF-8",
+                    null
+                )
+            }
+            "article-image" -> {
+                if (edition.hotspots.none {
+                        it.targetId == id && it.type == DawnHotspotType.TEXT
+                    }
+                ) return
+                viewingStoryContent = true
+                viewingArticleImage = true
+                displayedArticleId = id
+                if (File(File(directory, "images"), "$id.jpg").isFile) {
+                    showArticleImage(edition, directory, id)
+                } else {
+                    requestArticleImage(edition, directory, id)
+                }
+            }
             "image" -> {
                 viewingStoryContent = true
+                viewingArticleImage = false
                 if (!File(File(directory, "images"), "$id.jpg").isFile) {
                     requestStoryImage(edition, directory, id)
                     return
@@ -1420,6 +1483,69 @@ class MainActivity : Activity() {
         webView.loadDataWithBaseURL(baseUrl, html, "text/html", "UTF-8", null)
     }
 
+    private fun showArticleImage(edition: DawnEdition, directory: File, id: String) {
+        val baseUrl = Uri.fromFile(directory).toString().trimEnd('/') + "/"
+        viewingStoryContent = true
+        viewingArticleImage = true
+        displayedArticleId = id
+        val html = """
+            <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+            <style>html,body{margin:0;width:100%;height:100%;background:#111;color:#fff;font:16px sans-serif}
+            header{height:48px;display:flex;align-items:center;padding:0 12px}
+            a{color:#fff}img{display:block;width:100%;height:calc(100% - 48px);margin:0 auto;object-fit:contain}
+            #error{padding:24px;text-align:center}</style></head>
+            <body><header><a href="https://offline.dawn/article/$id">Back to story text</a></header>
+            <img src="images/$id.jpg" alt="${htmlEscape(edition.articles.firstOrNull { it.id == id }?.title ?: "Story image")}"
+                onerror="this.hidden=true;document.getElementById('error').hidden=false">
+            <div id="error" hidden>Image could not be displayed.</div></body></html>
+        """.trimIndent()
+        webView.loadDataWithBaseURL(baseUrl, html, "text/html", "UTF-8", null)
+    }
+
+    private fun requestArticleImage(edition: DawnEdition, directory: File, id: String) {
+        if (id in prefetchingImageIds) {
+            pendingArticleImageIds.add(id)
+            refreshDownloadIndicator()
+            return
+        }
+        pendingArticleImageIds.add(id)
+        prefetchingImageIds.add(id)
+        refreshDownloadIndicator()
+        downloadExecutor.execute {
+            try {
+                edition.downloadFullImages(directory, listOf(id)) { _, _ -> }
+                runOnUiThread {
+                    try {
+                        val metadata = File(directory, "edition.json")
+                        val latest = if (metadata.isFile) DawnEdition.readMetadata(metadata) else edition
+                        val updated = latest.copy(
+                            fullImageIds = (latest.fullImageIds + id).distinct()
+                        )
+                        persistEdition(updated, directory)
+                        updateEditionReferences(updated)
+                        pendingArticleImageIds.remove(id)
+                        if (readerMode && viewingArticleImage &&
+                            displayedArticleId == id && selectedDateKey() == edition.date
+                        ) showArticleImage(updated, directory, id)
+                    } catch (error: Exception) {
+                        pendingArticleImageIds.remove(id)
+                        showMessage(error.message ?: "Could not save this story image.")
+                    } finally {
+                        prefetchingImageIds.remove(id)
+                        refreshDownloadIndicator()
+                    }
+                }
+            } catch (error: Exception) {
+                runOnUiThread {
+                    pendingArticleImageIds.remove(id)
+                    prefetchingImageIds.remove(id)
+                    refreshDownloadIndicator()
+                    showMessage(error.message ?: "Could not download this story image.")
+                }
+            }
+        }
+    }
+
     private fun returnToCurrentPaperPage() {
         storyLoadingDialog?.dismiss()
         storyLoadingDialog = null
@@ -1427,6 +1553,8 @@ class MainActivity : Activity() {
         onDemandImageId = null
         onDemandEdition = null
         onDemandDirectory = null
+        viewingArticleImage = false
+        displayedArticleId = null
         val edition = availableEdition ?: offlineEdition ?: return
         val page = edition.readingOrder.firstOrNull {
             it.id.takeLast(3).toIntOrNull() == pageNumber
@@ -1536,12 +1664,19 @@ class MainActivity : Activity() {
         val paragraphs = article.paragraphs.joinToString("") {
             "<p>${htmlEscape(it)}</p>"
         }
+        val imageButton = """
+            <a class="image-button" href="https://offline.dawn/article-image/${article.id}">
+              Display as image
+            </a>
+        """.trimIndent()
         return """
             <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
             <style>body{max-width:760px;margin:24px auto;padding:0 20px;font:18px/1.65 Georgia,serif;color:#222}
             h1{font-size:30px;line-height:1.2}.byline{color:#666;font:14px Arial,sans-serif;margin:12px 0 24px}
-            p{margin:0 0 1em}</style></head><body><h1>${htmlEscape(article.title)}</h1>
-            <div class="byline">${htmlEscape(article.byline)}</div>$paragraphs</body></html>
+            p{margin:0 0 1em}.image-button{display:inline-block;margin:8px 0 18px;padding:10px 16px;
+            border-radius:4px;background:#244d70;color:#fff;text-decoration:none;font:14px Arial,sans-serif}
+            </style></head><body><h1>${htmlEscape(article.title)}</h1>
+            <div class="byline">${htmlEscape(article.byline)}</div>$imageButton$paragraphs</body></html>
         """.trimIndent()
     }
 
@@ -1602,7 +1737,23 @@ class MainActivity : Activity() {
     @Deprecated("Use the system back dispatcher in newer Android versions.")
     override fun onBackPressed() {
         if (readerMode) {
-            if (viewingStoryContent) {
+            if (viewingStoryContent && viewingArticleImage) {
+                val edition = offlineEdition
+                val directory = offlineDirectory
+                val article = edition?.articles?.firstOrNull { it.id == displayedArticleId }
+                if (edition != null && directory != null && article != null) {
+                    viewingArticleImage = false
+                    webView.loadDataWithBaseURL(
+                        "https://offline.dawn/",
+                        renderArticle(article),
+                        "text/html",
+                        "UTF-8",
+                        null
+                    )
+                } else {
+                    returnToCurrentPaperPage()
+                }
+            } else if (viewingStoryContent) {
                 returnToCurrentPaperPage()
             } else {
                 showHome()
