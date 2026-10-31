@@ -4,11 +4,12 @@ A native Android reader for Dawn's official e-paper site, designed with the Gala
 
 ## What it does
 
-- Starts with today's date selected and checks Dawn's availability for that date. Changing the date updates the availability check.
-- Shows Dawn and Jang in the newspaper list; Dawn editions that are available start downloading automatically. Jang is shown as not available until it is implemented.
-- Opens Dawn in an offline-first reader: the page image, visible news-point links, tappable story areas, and page selector/navigation controls are shown instead of the newspaper website.
+- Starts on a dedicated newspaper-selection screen with today's date selected. Changing the date updates Dawn's availability.
+- Shows Dawn and Jang in the newspaper list; available Dawn editions are prepared automatically in the background. Jang is shown as not available until it is implemented.
+- Opens Dawn on a separate reader screen showing the paper image and page selector/navigation controls, not the newspaper website.
 - Prefetches pages in front-page, back-page, editorial, then remaining-page order. Opening a page moves it ahead of queued downloads.
-- Saves page JPEGs, hotspot metadata, full-size images for image stories, and extracted article text. A tapped story opens its saved content or is fetched and saved on demand.
+- Makes stories tappable directly on the newspaper page. A tapped story opens its saved content or is fetched and saved on demand; no separate story buttons are shown.
+- Refreshes the current paper page as page images or hotspot metadata arrive. Download progress and storage mode are handled internally.
 - Uses Dawn's website temporarily to check availability and extract page/story data; full website HTML is not archived.
 
 Downloaded editions live in the app's private storage. Each edition contains page JPEGs, an `images/` folder for full-size story images, `edition.json` for page metadata/clickable areas/image IDs/article text, and a completion marker. Partial downloads are not listed as complete offline editions.

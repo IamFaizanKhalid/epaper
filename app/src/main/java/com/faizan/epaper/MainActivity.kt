@@ -35,8 +35,8 @@ class MainActivity : Activity() {
     private lateinit var pageLabel: TextView
     private lateinit var dateButton: Button
     private lateinit var dawnStatusLabel: TextView
-    private lateinit var homePanel: LinearLayout
-    private lateinit var readerPanel: LinearLayout
+    private lateinit var homeScreen: LinearLayout
+    private lateinit var readerScreen: LinearLayout
     private lateinit var pageSpinner: Spinner
     private val downloadExecutor = Executors.newFixedThreadPool(2)
     private val pageDownloadLock = Any()
@@ -49,6 +49,7 @@ class MainActivity : Activity() {
     private var selectedDate = Calendar.getInstance()
     private var pageNumber = 1
     private var readerMode = false
+    private var viewingStoryContent = false
     private var availableEdition: DawnEdition? = null
     private var pageAdapter: ArrayAdapter<String>? = null
     private var updatingPagePicker = false
@@ -88,7 +89,7 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.WHITE)
         }
-        val header = LinearLayout(this).apply {
+        homeScreen = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(12), dp(8), dp(12), dp(8))
             setBackgroundColor(Color.rgb(245, 245, 245))
@@ -132,16 +133,14 @@ class MainActivity : Activity() {
             setPadding(dp(12), dp(12), dp(12), dp(12))
         }
 
-        homePanel = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-        }
-        homePanel.addView(title)
-        homePanel.addView(paperRow)
-        homePanel.addView(jangRow)
-        homePanel.addView(button("Offline editions") { showOfflineEditions() })
+        homeScreen.addView(dateButton)
+        homeScreen.addView(title)
+        homeScreen.addView(paperRow)
+        homeScreen.addView(jangRow)
 
-        readerPanel = LinearLayout(this).apply {
+        readerScreen = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.WHITE)
         }
         val pageControls = LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
@@ -177,12 +176,8 @@ class MainActivity : Activity() {
             val index = pages.indexOfFirst { it.id.endsWith("_${pageNumber.toString().padStart(3, '0')}") }
             if (index >= 0 && index < pages.lastIndex) openReaderPage(pages[index + 1])
         })
-        readerPanel.addView(pageControls)
-        header.addView(dateButton)
-        header.addView(pageLabel)
-        header.addView(homePanel)
-        header.addView(readerPanel)
-        readerPanel.visibility = View.GONE
+        readerScreen.addView(pageLabel)
+        readerScreen.addView(pageControls)
 
         webView = WebView(this).apply {
             settings.javaScriptEnabled = true
@@ -247,6 +242,9 @@ class MainActivity : Activity() {
                     onDemandStoryId = null
                     onDemandEdition = null
                     onDemandDirectory = null
+                    if (!readerMode || selectedDateKey() != savedEdition.date) {
+                        return@parseStoryText
+                    }
                     webView.loadDataWithBaseURL(
                         "https://offline.dawn/",
                         renderArticle(article),
@@ -271,13 +269,6 @@ class MainActivity : Activity() {
             }
         }
 
-        root.addView(
-            header,
-            LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            )
-        )
         val contentFrame = FrameLayout(this)
         contentFrame.addView(
             inspectionWebView,
@@ -301,16 +292,22 @@ class MainActivity : Activity() {
             )
         )
         webView.visibility = View.GONE
-        root.addView(
-            contentFrame,
-            LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                0,
-                1f
-            )
-        )
+        readerScreen.addView(contentFrame, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            0,
+            1f
+        ))
+        root.addView(homeScreen, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.MATCH_PARENT
+        ))
+        readerScreen.visibility = View.GONE
+        root.addView(readerScreen, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.MATCH_PARENT
+        ))
         setContentView(root)
-        pageLabel.text = "Select a date and newspaper"
+        pageLabel.text = ""
         updateDateButton()
         updatePageLabel()
     }
@@ -390,10 +387,9 @@ class MainActivity : Activity() {
 
     private fun showHome() {
         readerMode = false
-        homePanel.visibility = View.VISIBLE
-        readerPanel.visibility = View.GONE
+        homeScreen.visibility = View.VISIBLE
+        readerScreen.visibility = View.GONE
         webView.visibility = View.GONE
-        updatePageLabel()
     }
 
     private fun openDawnEdition() {
@@ -403,8 +399,8 @@ class MainActivity : Activity() {
             return
         }
         readerMode = true
-        homePanel.visibility = View.GONE
-        readerPanel.visibility = View.VISIBLE
+        homeScreen.visibility = View.GONE
+        readerScreen.visibility = View.VISIBLE
         webView.visibility = View.VISIBLE
         val directory = File(File(filesDir, "editions"), edition.date)
         if (editionInProgress?.date != edition.date &&
@@ -433,6 +429,7 @@ class MainActivity : Activity() {
     private fun openReaderPage(page: DawnPage) {
         val edition = availableEdition ?: return
         val directory = File(File(filesDir, "editions"), edition.date)
+        viewingStoryContent = false
         pageNumber = page.id.takeLast(3).toIntOrNull() ?: 1
         val position = edition.readingOrder.indexOfFirst { it.id == page.id }
         if (position >= 0 && pageSpinner.selectedItemPosition != position) {
@@ -442,7 +439,7 @@ class MainActivity : Activity() {
             openOfflinePage(edition, page, directory)
         } else {
             webView.loadData(
-                "<html><body style='font:18px sans-serif;padding:24px'>Downloading ${htmlEscape(page.title)} first…</body></html>",
+                "<html><body style='font:18px sans-serif;padding:24px'>Loading ${htmlEscape(page.title)}…</body></html>",
                 "text/html",
                 "UTF-8"
             )
@@ -509,7 +506,7 @@ class MainActivity : Activity() {
                 availabilityCheckInProgress = false
                 if (response.optString("error") == "NOT_AVAILABLE") {
                     latestEditionStatus = "Not available"
-                    dawnStatusLabel.text = "Not available for this date"
+                    dawnStatusLabel.text = "Not available"
                     dawnStatusLabel.setTextColor(Color.GRAY)
                     pageLabel.text = "Dawn is not available for ${requestedDate.replace('_', '-')}"
                     return@evaluateJavascript
@@ -539,11 +536,11 @@ class MainActivity : Activity() {
                     if (pagesSaved) {
                         availableEdition = savedEdition
                         updatePagePicker(savedEdition!!)
-                        dawnStatusLabel.text = "Available · downloaded"
+                        dawnStatusLabel.text = "Available"
                         dawnStatusLabel.setTextColor(Color.rgb(30, 125, 70))
                     } else {
-                        dawnStatusLabel.text = "Available · downloading in background"
-                        dawnStatusLabel.setTextColor(Color.rgb(35, 95, 160))
+                        dawnStatusLabel.text = "Available"
+                        dawnStatusLabel.setTextColor(Color.rgb(30, 125, 70))
                         downloadEdition(edition)
                     }
                 }
@@ -668,7 +665,8 @@ class MainActivity : Activity() {
                             )
                             pageDownloadsRemaining = (pageDownloadsRemaining - 1).coerceAtLeast(0)
                         }
-                        if (readerMode && selectedDateKey() == request.edition.date &&
+                        if (readerMode && !viewingStoryContent &&
+                            selectedDateKey() == request.edition.date &&
                             pageNumber == request.page.id.takeLast(3).toIntOrNull()
                         ) {
                             openOfflinePage(
@@ -678,11 +676,7 @@ class MainActivity : Activity() {
                             )
                         }
                         if (isCurrentEdition) {
-                            updateDownloadStatus("Downloaded ${request.page.title}")
                             maybeCompleteEdition(request.edition)
-                        } else if (selectedDateKey() == request.edition.date) {
-                            dawnStatusLabel.text = "Available · page downloaded"
-                            dawnStatusLabel.setTextColor(Color.rgb(30, 125, 70))
                         }
                     }
                 } catch (error: Exception) {
@@ -690,13 +684,9 @@ class MainActivity : Activity() {
                         if (editionInProgress === request.edition) {
                             pageDownloadFailed = true
                             pageDownloadsRemaining = (pageDownloadsRemaining - 1).coerceAtLeast(0)
-                            dawnStatusLabel.text = "Available · download needs retry"
-                            dawnStatusLabel.setTextColor(Color.rgb(180, 90, 20))
                             showMessage(error.message ?: "Could not download ${request.page.title}.")
                             maybeCompleteEdition(request.edition)
                         } else if (selectedDateKey() == request.edition.date) {
-                            dawnStatusLabel.text = "Available · download needs retry"
-                            dawnStatusLabel.setTextColor(Color.rgb(180, 90, 20))
                             showMessage(error.message ?: "Could not download ${request.page.title}.")
                         }
                     }
@@ -718,7 +708,6 @@ class MainActivity : Activity() {
                 maybeCompleteEdition(edition)
                 return
             }
-            updateDownloadStatus("Saving story text · ${storyIndex + 1}/${textStoryIds.size}")
             processingContentId = null
             inspectionWebView.loadUrl("https://epaper.dawn.com/DetailImage.php?StoryImage=$storyId")
             return
@@ -730,7 +719,6 @@ class MainActivity : Activity() {
             downloadLinkedContent(edition)
             return
         }
-        updateDownloadStatus("Reading page links · ${editionPageIndex + 1}/${edition.pages.size}")
         processingContentId = null
         val parts = edition.date.split('_')
         inspectionWebView.loadUrl(
@@ -807,13 +795,7 @@ class MainActivity : Activity() {
         val imageIds = fullImageIds
         downloadExecutor.execute {
             try {
-                edition.downloadFullImages(directory, imageIds) { completed, total ->
-                    runOnUiThread {
-                        if (editionInProgress === edition) {
-                            updateDownloadStatus("Downloading full-size images · $completed/$total")
-                        }
-                    }
-                }
+                edition.downloadFullImages(directory, imageIds) { _, _ -> }
                 runOnUiThread {
                     if (editionInProgress !== edition) return@runOnUiThread
                     persistProgress(edition)
@@ -911,10 +893,10 @@ class MainActivity : Activity() {
             archivingStories = false
             pageScanInProgress = false
             storyScanInProgress = false
-            dawnStatusLabel.text = "Available · downloaded"
+            dawnStatusLabel.text = "Available"
             dawnStatusLabel.setTextColor(Color.rgb(30, 125, 70))
             updatePagePicker(savedEdition)
-            updatePageLabel("Offline edition ready")
+            updatePageLabel()
         } catch (error: Exception) {
             failEditionDownload(error.message ?: "Could not save edition details.")
         }
@@ -926,10 +908,10 @@ class MainActivity : Activity() {
         archivingStories = false
         pageScanInProgress = false
         storyScanInProgress = false
-        dawnStatusLabel.text = "Available · download incomplete"
+        dawnStatusLabel.text = "Available"
         dawnStatusLabel.setTextColor(Color.rgb(180, 90, 20))
         showMessage(message)
-        updatePageLabel("Download incomplete")
+        updatePageLabel()
     }
 
     private fun persistProgress(edition: DawnEdition) {
@@ -943,7 +925,7 @@ class MainActivity : Activity() {
         availableEdition = progress
         if (offlineEdition?.date == progress.date) offlineEdition = progress
         updatePagePicker(progress)
-        if (readerMode) {
+        if (readerMode && !viewingStoryContent && selectedDateKey() == progress.date) {
             val page = progress.readingOrder.firstOrNull {
                 it.id.takeLast(3).toIntOrNull() == pageNumber
             }
@@ -960,60 +942,13 @@ class MainActivity : Activity() {
         }
         if (!queueEmpty) return
         if (pageDownloadFailed) {
-            dawnStatusLabel.text = "Available · download needs retry"
-            dawnStatusLabel.setTextColor(Color.rgb(180, 90, 20))
             persistProgress(edition)
             return
         }
         completeEditionDownload(edition)
     }
 
-    private fun updateDownloadStatus(status: String) {
-        dawnStatusLabel.text = "Available · $status"
-        dawnStatusLabel.setTextColor(Color.rgb(35, 95, 160))
-        if (readerMode) updatePageLabel(status)
-    }
-
     private fun selectedDateKey(): String = dateFormat.format(selectedDate.time)
-
-    private fun showOfflineEditions() {
-        val editionDirectory = File(filesDir, "editions")
-        val editions = editionDirectory.listFiles()
-            ?.mapNotNull { directory ->
-                val metadata = File(directory, "edition.json")
-                if (!metadata.isFile || !File(directory, "complete").isFile) return@mapNotNull null
-                try {
-                    DawnEdition.readMetadata(metadata) to directory
-                } catch (_: Exception) {
-                    null
-                }
-            }
-            ?.sortedByDescending { dateFormat.parse(it.first.date)?.time ?: Long.MIN_VALUE }
-            .orEmpty()
-        if (editions.isEmpty()) {
-            showMessage("No complete editions have been downloaded yet.")
-            return
-        }
-        AlertDialog.Builder(this)
-            .setTitle("Offline editions")
-            .setItems(editions.map { it.first.date.replace('_', '-') }.toTypedArray()) { _, index ->
-                showOfflinePages(editions[index].first, editions[index].second)
-            }
-            .setNegativeButton("Close", null)
-            .show()
-    }
-
-    private fun showOfflinePages(edition: DawnEdition, directory: File) {
-        AlertDialog.Builder(this)
-            .setTitle("Pages · ${edition.date.replace('_', '-')}")
-            .setItems(edition.pages.map { "${it.id.takeLast(3)} · ${it.title}" }.toTypedArray()) { _, index ->
-                openOfflinePage(edition, edition.pages[index], directory)
-            }
-            .setNeutralButton("Images") { _, _ -> showOfflineImages(edition, directory) }
-            .setPositiveButton("Text stories") { _, _ -> showOfflineStories(edition, directory) }
-            .setNegativeButton("Close", null)
-            .show()
-    }
 
     private fun openOfflinePage(edition: DawnEdition, page: DawnPage, directory: File) {
         if (!edition.hasPageImage(directory, page.id)) {
@@ -1024,14 +959,15 @@ class MainActivity : Activity() {
         offlineDirectory = directory
         availableEdition = edition
         readerMode = true
-        homePanel.visibility = View.GONE
-        readerPanel.visibility = View.VISIBLE
+        viewingStoryContent = false
+        homeScreen.visibility = View.GONE
+        readerScreen.visibility = View.VISIBLE
         webView.visibility = View.VISIBLE
         selectedDate.time = dateFormat.parse(edition.date) ?: selectedDate.time
         pageNumber = page.id.takeLast(3).toInt()
         updateDateButton()
         updatePagePicker(edition)
-        updatePageLabel("Offline · ${page.title}")
+        updatePageLabel()
         val pageHotspots = edition.hotspots.filter { it.pageId == page.id }
         val html = renderOfflinePage(page, pageHotspots)
         webView.loadDataWithBaseURL(
@@ -1044,23 +980,15 @@ class MainActivity : Activity() {
     }
 
     private fun renderOfflinePage(page: DawnPage, hotspots: List<DawnHotspot>): String {
-        val points = hotspots.joinToString(" ") { hotspot ->
-            val route = if (hotspot.type == DawnHotspotType.TEXT) "text" else "image"
-            val label = hotspot.label.ifBlank { "Story ${hotspot.targetId.takeLast(3)}" }
-            """<a href="https://offline.dawn/$route/${hotspot.targetId}">${htmlEscape(label)}</a>"""
-        }
         val areas = hotspots.joinToString("") { hotspot ->
             val route = if (hotspot.type == DawnHotspotType.TEXT) "text" else "image"
             """<area shape="${htmlEscape(hotspot.shape)}" coords="${hotspot.coordinates.joinToString(",")}" href="https://offline.dawn/$route/${hotspot.targetId}" alt="${htmlEscape(hotspot.label)}" title="${htmlEscape(hotspot.label)}">"""
         }
         return """
             <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-            <style>body{margin:0;background:#222;text-align:center;color:#fff;font:14px sans-serif}
-            .points{padding:10px;text-align:left;background:#333}.points a{display:inline-block;margin:4px;padding:6px 9px;
-            border-radius:4px;background:#fff;color:#234;text-decoration:none}
+            <style>body{margin:0;background:#222;text-align:center}
             img{display:block;width:100%;height:auto;margin:auto}</style>
-            </head><body><nav class="points">News points: $points</nav>
-            <img id="page" src="${page.imageFileName}" usemap="#page-map"><map name="page-map">$areas</map>
+            </head><body><img id="page" src="${page.imageFileName}" usemap="#page-map"><map name="page-map">$areas</map>
             <script>
             (function(){const img=document.getElementById('page');const areas=document.querySelectorAll('area');
             function scale(){if(!img.naturalWidth)return;const sx=img.clientWidth/img.naturalWidth,sy=img.clientHeight/img.naturalHeight;
@@ -1078,11 +1006,17 @@ class MainActivity : Activity() {
         if (parts.size != 2) return
         val id = parts[1]
         when (parts[0]) {
+            "page" -> {
+                val page = edition.pages.firstOrNull { it.id == id } ?: return
+                openOfflinePage(edition, page, directory)
+            }
             "text" -> {
                 val article = edition.articles.firstOrNull { it.id == id } ?: run {
+                    viewingStoryContent = true
                     requestStoryText(edition, directory, id)
                     return
                 }
+                viewingStoryContent = true
                 webView.loadDataWithBaseURL(
                     "https://offline.dawn/",
                     renderArticle(article),
@@ -1092,14 +1026,34 @@ class MainActivity : Activity() {
                 )
             }
             "image" -> {
-                val image = File(File(directory, "images"), "$id.jpg")
-                if (!image.isFile) {
+                viewingStoryContent = true
+                if (!File(File(directory, "images"), "$id.jpg").isFile) {
                     requestStoryImage(edition, directory, id)
                     return
                 }
-                webView.loadUrl(Uri.fromFile(image).toString())
+                showOfflineImage(edition, directory, id)
             }
         }
+    }
+
+    private fun showOfflineImage(edition: DawnEdition, directory: File, id: String) {
+        val sourcePage = edition.hotspots.firstOrNull { it.targetId == id }?.pageId
+            ?: edition.pages.firstOrNull()?.id
+            ?: return
+        val baseUrl = Uri.fromFile(directory).toString().trimEnd('/') + "/"
+        viewingStoryContent = true
+        val html = """
+            <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+            <style>html,body{margin:0;width:100%;height:100%;background:#111;color:#fff;font:16px sans-serif}
+            header{height:48px;display:flex;align-items:center;padding:0 12px}
+            a{color:#fff}img{display:block;width:100%;height:calc(100% - 48px);margin:0 auto;object-fit:contain}
+            #error{padding:24px;text-align:center}</style></head>
+            <body><header><a href="https://offline.dawn/page/$sourcePage">Back to paper</a></header>
+            <img src="images/$id.jpg" alt="Full-size newspaper image"
+                onerror="this.hidden=true;document.getElementById('error').hidden=false">
+            <div id="error" hidden>Image could not be displayed.</div></body></html>
+        """.trimIndent()
+        webView.loadDataWithBaseURL(baseUrl, html, "text/html", "UTF-8", null)
     }
 
     private fun requestStoryText(edition: DawnEdition, directory: File, id: String) {
@@ -1118,7 +1072,7 @@ class MainActivity : Activity() {
             onDemandEdition = edition
             onDemandDirectory = directory
             webView.loadData(
-                "<html><body style='font:18px sans-serif;padding:24px'>Downloading story text…</body></html>",
+                "<html><body style='font:18px sans-serif;padding:24px'>Opening story…</body></html>",
                 "text/html",
                 "UTF-8"
             )
@@ -1133,9 +1087,8 @@ class MainActivity : Activity() {
                 showMessage("This image is not listed in this edition.")
                 return
             }
-            val imageDir = File(directory, "images")
             webView.loadData(
-                "<html><body style='font:18px sans-serif;padding:24px'>Downloading full-size image…</body></html>",
+                "<html><body style='font:18px sans-serif;padding:24px'>Opening image…</body></html>",
                 "text/html",
                 "UTF-8"
             )
@@ -1152,8 +1105,9 @@ class MainActivity : Activity() {
                         }
                         if (offlineEdition?.date == edition.date) offlineEdition = updated
                         if (availableEdition?.date == edition.date) availableEdition = updated
-                        val image = File(imageDir, "$id.jpg")
-                        webView.loadUrl(Uri.fromFile(image).toString())
+                        if (readerMode && selectedDateKey() == edition.date && viewingStoryContent) {
+                            showOfflineImage(updated, directory, id)
+                        }
                     }
                 } catch (error: Exception) {
                     runOnUiThread {
@@ -1194,49 +1148,13 @@ class MainActivity : Activity() {
         value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
             .replace("\"", "&quot;").replace("'", "&#39;")
 
-    private fun showOfflineImages(edition: DawnEdition, directory: File) {
-        if (edition.fullImageIds.isEmpty()) {
-            showMessage("No full-size images were saved for this edition.")
-            return
-        }
-        AlertDialog.Builder(this)
-            .setTitle("Full-size images")
-            .setItems(edition.fullImageIds.map { "Page ${it.split('_')[3]} · Image ${it.split('_')[4]}" }
-                .toTypedArray()) { _, index ->
-                offlineEdition = edition
-                offlineDirectory = directory
-                openOfflineTarget(Uri.parse("https://offline.dawn/image/${edition.fullImageIds[index]}"))
-            }
-            .setNegativeButton("Close", null)
-            .show()
-    }
-
-    private fun showOfflineStories(edition: DawnEdition, directory: File) {
-        if (edition.articles.isEmpty()) {
-            showMessage("No text stories were saved for this edition.")
-            return
-        }
-        AlertDialog.Builder(this)
-            .setTitle("Text stories · ${edition.date.replace('_', '-')}")
-            .setItems(edition.articles.map { it.title }.toTypedArray()) { _, index ->
-                offlineEdition = edition
-                offlineDirectory = directory
-                webView.loadDataWithBaseURL(
-                    "https://offline.dawn/",
-                    renderArticle(edition.articles[index]),
-                    "text/html",
-                    "UTF-8",
-                    null
-                )
-            }
-            .setNegativeButton("Close", null)
-            .show()
-    }
-
-    private fun updatePageLabel(status: String? = null) {
+    private fun updatePageLabel() {
         val date = SimpleDateFormat("EEE, d MMM yyyy", Locale.getDefault()).format(selectedDate.time)
         val page = "$date  ·  Page ${pageNumber.toString().padStart(3, '0')}"
-        pageLabel.text = listOfNotNull(page, status ?: latestEditionStatus).joinToString("  ·  ")
+        val title = availableEdition?.readingOrder?.firstOrNull {
+            it.id.takeLast(3).toIntOrNull() == pageNumber
+        }?.title
+        pageLabel.text = listOfNotNull(page, title?.takeIf { it.isNotBlank() }).joinToString("  ·  ")
     }
 
     private fun button(label: String, onClick: () -> Unit): Button =
