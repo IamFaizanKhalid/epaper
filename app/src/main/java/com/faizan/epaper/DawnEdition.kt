@@ -39,7 +39,8 @@ data class DawnEdition(
     val pages: List<DawnPage>,
     val fullImageIds: List<String> = emptyList(),
     val hotspots: List<DawnHotspot> = emptyList(),
-    val articles: List<DawnArticle> = emptyList()
+    val articles: List<DawnArticle> = emptyList(),
+    val processedPageIds: List<String> = emptyList()
 ) {
     val readingOrder: List<DawnPage>
         get() {
@@ -136,6 +137,7 @@ data class DawnEdition(
                     })
                 }
             })
+            put("processedPageIds", JSONArray(processedPageIds))
         }
         val temporaryMetadata = File(directory, "edition.json.tmp")
         FileOutputStream(temporaryMetadata).use {
@@ -293,7 +295,21 @@ data class DawnEdition(
                     item.getJSONArray("paragraphs").strings()
                 )
             }.orEmpty()
-            return DawnEdition(date, latestDate, pages, fullImageIds.distinct(), hotspots, articles)
+            val processedPageIds = data.optJSONArray("processedPageIds")?.strings().orEmpty()
+            require(processedPageIds.all { id ->
+                PAGE_PATTERN.matches(id) && id.startsWith("${date}_") && pages.any { it.id == id }
+            }) {
+                "Dawn returned invalid processed page IDs."
+            }
+            return DawnEdition(
+                date,
+                latestDate,
+                pages,
+                fullImageIds.distinct(),
+                hotspots,
+                articles,
+                processedPageIds.distinct()
+            )
         }
 
         fun readMetadata(file: File): DawnEdition =
