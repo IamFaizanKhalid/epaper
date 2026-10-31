@@ -83,6 +83,8 @@ class MainActivity : Activity() {
     private var jangCheckDate: String? = null
     private var jangAvailabilityCheckInProgress = false
     private var openJangWhenAvailable = false
+    private var jangVerificationKey: String? = null
+    private var jangVerificationGeneration = 0
     private var pageScanInProgress = false
     private var storyScanInProgress = false
     private var onDemandStoryId: String? = null
@@ -107,6 +109,7 @@ class MainActivity : Activity() {
         DailyEditionCheckScheduler.schedule(this)
         NotificationPermission.requestIfNeeded(this)
         checkAvailability()
+        checkJangAvailability()
     }
 
     private fun showStoryLoadingDialog() {
@@ -195,7 +198,7 @@ class MainActivity : Activity() {
             setTextColor(Color.rgb(34, 50, 70))
         }
         jangStatusLabel = TextView(this).apply {
-            text = "Tap to check availability"
+            text = "Checking availability…"
             textSize = 14f
             setTextColor(Color.DKGRAY)
         }
@@ -266,7 +269,9 @@ class MainActivity : Activity() {
                     view: WebView,
                     request: WebResourceRequest
                 ): Boolean {
-                    if (request.url.host == "offline.dawn") {
+                    if (request.url.host == "offline.dawn" ||
+                        request.url.host == "offline.jang"
+                    ) {
                         openOfflineTarget(request.url)
                         return true
                     }
@@ -496,24 +501,102 @@ class MainActivity : Activity() {
     private fun jangInspectionClient() = object : WebViewClient() {
         override fun onPageFinished(view: WebView, url: String) {
             val uri = Uri.parse(url)
-            if (uri.host != "e.jang.com.pk") return
             val requestedDate = jangCheckDate
             if (jangAvailabilityCheckInProgress && requestedDate != null &&
-                uri.path == "/lahore/${requestedDate.replace('_', '-')}/page1"
+                (uri.host == "e.jang.com.pk" || uri.host == "www.e.jang.com.pk")
             ) {
-                discoverJangEdition(requestedDate)
+                awaitJangVerification(
+                    "https://e.jang.com.pk/lahore/${requestedDate.replace('_', '-')}/page1",
+                    requestedDate,
+                    null
+                ) { discoverJangEdition(requestedDate) }
                 return
             }
+            if (uri.host != "e.jang.com.pk") return
             val requestedPage = onDemandPage
             if (requestedPage?.first?.isJangEdition == true &&
                 uri.path == "/lahore/${requestedPage.first.date.replace('_', '-')}/page${requestedPage.second.id.takeLast(3).toInt()}"
             ) {
-                view.postDelayed({
-                    if (onDemandPage == requestedPage) {
-                        collectOnDemandJangPageHotspots(requestedPage.first, requestedPage.second)
-                    }
-                }, 250)
+                val requestedPageUrl = "https://e.jang.com.pk${uri.path}"
+                awaitJangVerification(requestedPageUrl, null, requestedPage) {
+                    collectOnDemandJangPageHotspots(requestedPage.first, requestedPage.second)
+                }
             }
+        }
+
+        private fun awaitJangVerification(
+                expectedUrl: String,
+                editionDate: String?,
+                requestedPage: Pair<DawnEdition, DawnPage>?,
+                attempt: Int = 0,
+                onReady: () -> Unit
+            ) {
+                if (editionDate != null && jangCheckDate != editionDate) return
+                if (requestedPage != null && onDemandPage != requestedPage) return
+                val key = expectedUrl
+                if (attempt == 0 && jangVerificationKey != key) {
+                    jangVerificationKey = key
+                    jangVerificationGeneration++
+                }
+                val generation = jangVerificationGeneration
+                val script = """
+                    (() => {
+                        const title = document.title.toLowerCase();
+                        const text = (document.body?.innerText || '').slice(0, 4000).toLowerCase();
+                        const challenge = title.includes('moment, please') ||
+                            title.includes('just a moment') ||
+                            text.includes('verify you are human') ||
+                            text.includes('checking your browser') ||
+                            text.includes('security verification') ||
+                            text.includes('performing security verification') ||
+                            document.querySelector('#challenge-running, #challenge-stage');
+                        return JSON.stringify({
+                            challenge: Boolean(challenge),
+                            url: location.href,
+                            expected: location.pathname === '${Uri.parse(expectedUrl).path}'
+                        });
+                    })()
+                """.trimIndent()
+                jangWebView.evaluateJavascript(script) { result ->
+                    if (generation != jangVerificationGeneration) return@evaluateJavascript
+                    if (editionDate != null && jangCheckDate != editionDate) return@evaluateJavascript
+                    if (requestedPage != null && onDemandPage != requestedPage) return@evaluateJavascript
+                    try {
+                        val json = JSONTokener(result).nextValue() as? String
+                            ?: throw IllegalStateException("Could not check Jang's verification page.")
+                        val state = JSONObject(json)
+                        if (state.optBoolean("challenge") || !state.optBoolean("expected")) {
+                            if (attempt < 60) {
+                                jangWebView.postDelayed({
+                                    awaitJangVerification(
+                                        expectedUrl,
+                                        editionDate,
+                                        requestedPage,
+                                        attempt + 1,
+                                        onReady
+                                    )
+                                }, 1_000)
+                            } else {
+                                jangVerificationKey = null
+                                jangAvailabilityCheckInProgress = false
+                                openJangWhenAvailable = false
+                                if (editionDate != null) {
+                                    jangStatusLabel.text = "Verification timed out"
+                                    jangStatusLabel.setTextColor(Color.RED)
+                                }
+                                showMessage("Jang's request verification did not finish in time.")
+                            }
+                            return@evaluateJavascript
+                        }
+                        jangVerificationKey = null
+                        jangWebView.postDelayed(onReady, 300)
+                    } catch (error: Exception) {
+                        jangVerificationKey = null
+                        jangAvailabilityCheckInProgress = false
+                        openJangWhenAvailable = false
+                        showMessage(error.message ?: "Could not finish Jang verification.")
+                    }
+                }
         }
 
         override fun onReceivedError(
@@ -522,6 +605,7 @@ class MainActivity : Activity() {
             error: android.webkit.WebResourceError
         ) {
             if (!request.isForMainFrame || request.url.host != "e.jang.com.pk") return
+            if (request.url.path?.contains("/cdn-cgi/") == true) return
             if (jangAvailabilityCheckInProgress) {
                 jangAvailabilityCheckInProgress = false
                 openJangWhenAvailable = false
@@ -552,11 +636,12 @@ class MainActivity : Activity() {
                 pageNumber = 1
                 showHome()
                 availableEdition = null
-                jangStatusLabel.text = "Tap to check availability"
+                jangStatusLabel.text = "Checking availability…"
                 jangStatusLabel.setTextColor(Color.DKGRAY)
                 updateDateButton()
                 pageAdapter?.clear()
                 checkAvailability()
+                checkJangAvailability()
             },
             selectedDate.get(Calendar.YEAR),
             selectedDate.get(Calendar.MONTH),
@@ -611,6 +696,10 @@ class MainActivity : Activity() {
     }
 
     private fun openJangEdition() {
+        checkJangAvailability(openWhenAvailable = true)
+    }
+
+    private fun checkJangAvailability(openWhenAvailable: Boolean = false) {
         val requestedDate = selectedDateKey()
         val directory = File(File(filesDir, "editions/jang"), requestedDate)
         val metadata = File(directory, "edition.json")
@@ -622,7 +711,7 @@ class MainActivity : Activity() {
                 }
                 jangStatusLabel.text = "Available"
                 jangStatusLabel.setTextColor(Color.rgb(30, 125, 70))
-                openEdition(edition)
+                if (openWhenAvailable) openEdition(edition)
                 return
             } catch (error: Exception) {
                 showMessage(error.message ?: "Could not read the saved Jang edition.")
@@ -635,7 +724,7 @@ class MainActivity : Activity() {
         }
         jangCheckDate = requestedDate
         jangAvailabilityCheckInProgress = true
-        openJangWhenAvailable = true
+        openJangWhenAvailable = openWhenAvailable
         jangStatusLabel.text = "Checking availability…"
         jangStatusLabel.setTextColor(Color.DKGRAY)
         jangWebView.loadUrl(
@@ -760,7 +849,7 @@ class MainActivity : Activity() {
             openOfflinePage(edition, page, directory)
         } else {
             webView.loadData(
-                "<html><body style='font:18px sans-serif;padding:24px'>Loading ${htmlEscape(page.title)}…</body></html>",
+                renderPageLoading(page),
                 "text/html",
                 "UTF-8"
             )
@@ -768,6 +857,31 @@ class MainActivity : Activity() {
         }
         ensurePageHotspots(edition, page)
         prefetchPageStories(edition, page)
+    }
+
+    private fun renderPageLoading(page: DawnPage): String =
+        "<html><body style='font:18px sans-serif;padding:24px'>Loading ${htmlEscape(page.title)}…</body></html>"
+
+    private fun isRequestedPageVisible(request: PageDownloadRequest): Boolean =
+        readerMode && !viewingStoryContent &&
+            selectedDateKey() == request.edition.date &&
+            readerEdition()?.isJangEdition == request.edition.isJangEdition &&
+            pageNumber == request.page.id.takeLast(3).toIntOrNull()
+
+    private fun showPageLoadFailure(page: DawnPage, message: String?) {
+        val edition = readerEdition() ?: return
+        val host = if (edition.isJangEdition) "offline.jang" else "offline.dawn"
+        val details = message?.takeIf { it.isNotBlank() } ?: "The page image could not be downloaded."
+        val html = """
+            <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+            <style>body{font:18px sans-serif;padding:24px;color:#333}
+            a{display:inline-block;margin-top:16px;padding:10px 16px;background:#244d70;
+            color:#fff;text-decoration:none;border-radius:4px}</style></head>
+            <body><h2>Could not load ${htmlEscape(page.title)}</h2>
+            <p>${htmlEscape(details)}</p>
+            <a href="https://$host/retry/${page.id}">Try again</a></body></html>
+        """.trimIndent()
+        webView.loadDataWithBaseURL("https://$host/", html, "text/html", "UTF-8", null)
     }
 
     private fun checkAvailability() {
@@ -1044,9 +1158,13 @@ class MainActivity : Activity() {
                         if (editionInProgress === request.edition) {
                             pageDownloadFailed = true
                             pageDownloadsRemaining = (pageDownloadsRemaining - 1).coerceAtLeast(0)
+                            if (isRequestedPageVisible(request)) {
+                                showPageLoadFailure(request.page, error.message)
+                            }
                             showMessage(error.message ?: "Could not download ${request.page.title}.")
                             maybeCompleteEdition(request.edition)
-                        } else if (selectedDateKey() == request.edition.date) {
+                        } else if (isRequestedPageVisible(request)) {
+                            showPageLoadFailure(request.page, error.message)
                             showMessage(error.message ?: "Could not download ${request.page.title}.")
                         }
                     }
@@ -1173,13 +1291,30 @@ class MainActivity : Activity() {
     private fun collectOnDemandJangPageHotspots(edition: DawnEdition, page: DawnPage) {
         val script = """
             JSON.stringify(Array.from(document.querySelectorAll('area[href]')).flatMap(area => {
-                const match = (area.getAttribute('href') || '').match(/\/detail\/(\d+)/i);
-                if (!match) return [];
+                const href = area.getAttribute('href') || '';
+                const story = href.match(/\/detail\/(\d+)/i);
+                const onclick = area.getAttribute('onclick') || '';
+                const image = onclick.match(/window\.open\s*\(\s*['"]([^'"]+)['"]/i);
+                let type, targetId, imageUrl = null;
+                if (story) {
+                    type = 'TEXT';
+                    targetId = story[1];
+                } else if (image) {
+                    const path = image[1];
+                    const asset = path.match(/^pic\/([A-Za-z0-9_.-]+\.(?:jpe?g|png))(?:\?farman=1)?$/i);
+                    if (!asset) return [];
+                    type = 'IMAGE';
+                    imageUrl = path;
+                    targetId = 'J${edition.date}_I${page.id.takeLast(3)}_' + asset[1];
+                } else {
+                    return [];
+                }
                 const coordinates = (area.getAttribute('coords') || '')
                     .split(/[;,]/).map(value => value.trim()).filter(Boolean)
                     .map(Number).filter(Number.isFinite);
-                return [{targetId: match[1], coordinates: coordinates,
-                    label: area.alt || area.title || '', shape: area.shape || 'poly'}];
+                return [{targetId: targetId, type: type, imageUrl: imageUrl,
+                    coordinates: coordinates, label: area.alt || area.title || '',
+                    shape: area.shape || 'poly'}];
             }))
         """.trimIndent()
         jangWebView.evaluateJavascript(script) { result ->
@@ -1195,10 +1330,13 @@ class MainActivity : Activity() {
                     DawnHotspot(
                         page.id,
                         entry.getString("targetId"),
-                        DawnHotspotType.TEXT,
+                        DawnHotspotType.valueOf(entry.getString("type")),
                         entry.optString("label"),
                         entry.optString("shape", "poly"),
-                        (0 until coordinates.length()).map { coordinates.getInt(it) }
+                        (0 until coordinates.length()).map { coordinates.getInt(it) },
+                        entry.optString("imageUrl").takeIf {
+                            it.isNotBlank() && it != "null"
+                        }
                     )
                 }
                 val directory = editionDirectory(edition)
@@ -1209,7 +1347,8 @@ class MainActivity : Activity() {
                 val latest = if (metadata.isFile) DawnEdition.readMetadata(metadata) else edition
                 val updated = latest.copy(
                     hotspots = latest.hotspots.filterNot { it.pageId == page.id } + hotspots,
-                    processedPageIds = (latest.processedPageIds + page.id).distinct()
+                    processedPageIds = (latest.processedPageIds + page.id).distinct(),
+                    jangImageAreasVersion = 1
                 )
                 updated.saveMetadata(directory)
                 availableEdition = updated
@@ -1252,7 +1391,7 @@ class MainActivity : Activity() {
             .map { it.targetId }
             .distinct()
             .filter { id ->
-                !File(File(directory, "images"), "$id.jpg").isFile &&
+                !edition.fullImageFile(directory, id).isFile &&
                     id !in prefetchingImageIds
             }
             .toList()
@@ -1559,17 +1698,27 @@ class MainActivity : Activity() {
                 const content = document.querySelector('.detail-content');
                 const body = content?.querySelector('.description-area .detail_view_content') ||
                     content?.querySelector('.description-area');
-                if (!body || !document.querySelector('h1')) {
+                const title = document.querySelector('h1')?.innerText.trim() || '';
+                const author = document.querySelector('.detail-w-t .authorFullName')
+                    ?.innerText.trim() || '';
+                const date = Array.from(document.querySelectorAll('.detail-w-t .detail-time'))
+                    .map(element => element.innerText.trim())
+                    .find(text => text && text !== author) || '';
+                if (!body || !title || !body.innerText.trim()) {
                     return JSON.stringify({pending: true});
                 }
-                const title = document.querySelector('h1')?.innerText.trim() || '';
-                const paragraphs = Array.from(body.querySelectorAll('p'))
+                let paragraphs = Array.from(body.querySelectorAll('p'))
                     .map(p => p.innerText.trim())
                     .filter(text => text && !text.startsWith('فوٹو:'));
+                if (!paragraphs.length) {
+                    paragraphs = body.innerText.split(/\n+/)
+                        .map(text => text.trim())
+                        .filter(text => text && !text.startsWith('فوٹو:'));
+                }
                 const imageUrls = Array.from(content.querySelectorAll('img[src*="/assets/uploads/"]'))
                     .map(img => img.currentSrc || img.src).filter(Boolean);
-                return JSON.stringify({id: '$id', title: title, paragraphs: paragraphs,
-                    imageUrls: imageUrls});
+                return JSON.stringify({id: '$id', title: title, author: author, date: date,
+                    paragraphs: paragraphs, imageUrls: imageUrls});
             })()
         """.trimIndent()
         source.evaluateJavascript(script) { result ->
@@ -1590,10 +1739,13 @@ class MainActivity : Activity() {
                 }
                 if (data.has("error")) throw IllegalStateException(data.getString("error"))
                 val paragraphsJson = data.getJSONArray("paragraphs")
+                val byline = listOf(data.optString("author"), data.optString("date"))
+                    .filter { it.isNotBlank() }
+                    .joinToString(" · ")
                 val article = DawnArticle(
                     id,
                     data.getString("title"),
-                    "",
+                    byline,
                     (0 until paragraphsJson.length()).map { paragraphsJson.getString(it) },
                     data.getJSONArray("imageUrls").let { images ->
                         (0 until images.length()).map { images.getString(it) }
@@ -1748,7 +1900,7 @@ class MainActivity : Activity() {
         }
         viewingStoryContent = false
         val pageHotspots = edition.hotspots.filter { it.pageId == page.id }
-        val html = renderOfflinePage(page, pageHotspots)
+        val html = renderOfflinePage(page, pageHotspots, directory)
         displayedPageId = page.id
         displayedEditionDate = edition.date
         paperPageReady = false
@@ -1761,7 +1913,16 @@ class MainActivity : Activity() {
         )
     }
 
-    private fun renderOfflinePage(page: DawnPage, hotspots: List<DawnHotspot>): String {
+    private fun renderOfflinePage(
+        page: DawnPage,
+        hotspots: List<DawnHotspot>,
+        directory: File
+    ): String {
+        val imageFileName = if (File(directory, "${page.id}.jpg").isFile) {
+            "${page.id}.jpg"
+        } else {
+            "${page.id}.png"
+        }
         val areas = hotspots.joinToString("") { hotspot ->
             val route = if (hotspot.type == DawnHotspotType.TEXT) "text" else "image"
             """<area shape="${htmlEscape(hotspot.shape)}" coords="${hotspot.coordinates.joinToString(",")}" href="https://offline.dawn/$route/${hotspot.targetId}" alt="${htmlEscape(hotspot.label)}" title="${htmlEscape(hotspot.label)}">"""
@@ -1769,12 +1930,14 @@ class MainActivity : Activity() {
         return """
             <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
             <style>body{margin:0;background:#222;text-align:center}
+            area,a{-webkit-tap-highlight-color:transparent;outline:none}
+            area:focus,area:active,a:focus,a:active{outline:none}
             #paper-container{position:relative;width:100%}
             #page{display:block;width:100%;height:auto;margin:auto}
             .hotspot-highlight{position:absolute;z-index:2;pointer-events:none;
               background:rgba(255,210,0,.32);border:3px solid #ffd400;box-sizing:border-box;
               box-shadow:0 0 12px rgba(255,212,0,.9)}</style>
-            </head><body><div id="paper-container"><img id="page" src="${page.imageFileName}" usemap="#page-map"><map id="page-map" name="page-map">$areas</map></div>
+            </head><body><div id="paper-container"><img id="page" src="$imageFileName" usemap="#page-map"><map id="page-map" name="page-map">$areas</map></div>
             <script>
             (function(){const img=document.getElementById('page');
             function scale(){if(!img.naturalWidth)return;const sx=img.clientWidth/img.naturalWidth,sy=img.clientHeight/img.naturalHeight;
@@ -1829,6 +1992,22 @@ class MainActivity : Activity() {
         val edition = offlineEdition ?: return
         val directory = offlineDirectory ?: return
         val parts = uri.pathSegments
+        if (parts.size == 2 && parts[0] == "retry") {
+            val page = edition.pages.firstOrNull { it.id == parts[1] } ?: return
+            viewingStoryContent = false
+            openReaderPage(page)
+            return
+        }
+        if (parts.firstOrNull() == "article-image") {
+            if (edition.isJangEdition) {
+                if (parts.size != 3) return
+                val article = edition.articles.firstOrNull { it.id == parts[1] } ?: return
+                val imageIndex = parts[2].toIntOrNull() ?: return
+                val imageUrl = article.imageUrls.getOrNull(imageIndex) ?: return
+                showJangArticleImage(article, imageUrl, imageIndex)
+                return
+            }
+        }
         if (parts.size != 2) return
         val id = parts[1]
         when (parts[0]) {
@@ -1837,7 +2016,8 @@ class MainActivity : Activity() {
                 openOfflinePage(edition, page, directory)
             }
             "text" -> {
-                val article = edition.articles.firstOrNull { it.id == id } ?: run {
+                val article = edition.articles.firstOrNull { it.id == id }
+                if (article == null || (edition.isJangEdition && article.byline.isBlank())) {
                     viewingStoryContent = true
                     viewingArticleImage = false
                     displayedArticleId = id
@@ -1860,6 +2040,13 @@ class MainActivity : Activity() {
             }
             "article" -> {
                 val article = edition.articles.firstOrNull { it.id == id } ?: return
+                if (edition.isJangEdition && article.byline.isBlank()) {
+                    viewingStoryContent = true
+                    viewingArticleImage = false
+                    displayedArticleId = id
+                    requestStoryText(edition, directory, id)
+                    return
+                }
                 viewingStoryContent = true
                 viewingArticleImage = false
                 displayedArticleId = article.id
@@ -1890,10 +2077,11 @@ class MainActivity : Activity() {
                     requestArticleImage(edition, directory, id)
                 }
             }
+
             "image" -> {
                 viewingStoryContent = true
                 viewingArticleImage = false
-                if (!File(File(directory, "images"), "$id.jpg").isFile) {
+                if (!edition.fullImageFile(directory, id).isFile) {
                     requestStoryImage(edition, directory, id)
                     return
                 }
@@ -1902,11 +2090,37 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun showJangArticleImage(article: DawnArticle, imageUrl: String, imageIndex: Int) {
+        viewingStoryContent = true
+        viewingArticleImage = true
+        displayedArticleId = article.id
+        val html = """
+            <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+            <style>html,body{margin:0;width:100%;height:100%;background:#111;color:#fff;font:16px sans-serif}
+            header{height:48px;display:flex;align-items:center;padding:0 12px}
+            a{color:#fff}img{display:block;width:100%;height:calc(100% - 48px);margin:0 auto;object-fit:contain}
+            #error{padding:24px;text-align:center}</style></head>
+            <body><header><a href="https://offline.jang/article/${article.id}">Back to story text</a></header>
+            <img src="${htmlEscape(imageUrl)}" alt="${htmlEscape(article.title)}"
+                onerror="this.hidden=true;document.getElementById('error').hidden=false">
+            <div id="error" hidden>Image could not be displayed.</div></body></html>
+        """.trimIndent()
+        webView.loadDataWithBaseURL(
+            "https://offline.jang/article-image/${article.id}/$imageIndex",
+            html,
+            "text/html",
+            "UTF-8",
+            null
+        )
+    }
+
     private fun showOfflineImage(edition: DawnEdition, directory: File, id: String) {
         val sourcePage = edition.hotspots.firstOrNull { it.targetId == id }?.pageId
             ?: edition.pages.firstOrNull()?.id
             ?: return
         val baseUrl = Uri.fromFile(directory).toString().trimEnd('/') + "/"
+        val imageFile = edition.fullImageFile(directory, id)
+        val host = if (edition.isJangEdition) "offline.jang" else "offline.dawn"
         viewingStoryContent = true
         val html = """
             <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -1914,8 +2128,8 @@ class MainActivity : Activity() {
             header{height:48px;display:flex;align-items:center;padding:0 12px}
             a{color:#fff}img{display:block;width:100%;height:calc(100% - 48px);margin:0 auto;object-fit:contain}
             #error{padding:24px;text-align:center}</style></head>
-            <body><header><a href="https://offline.dawn/page/$sourcePage">Back to paper</a></header>
-            <img src="images/$id.jpg" alt="Full-size newspaper image"
+            <body><header><a href="https://$host/page/$sourcePage">Back to paper</a></header>
+            <img src="images/${htmlEscape(imageFile.name)}" alt="Full-size newspaper image"
                 onerror="this.hidden=true;document.getElementById('error').hidden=false">
             <div id="error" hidden>Image could not be displayed.</div></body></html>
         """.trimIndent()
@@ -2103,9 +2317,14 @@ class MainActivity : Activity() {
         val paragraphs = article.paragraphs.joinToString("") {
             "<p>${htmlEscape(it)}</p>"
         }
-        val images = article.imageUrls.joinToString("") { imageUrl ->
-            """<img src="${htmlEscape(imageUrl)}" alt="" loading="lazy">"""
-        }
+        val images = article.imageUrls.mapIndexed { index, imageUrl ->
+            val image = """<img src="${htmlEscape(imageUrl)}" alt="" loading="lazy">"""
+            if (newspaper == NewspaperProvider.JANG) {
+                """<a href="https://offline.jang/article-image/${article.id}/$index">$image</a>"""
+            } else {
+                image
+            }
+        }.joinToString("")
         val imageButton = if (newspaper.supportsImageDetail &&
             DAWN_STORY_ID_PATTERN.matches(article.id)
         ) """
@@ -2200,9 +2419,11 @@ class MainActivity : Activity() {
                 val article = edition?.articles?.firstOrNull { it.id == displayedArticleId }
                 if (edition != null && directory != null && article != null) {
                     viewingArticleImage = false
+                    val newspaper =
+                        if (edition.isJangEdition) NewspaperProvider.JANG else NewspaperProvider.DAWN
                     webView.loadDataWithBaseURL(
-                        "https://offline.dawn/",
-                        renderArticle(article, NewspaperProvider.DAWN),
+                        if (edition.isJangEdition) "https://offline.jang/" else "https://offline.dawn/",
+                        renderArticle(article, newspaper),
                         "text/html",
                         "UTF-8",
                         null
