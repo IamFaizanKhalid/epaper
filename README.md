@@ -4,13 +4,14 @@ A native Android reader for Dawn's official e-paper site, designed with the Gala
 
 ## What it does
 
-- Opens Dawn's live e-paper website in an embedded browser, including its date picker, page names, page navigation, and clickable story areas.
-- Checks the latest edition date Dawn publishes against today's date to report whether today's paper is live.
-- Downloads the edition's page JPEGs and reads page hotspots to preserve their types, labels, shapes, and clickable coordinates.
-- Downloads full-size JPEGs for image hotspots and extracts title, byline, and readable text for text-story hotspots.
-- Provides offline page, image, and text-story browsing without archiving full HTML pages.
+- Starts with today's date selected and checks Dawn's availability for that date. Changing the date updates the availability check.
+- Shows Dawn and Jang in the newspaper list; Dawn editions that are available start downloading automatically. Jang is shown as not available until it is implemented.
+- Opens Dawn in an offline-first reader: the page image, visible news-point links, tappable story areas, and page selector/navigation controls are shown instead of the newspaper website.
+- Prefetches pages in front-page, back-page, editorial, then remaining-page order. Opening a page moves it ahead of queued downloads.
+- Saves page JPEGs, hotspot metadata, full-size images for image stories, and extracted article text. A tapped story opens its saved content or is fetched and saved on demand.
+- Uses Dawn's website temporarily to check availability and extract page/story data; full website HTML is not archived.
 
-Downloaded editions live in the app's private storage. Each edition contains page JPEGs, an `images/` folder for full-size story images, and `edition.json` for page metadata, clickable areas, image IDs, and article text. Website HTML is used temporarily to collect content and is not saved. An edition is listed as complete only after its content and metadata have been saved successfully.
+Downloaded editions live in the app's private storage. Each edition contains page JPEGs, an `images/` folder for full-size story images, `edition.json` for page metadata/clickable areas/image IDs/article text, and a completion marker. Partial downloads are not listed as complete offline editions.
 
 ## Build
 

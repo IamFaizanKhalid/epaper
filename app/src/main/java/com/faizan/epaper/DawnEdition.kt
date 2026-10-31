@@ -41,10 +41,29 @@ data class DawnEdition(
     val hotspots: List<DawnHotspot> = emptyList(),
     val articles: List<DawnArticle> = emptyList()
 ) {
+    val readingOrder: List<DawnPage>
+        get() {
+            val front = pages.filter { it.title.contains("front", ignoreCase = true) }
+            val back = pages.filter { it.title.contains("back", ignoreCase = true) }
+            val editorial = pages.filter { it.title.contains("editorial", ignoreCase = true) }
+            val preferredIds = (front + back + editorial).map { it.id }.toSet()
+            return front + back + editorial + pages
+                .filterNot { it.id in preferredIds }
+                .sortedBy { it.id.takeLast(3).toIntOrNull() ?: Int.MAX_VALUE }
+        }
+
+    fun downloadPageImage(directory: File, id: String) {
+        require(pages.any { it.id == id }) { "Invalid Dawn page ID." }
+        downloadImages(directory, listOf(id), "pages", { pageId -> "$pageId.jpg" }) { _, _ -> }
+    }
+
+    fun hasPageImage(directory: File, id: String): Boolean =
+        pages.any { it.id == id } && File(directory, "$id.jpg").isJpeg()
+
     fun downloadPageImages(directory: File, onProgress: (Int, Int) -> Unit) {
         downloadImages(
             directory,
-            pages.map { it.id },
+            readingOrder.map { it.id },
             "pages",
             { id -> "$id.jpg" },
             onProgress

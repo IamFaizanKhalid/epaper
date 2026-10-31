@@ -6,14 +6,17 @@ import android.app.DatePickerDialog
 import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
+import android.view.View
 import android.view.Gravity
-import android.webkit.WebChromeClient
+import android.widget.AdapterView
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.ArrayAdapter
 import android.widget.Button
-import android.widget.HorizontalScrollView
+import android.widget.FrameLayout
 import android.widget.LinearLayout
+import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import org.json.JSONObject
@@ -22,16 +25,33 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
+import java.util.PriorityQueue
 import java.util.concurrent.Executors
 
 class MainActivity : Activity() {
     private lateinit var webView: WebView
+    private lateinit var inspectionWebView: WebView
+    private lateinit var detailWebView: WebView
     private lateinit var pageLabel: TextView
-    private lateinit var downloadButton: Button
-    private val downloadExecutor = Executors.newSingleThreadExecutor()
-    private val readerButtons = mutableListOf<Button>()
+    private lateinit var dateButton: Button
+    private lateinit var dawnStatusLabel: TextView
+    private lateinit var homePanel: LinearLayout
+    private lateinit var readerPanel: LinearLayout
+    private lateinit var pageSpinner: Spinner
+    private val downloadExecutor = Executors.newFixedThreadPool(2)
+    private val pageDownloadLock = Any()
+    private val pageDownloadQueue = PriorityQueue<PageDownloadRequest>(
+        compareBy<PageDownloadRequest> { it.priority }.thenBy { it.sequence }
+    )
+    private val queuedPageIds = mutableSetOf<String>()
+    private var pageDownloadWorkerRunning = false
+    private var pageDownloadSequence = 0L
     private var selectedDate = Calendar.getInstance()
     private var pageNumber = 1
+    private var readerMode = false
+    private var availableEdition: DawnEdition? = null
+    private var pageAdapter: ArrayAdapter<String>? = null
+    private var updatingPagePicker = false
     private var editionInProgress: DawnEdition? = null
     private var activeEditionDirectory: File? = null
     private var editionPageIndex = 0
@@ -46,12 +66,21 @@ class MainActivity : Activity() {
     private var offlineDirectory: File? = null
     private var latestEditionStatus: String? = null
     private var checkedEditionDate: String? = null
+    private var availabilityCheckInProgress = false
+    private var pageScanInProgress = false
+    private var storyScanInProgress = false
+    private var onDemandStoryId: String? = null
+    private var onDemandEdition: DawnEdition? = null
+    private var onDemandDirectory: File? = null
+    private var pageDownloadsRemaining = 0
+    private var storyScanComplete = false
+    private var pageDownloadFailed = false
     private val dateFormat = SimpleDateFormat("dd_MM_yyyy", Locale.US)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         createReaderView()
-        loadPage()
+        checkAvailability()
     }
 
     private fun createReaderView() {
@@ -64,137 +93,103 @@ class MainActivity : Activity() {
             setPadding(dp(12), dp(8), dp(12), dp(8))
             setBackgroundColor(Color.rgb(245, 245, 245))
         }
+        dateButton = button("") { chooseDate() }
         val title = TextView(this).apply {
-            text = "Dawn E-Paper"
+            text = "Newspapers"
             textSize = 20f
             setTextColor(Color.rgb(34, 50, 70))
+            setPadding(0, dp(10), 0, dp(4))
         }
         pageLabel = TextView(this).apply {
             textSize = 14f
             setTextColor(Color.DKGRAY)
             setPadding(0, dp(4), 0, dp(6))
         }
-        val controls = LinearLayout(this).apply {
+        val paperRow = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            setBackgroundColor(Color.WHITE)
+            isClickable = true
+            isFocusable = true
+            setOnClickListener { openDawnEdition() }
+        }
+        val dawnTitle = TextView(this).apply {
+            text = "Dawn"
+            textSize = 18f
+            setTextColor(Color.rgb(34, 50, 70))
+        }
+        dawnStatusLabel = TextView(this).apply {
+            text = "Checking availability…"
+            textSize = 14f
+            setTextColor(Color.DKGRAY)
+        }
+        paperRow.addView(dawnTitle)
+        paperRow.addView(dawnStatusLabel)
+        val jangRow = TextView(this).apply {
+            text = "Jang\nNot available yet"
+            textSize = 16f
+            setTextColor(Color.GRAY)
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+        }
+
+        homePanel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        homePanel.addView(title)
+        homePanel.addView(paperRow)
+        homePanel.addView(jangRow)
+        homePanel.addView(button("Offline editions") { showOfflineEditions() })
+
+        readerPanel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        val pageControls = LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
         }
-        controls.addView(button("Date") { chooseDate() })
-        downloadButton = button("Download edition") { discoverEdition(startDownload = true) }
-        downloadButton.isEnabled = false
-        controls.addView(downloadButton)
-        controls.addView(button("Offline editions") { showOfflineEditions() })
-        controls.addView(button("Prev") {
-            if (pageNumber > 1) {
-                pageNumber--
-                loadPage()
+        pageControls.addView(button("Papers") { showHome() })
+        pageControls.addView(button("Prev") {
+            val pages = availableEdition?.readingOrder.orEmpty()
+            val index = pages.indexOfFirst { it.id.endsWith("_${pageNumber.toString().padStart(3, '0')}") }
+            if (index > 0) openReaderPage(pages[index - 1])
+        })
+        pageSpinner = Spinner(this)
+        pageAdapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, mutableListOf())
+        pageAdapter?.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        pageSpinner.adapter = pageAdapter
+        pageSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onNothingSelected(parent: AdapterView<*>?) = Unit
+            override fun onItemSelected(
+                parent: AdapterView<*>?,
+                view: View?,
+                position: Int,
+                id: Long
+            ) {
+                if (updatingPagePicker) return
+                val page = availableEdition?.readingOrder?.getOrNull(position) ?: return
+                if (readerMode && page.id.takeLast(3).toIntOrNull() != pageNumber) {
+                    openReaderPage(page)
+                }
             }
-        })
-        controls.addView(button("Next") {
-            pageNumber++
-            loadPage()
-        })
-
-        val controlsScroll = HorizontalScrollView(this).apply {
-            isHorizontalScrollBarEnabled = false
-            addView(controls)
         }
-        header.addView(title)
+        pageControls.addView(pageSpinner, LinearLayout.LayoutParams(0, dp(48), 1f))
+        pageControls.addView(button("Next") {
+            val pages = availableEdition?.readingOrder.orEmpty()
+            val index = pages.indexOfFirst { it.id.endsWith("_${pageNumber.toString().padStart(3, '0')}") }
+            if (index >= 0 && index < pages.lastIndex) openReaderPage(pages[index + 1])
+        })
+        readerPanel.addView(pageControls)
+        header.addView(dateButton)
         header.addView(pageLabel)
-        header.addView(controlsScroll)
+        header.addView(homePanel)
+        header.addView(readerPanel)
+        readerPanel.visibility = View.GONE
 
         webView = WebView(this).apply {
             settings.javaScriptEnabled = true
-            settings.domStorageEnabled = true
-            settings.useWideViewPort = true
-            settings.loadWithOverviewMode = true
             settings.setSupportZoom(true)
             settings.builtInZoomControls = true
             settings.displayZoomControls = false
             settings.allowFileAccess = true
-            settings.allowContentAccess = false
-            settings.javaScriptCanOpenWindowsAutomatically = true
-            settings.setSupportMultipleWindows(true)
-            webChromeClient = object : WebChromeClient() {
-                override fun onCreateWindow(
-                    view: WebView,
-                    isDialog: Boolean,
-                    isUserGesture: Boolean,
-                    resultMsg: android.os.Message
-                ): Boolean {
-                    if (!isUserGesture) return false
-                    val popup = WebView(this@MainActivity).apply {
-                        settings.javaScriptEnabled = true
-                        settings.domStorageEnabled = true
-                        settings.useWideViewPort = true
-                        settings.loadWithOverviewMode = true
-                    }
-                    val dialog = AlertDialog.Builder(this@MainActivity)
-                        .setTitle("Dawn story")
-                        .setView(popup)
-                        .setNegativeButton("Close", null)
-                        .create()
-                    popup.webChromeClient = object : WebChromeClient() {
-                        override fun onCloseWindow(window: WebView) {
-                            dialog.dismiss()
-                        }
-                    }
-                    popup.webViewClient = object : WebViewClient() {
-                        override fun shouldOverrideUrlLoading(
-                            view: WebView,
-                            request: WebResourceRequest
-                        ): Boolean {
-                            val uri = request.url
-                            if (uri.host != "epaper.dawn.com" ||
-                                uri.path !in setOf(
-                                    "/DetailNews.php",
-                                    "/DetailImage.php",
-                                    "/Advt.php"
-                                )
-                            ) return false
-                            val storyId = uri.getQueryParameter("StoryText")
-                                ?: uri.getQueryParameter("StoryImage")
-                                ?: return false
-                            val parts = storyId.split('_')
-                            if (parts.size != 5) return false
-                            val editionDirectory = File(
-                                File(filesDir, "editions"),
-                                parts.take(3).joinToString("_")
-                            )
-                            val metadata = File(editionDirectory, "edition.json")
-                            if (!metadata.isFile) return false
-                            val edition = DawnEdition.readMetadata(metadata)
-                            val article = edition.articles.firstOrNull { it.id == storyId }
-                            if (uri.path == "/DetailImage.php" && article != null) {
-                                view.loadDataWithBaseURL(
-                                    "https://offline.dawn/",
-                                    renderArticle(article),
-                                    "text/html",
-                                    "UTF-8",
-                                    null
-                                )
-                                return true
-                            }
-                            val image = File(File(editionDirectory, "images"), "$storyId.jpg")
-                            if (uri.path in setOf("/DetailNews.php", "/Advt.php") &&
-                                storyId in edition.fullImageIds && image.isFile
-                            ) {
-                                view.loadUrl(Uri.fromFile(image).toString())
-                                return true
-                            }
-                            return false
-                        }
-                    }
-                    dialog.setOnDismissListener { popup.destroy() }
-                    dialog.show()
-                    dialog.window?.setLayout(
-                        (resources.displayMetrics.widthPixels * 0.95f).toInt(),
-                        (resources.displayMetrics.heightPixels * 0.9f).toInt()
-                    )
-                    val transport = resultMsg.obj as? WebView.WebViewTransport ?: return false
-                    transport.webView = popup
-                    resultMsg.sendToTarget()
-                    return true
-                }
-            }
             webViewClient = object : WebViewClient() {
                 override fun shouldOverrideUrlLoading(
                     view: WebView,
@@ -204,58 +199,75 @@ class MainActivity : Activity() {
                         openOfflineTarget(request.url)
                         return true
                     }
-                    syncPageFromUrl(request.url)
-                    return false
+                    return request.url.scheme !in setOf("file", "data", "about")
                 }
+            }
+        }
+        inspectionWebView = WebView(this).apply {
+            settings.javaScriptEnabled = true
+            settings.domStorageEnabled = true
+            settings.useWideViewPort = true
+            settings.loadWithOverviewMode = true
+            alpha = 0f
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+        }
+        inspectionWebView.webViewClient = inspectionClient()
+        detailWebView = WebView(this).apply {
+            settings.javaScriptEnabled = true
+            settings.domStorageEnabled = true
+            settings.useWideViewPort = true
+            settings.loadWithOverviewMode = true
+            alpha = 0f
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+        }
+        detailWebView.webViewClient = object : WebViewClient() {
+            override fun onPageFinished(view: WebView, url: String) {
+                val id = onDemandStoryId ?: return
+                val uri = Uri.parse(url)
+                if (uri.host != "epaper.dawn.com" || uri.path != "/DetailImage.php") return
+                if (uri.getQueryParameter("StoryImage") != id) return
+                parseStoryText(view, id) { article ->
+                    val edition = onDemandEdition ?: return@parseStoryText
+                    val directory = onDemandDirectory ?: return@parseStoryText
+                    val updated = edition.copy(
+                        articles = edition.articles.filterNot { it.id == id } + article
+                    )
+                    val savedEdition: DawnEdition
+                    if (editionInProgress?.date == edition.date) {
+                        collectedArticles = collectedArticles.filterNot { it.id == id } + article
+                        val activeEdition = editionInProgress ?: updated
+                        persistProgress(activeEdition)
+                        savedEdition = availableEdition ?: updated
+                    } else {
+                        persistEdition(updated, directory)
+                        savedEdition = updated
+                    }
+                    if (offlineEdition?.date == savedEdition.date) offlineEdition = savedEdition
+                    if (availableEdition?.date == savedEdition.date) availableEdition = savedEdition
+                    onDemandStoryId = null
+                    onDemandEdition = null
+                    onDemandDirectory = null
+                    webView.loadDataWithBaseURL(
+                        "https://offline.dawn/",
+                        renderArticle(article),
+                        "text/html",
+                        "UTF-8",
+                        null
+                    )
+                }
+            }
 
-                override fun onPageFinished(view: WebView, url: String) {
-                    val uri = Uri.parse(url)
-                    val activeEdition = editionInProgress
-                    if (activeEdition != null && uri.host == "e.dawn.com" &&
-                        !archivingStories
-                    ) {
-                        val page = activeEdition.pages.getOrNull(editionPageIndex)
-                        val currentId = uri.lastPathSegment?.removeSuffix(".html")
-                        if (page != null && currentId == page.id &&
-                            processingContentId != page.id
-                        ) {
-                            processingContentId = page.id
-                            view.postDelayed({
-                                if (editionInProgress === activeEdition) {
-                                    collectPageHotspots(activeEdition, page)
-                                }
-                            }, 250)
-                        }
-                        return
-                    }
-                    if (activeEdition != null && archivingStories &&
-                        uri.host == "epaper.dawn.com"
-                    ) {
-                        val storyId = textStoryIds.getOrNull(storyIndex)
-                        if (storyId != null && uri.path == "/DetailImage.php" &&
-                            uri.getQueryParameter("StoryImage") == storyId &&
-                            processingContentId != storyId
-                        ) {
-                            processingContentId = storyId
-                            view.postDelayed({
-                                if (editionInProgress === activeEdition) {
-                                    collectStoryText(storyId)
-                                }
-                            }, 250)
-                        }
-                        return
-                    }
-                    if (activeEdition != null && archivingStories) return
-                    if (uri.host == "epaper.dawn.com") {
-                        downloadButton.isEnabled = true
-                        val requestedDate = dateFormat.format(selectedDate.time)
-                        if (checkedEditionDate != requestedDate) {
-                            checkedEditionDate = requestedDate
-                            discoverEdition(startDownload = false)
-                        }
-                    }
-                    updatePageLabel()
-                }
+            override fun onReceivedError(
+                view: WebView,
+                request: WebResourceRequest,
+                error: android.webkit.WebResourceError
+            ) {
+                if (!request.isForMainFrame) return
+                val id = onDemandStoryId ?: return
+                onDemandStoryId = null
+                onDemandEdition = null
+                onDemandDirectory = null
+                showMessage("Could not download story $id: ${error.description}")
             }
         }
 
@@ -266,8 +278,31 @@ class MainActivity : Activity() {
                 LinearLayout.LayoutParams.WRAP_CONTENT
             )
         )
-        root.addView(
+        val contentFrame = FrameLayout(this)
+        contentFrame.addView(
+            inspectionWebView,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+        )
+        contentFrame.addView(
+            detailWebView,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+        )
+        contentFrame.addView(
             webView,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+        )
+        webView.visibility = View.GONE
+        root.addView(
+            contentFrame,
             LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 0,
@@ -275,15 +310,59 @@ class MainActivity : Activity() {
             )
         )
         setContentView(root)
+        pageLabel.text = "Select a date and newspaper"
+        updateDateButton()
         updatePageLabel()
     }
 
+    private fun inspectionClient() = object : WebViewClient() {
+        override fun onPageFinished(view: WebView, url: String) {
+            val uri = Uri.parse(url)
+            if (availabilityCheckInProgress && uri.host == "epaper.dawn.com") {
+                val requestedDate = checkedEditionDate ?: return
+                if (uri.getQueryParameter("page")?.startsWith("${requestedDate}_") != true) return
+                discoverEdition()
+                return
+            }
+            val edition = editionInProgress ?: return
+            if (pageScanInProgress && uri.host == "e.dawn.com") {
+                val page = edition.readingOrder.getOrNull(editionPageIndex) ?: return
+                if (uri.lastPathSegment?.removeSuffix(".html") == page.id &&
+                    processingContentId != page.id
+                ) {
+                    processingContentId = page.id
+                    view.postDelayed({
+                        if (editionInProgress === edition && pageScanInProgress) {
+                            collectPageHotspots(edition, page)
+                        }
+                    }, 250)
+                }
+                return
+            }
+            if (storyScanInProgress && uri.host == "epaper.dawn.com") {
+                val storyId = textStoryIds.getOrNull(storyIndex) ?: return
+                if (uri.path == "/DetailImage.php" &&
+                    uri.getQueryParameter("StoryImage") == storyId &&
+                    processingContentId != storyId
+                ) {
+                    processingContentId = storyId
+                    view.postDelayed({
+                        if (editionInProgress === edition && storyScanInProgress) {
+                            collectStoryText(edition, storyId)
+                        }
+                    }, 250)
+                }
+            }
+        }
+    }
+
     private fun loadPage() {
-        downloadButton.isEnabled = false
         updatePageLabel()
-        val date = dateFormat.format(selectedDate.time)
-        val page = pageNumber.toString().padStart(3, '0')
-        webView.loadUrl("https://epaper.dawn.com/?page=${date}_$page")
+        val edition = availableEdition ?: return
+        val page = edition.readingOrder.firstOrNull {
+            it.id.takeLast(3).toIntOrNull() == pageNumber
+        } ?: edition.readingOrder.firstOrNull() ?: return
+        openReaderPage(page)
     }
 
     private fun chooseDate() {
@@ -292,7 +371,11 @@ class MainActivity : Activity() {
             { _, year, month, day ->
                 selectedDate.set(year, month, day)
                 pageNumber = 1
-                loadPage()
+                showHome()
+                availableEdition = null
+                updateDateButton()
+                pageAdapter?.clear()
+                checkAvailability()
             },
             selectedDate.get(Calendar.YEAR),
             selectedDate.get(Calendar.MONTH),
@@ -300,60 +383,176 @@ class MainActivity : Activity() {
         ).show()
     }
 
-    private fun discoverEdition(startDownload: Boolean) {
-        downloadButton.isEnabled = false
+    private fun updateDateButton() {
+        dateButton.text = SimpleDateFormat("EEE, d MMM yyyy", Locale.getDefault())
+            .format(selectedDate.time)
+    }
+
+    private fun showHome() {
+        readerMode = false
+        homePanel.visibility = View.VISIBLE
+        readerPanel.visibility = View.GONE
+        webView.visibility = View.GONE
+        updatePageLabel()
+    }
+
+    private fun openDawnEdition() {
+        val edition = availableEdition
+        if (edition == null) {
+            showMessage(if (availabilityCheckInProgress) "Checking Dawn availability…" else "Dawn is not available for this date.")
+            return
+        }
+        readerMode = true
+        homePanel.visibility = View.GONE
+        readerPanel.visibility = View.VISIBLE
+        webView.visibility = View.VISIBLE
+        val directory = File(File(filesDir, "editions"), edition.date)
+        if (editionInProgress?.date != edition.date &&
+            !File(directory, "complete").isFile
+        ) {
+            downloadEdition(edition)
+        }
+        pageNumber = edition.readingOrder.firstOrNull()?.id?.takeLast(3)?.toIntOrNull() ?: 1
+        updatePagePicker(edition)
+        loadPage()
+    }
+
+    private fun updatePagePicker(edition: DawnEdition) {
+        val adapter = pageAdapter ?: return
+        updatingPagePicker = true
+        adapter.clear()
+        adapter.addAll(edition.readingOrder.map { it.title.ifBlank { "Page ${it.id.takeLast(3)}" } })
+        adapter.notifyDataSetChanged()
+        val index = edition.readingOrder.indexOfFirst {
+            it.id.takeLast(3).toIntOrNull() == pageNumber
+        }
+        if (index >= 0) pageSpinner.setSelection(index, false)
+        updatingPagePicker = false
+    }
+
+    private fun openReaderPage(page: DawnPage) {
+        val edition = availableEdition ?: return
+        val directory = File(File(filesDir, "editions"), edition.date)
+        pageNumber = page.id.takeLast(3).toIntOrNull() ?: 1
+        val position = edition.readingOrder.indexOfFirst { it.id == page.id }
+        if (position >= 0 && pageSpinner.selectedItemPosition != position) {
+            pageSpinner.setSelection(position, false)
+        }
+        if (edition.hasPageImage(directory, page.id)) {
+            openOfflinePage(edition, page, directory)
+        } else {
+            webView.loadData(
+                "<html><body style='font:18px sans-serif;padding:24px'>Downloading ${htmlEscape(page.title)} first…</body></html>",
+                "text/html",
+                "UTF-8"
+            )
+            requestPageDownload(edition, directory, page, priority = -100)
+        }
+    }
+
+    private fun checkAvailability() {
+        val requestedDate = dateFormat.format(selectedDate.time)
+        checkedEditionDate = requestedDate
+        availableEdition = null
+        availabilityCheckInProgress = true
+        latestEditionStatus = null
+        dawnStatusLabel.text = "Checking availability…"
+        dawnStatusLabel.setTextColor(Color.DKGRAY)
+        pageLabel.text = "Checking Dawn for ${requestedDate.replace('_', '-')}"
+        inspectionWebView.loadUrl("https://epaper.dawn.com/?page=${requestedDate}_001")
+    }
+
+    private fun discoverEdition() {
+        val requestedDate = checkedEditionDate ?: return
         val script = """
             (function() {
+                const requestedDate = '$requestedDate';
                 const datePattern = /^\d{2}_\d{2}_\d{4}_001$/;
                 const datePicker = Array.from(document.querySelectorAll('select'))
                     .find(select => Array.from(select.options).some(option => datePattern.test(option.value)));
                 if (!datePicker || !datePicker.options.length) {
                     return JSON.stringify({error: 'Could not find Dawn edition dates on this page.'});
                 }
-                const date = (datePicker.value || datePicker.options[0].value).substring(0, 10);
+                const availableDates = Array.from(datePicker.options)
+                    .map(option => option.value.substring(0, 10));
                 const latestDate = datePicker.options[0].value.substring(0, 10);
+                if (!availableDates.includes(requestedDate)) {
+                    return JSON.stringify({error: 'NOT_AVAILABLE', latestDate: latestDate});
+                }
                 const pages = [];
                 const seen = new Set();
                 for (const link of document.querySelectorAll('a[href*="page="]')) {
                     const url = new URL(link.href, location.href);
                     const id = url.searchParams.get('page');
-                    if (id && id.startsWith(date + '_') &&
+                    if (id && id.startsWith(requestedDate + '_') &&
                         /^\d{2}_\d{2}_\d{4}_\d{3}$/.test(id) && !seen.has(id)) {
                         seen.add(id);
                         pages.push({id: id, title: link.innerText.trim()});
                     }
                 }
+                if (!pages.length) {
+                    return JSON.stringify({error: 'NOT_AVAILABLE', latestDate: latestDate});
+                }
                 return JSON.stringify({
-                    date: date,
+                    date: requestedDate,
                     latestDate: latestDate,
                     pages: pages
                 });
             })();
         """.trimIndent()
-        webView.evaluateJavascript(script) { result ->
+        inspectionWebView.evaluateJavascript(script) { result ->
             try {
+                if (checkedEditionDate != requestedDate) return@evaluateJavascript
                 val json = JSONTokener(result).nextValue() as? String
                     ?: throw IllegalStateException("Could not read the Dawn edition page list.")
                 val response = JSONObject(json)
-                if (response.has("error")) {
-                    latestEditionStatus = response.getString("error")
-                    downloadButton.isEnabled = true
-                    updatePageLabel()
-                    showMessage(response.getString("error"))
+                availabilityCheckInProgress = false
+                if (response.optString("error") == "NOT_AVAILABLE") {
+                    latestEditionStatus = "Not available"
+                    dawnStatusLabel.text = "Not available for this date"
+                    dawnStatusLabel.setTextColor(Color.GRAY)
+                    pageLabel.text = "Dawn is not available for ${requestedDate.replace('_', '-')}"
+                    return@evaluateJavascript
+                } else if (response.has("error")) {
+                    val message = response.getString("error")
+                    latestEditionStatus = message
+                    dawnStatusLabel.text = "Could not check availability"
+                    dawnStatusLabel.setTextColor(Color.RED)
+                    pageLabel.text = message
                 } else {
                     val edition = DawnEdition.fromJson(json)
-                    val today = dateFormat.format(Calendar.getInstance().time)
-                    latestEditionStatus = if (edition.latestDate == today) {
-                        "Today's paper is live · ${edition.pages.size} pages"
+                    availableEdition = edition
+                    updatePagePicker(edition)
+                    val directory = File(File(filesDir, "editions"), edition.date)
+                    val metadata = File(directory, "edition.json")
+                    val savedEdition = if (metadata.isFile) {
+                        try {
+                            DawnEdition.readMetadata(metadata)
+                        } catch (error: Exception) {
+                            showMessage(error.message ?: "Saved edition metadata is invalid and will be rebuilt.")
+                            null
+                        }
+                    } else null
+                    val pagesSaved = savedEdition != null &&
+                        File(directory, "complete").isFile &&
+                        savedEdition.pages.all { savedEdition.hasPageImage(directory, it.id) }
+                    if (pagesSaved) {
+                        availableEdition = savedEdition
+                        updatePagePicker(savedEdition!!)
+                        dawnStatusLabel.text = "Available · downloaded"
+                        dawnStatusLabel.setTextColor(Color.rgb(30, 125, 70))
                     } else {
-                        "Today's paper is not live · latest ${edition.latestDate.replace('_', '-')}"
+                        dawnStatusLabel.text = "Available · downloading in background"
+                        dawnStatusLabel.setTextColor(Color.rgb(35, 95, 160))
+                        downloadEdition(edition)
                     }
-                    updatePageLabel()
-                    if (startDownload) downloadEdition(edition) else downloadButton.isEnabled = true
                 }
+                updatePageLabel()
             } catch (error: Exception) {
-                latestEditionStatus = error.message ?: "Could not check Dawn's latest edition."
-                downloadButton.isEnabled = true
+                availabilityCheckInProgress = false
+                latestEditionStatus = error.message ?: "Could not check Dawn's edition."
+                dawnStatusLabel.text = "Could not check availability"
+                dawnStatusLabel.setTextColor(Color.RED)
                 updatePageLabel()
                 showMessage(error.message ?: "Could not read Dawn's edition page list.")
             }
@@ -361,54 +560,151 @@ class MainActivity : Activity() {
     }
 
     private fun downloadEdition(edition: DawnEdition) {
-        val selected = dateFormat.format(selectedDate.time)
-        val today = dateFormat.format(Calendar.getInstance().time)
-        if (edition.date != selected &&
-            (selected != today || edition.date != edition.latestDate)
-        ) {
-            downloadButton.isEnabled = true
-            showMessage("Dawn is showing ${edition.date.replace('_', '-')}, not the selected date. Reload the page and try again.")
-            return
-        }
-        if (edition.date != selected) {
-            dateFormat.parse(edition.date)?.let { selectedDate.time = it }
-            pageNumber = 1
-        }
-
-        latestEditionStatus = if (edition.latestDate == today) {
-            "Today's paper is live"
-        } else {
-            "Today's paper is not live · latest ${edition.latestDate.replace('_', '-')}"
-        }
-        pageLabel.text = "${latestEditionStatus} · ${edition.pages.size} pages"
-        downloadButton.isEnabled = false
-        setReaderControlsEnabled(false)
-        showMessage("Downloading ${edition.pages.size} Dawn page images…")
+        if (editionInProgress?.date == edition.date) return
 
         val directory = File(File(filesDir, "editions"), edition.date)
-        downloadExecutor.execute {
-            try {
-                edition.downloadPageImages(directory) { completed, total ->
-                    runOnUiThread {
-                        pageLabel.text = "Downloading page images · $completed/$total"
-                    }
+        synchronized(pageDownloadLock) {
+            pageDownloadQueue.clear()
+            queuedPageIds.clear()
+        }
+        editionInProgress = edition
+        activeEditionDirectory = directory
+        val completionMarker = File(directory, "complete")
+        if (completionMarker.exists() && !completionMarker.delete()) {
+            failEditionDownload("Could not resume this edition's download.")
+            return
+        }
+        editionPageIndex = 0
+        textStoryIds = emptyList()
+        fullImageIds = emptyList()
+        collectedHotspots = emptyList()
+        collectedArticles = emptyList()
+        storyIndex = 0
+        archivingStories = false
+        processingContentId = null
+        pageScanInProgress = true
+        storyScanInProgress = false
+        storyScanComplete = false
+        pageDownloadFailed = false
+        val pagesToDownload = edition.readingOrder.filterNot {
+            edition.hasPageImage(directory, it.id)
+        }
+        pageDownloadsRemaining = pagesToDownload.size
+        enqueuePageDownloads(edition, directory, pagesToDownload)
+        loadNextEditionPage()
+    }
+
+    private fun enqueuePageDownloads(
+        edition: DawnEdition,
+        directory: File,
+        pages: List<DawnPage>
+    ) {
+        synchronized(pageDownloadLock) {
+            pages.forEachIndexed { index, page ->
+                if (!edition.hasPageImage(directory, page.id) &&
+                    queuedPageIds.add(page.id)
+                ) {
+                    pageDownloadQueue.add(
+                        PageDownloadRequest(page, directory, edition, 10 + index, pageDownloadSequence++)
+                    )
                 }
-                runOnUiThread {
-                    editionInProgress = edition
-                    activeEditionDirectory = directory
-                    editionPageIndex = 0
-                    textStoryIds = emptyList()
-                    fullImageIds = emptyList()
-                    collectedHotspots = emptyList()
-                    collectedArticles = emptyList()
-                    storyIndex = 0
-                    archivingStories = false
-                    processingContentId = null
-                    loadNextEditionPage()
-                }
-            } catch (error: Exception) {
-                runOnUiThread { failEditionDownload(error.message ?: "Could not download Dawn's page images.") }
             }
+            startPageDownloadWorkerLocked()
+        }
+    }
+
+    private fun requestPageDownload(
+        edition: DawnEdition,
+        directory: File,
+        page: DawnPage,
+        priority: Int
+    ) {
+        synchronized(pageDownloadLock) {
+            if (edition.hasPageImage(directory, page.id)) return
+            val existing = pageDownloadQueue.firstOrNull { it.page.id == page.id }
+            if (existing != null) {
+                if (priority < existing.priority) {
+                    pageDownloadQueue.remove(existing)
+                    pageDownloadQueue.add(existing.copy(priority = priority))
+                }
+            } else if (pageDownloadInProgressId != page.id) {
+                pageDownloadQueue.add(
+                    PageDownloadRequest(page, directory, edition, priority, pageDownloadSequence++)
+                )
+                queuedPageIds.add(page.id)
+                pageDownloadsRemaining++
+                pageDownloadFailed = false
+            }
+            startPageDownloadWorkerLocked()
+        }
+    }
+
+    private var pageDownloadInProgressId: String? = null
+
+    private fun startPageDownloadWorkerLocked() {
+        if (pageDownloadWorkerRunning || pageDownloadQueue.isEmpty()) return
+        pageDownloadWorkerRunning = true
+        downloadExecutor.execute {
+            while (true) {
+                val request = synchronized(pageDownloadLock) {
+                    pageDownloadQueue.poll()?.also {
+                        queuedPageIds.remove(it.page.id)
+                        pageDownloadInProgressId = it.page.id
+                    } ?: run {
+                        pageDownloadWorkerRunning = false
+                        pageDownloadInProgressId = null
+                        null
+                    }
+                } ?: break
+                try {
+                    request.edition.downloadPageImage(request.directory, request.page.id)
+                    runOnUiThread {
+                        val isCurrentEdition = editionInProgress === request.edition
+                        if (isCurrentEdition) {
+                            availableEdition = request.edition.copy(
+                                fullImageIds = fullImageIds,
+                                hotspots = collectedHotspots,
+                                articles = collectedArticles
+                            )
+                            pageDownloadsRemaining = (pageDownloadsRemaining - 1).coerceAtLeast(0)
+                        }
+                        if (readerMode && selectedDateKey() == request.edition.date &&
+                            pageNumber == request.page.id.takeLast(3).toIntOrNull()
+                        ) {
+                            openOfflinePage(
+                                if (isCurrentEdition) availableEdition ?: request.edition else request.edition,
+                                request.page,
+                                request.directory
+                            )
+                        }
+                        if (isCurrentEdition) {
+                            updateDownloadStatus("Downloaded ${request.page.title}")
+                            maybeCompleteEdition(request.edition)
+                        } else if (selectedDateKey() == request.edition.date) {
+                            dawnStatusLabel.text = "Available · page downloaded"
+                            dawnStatusLabel.setTextColor(Color.rgb(30, 125, 70))
+                        }
+                    }
+                } catch (error: Exception) {
+                    runOnUiThread {
+                        if (editionInProgress === request.edition) {
+                            pageDownloadFailed = true
+                            pageDownloadsRemaining = (pageDownloadsRemaining - 1).coerceAtLeast(0)
+                            dawnStatusLabel.text = "Available · download needs retry"
+                            dawnStatusLabel.setTextColor(Color.rgb(180, 90, 20))
+                            showMessage(error.message ?: "Could not download ${request.page.title}.")
+                            maybeCompleteEdition(request.edition)
+                        } else if (selectedDateKey() == request.edition.date) {
+                            dawnStatusLabel.text = "Available · download needs retry"
+                            dawnStatusLabel.setTextColor(Color.rgb(180, 90, 20))
+                            showMessage(error.message ?: "Could not download ${request.page.title}.")
+                        }
+                    }
+                } finally {
+                    synchronized(pageDownloadLock) { pageDownloadInProgressId = null }
+                }
+            }
+            runOnUiThread { maybeCompleteEdition(editionInProgress ?: return@runOnUiThread) }
         }
     }
 
@@ -417,24 +713,27 @@ class MainActivity : Activity() {
         if (archivingStories) {
             val storyId = textStoryIds.getOrNull(storyIndex)
             if (storyId == null) {
-                completeEditionDownload(edition)
+                storyScanInProgress = false
+                storyScanComplete = true
+                maybeCompleteEdition(edition)
                 return
             }
-            pageLabel.text = "Saving story text · ${storyIndex + 1}/${textStoryIds.size}"
+            updateDownloadStatus("Saving story text · ${storyIndex + 1}/${textStoryIds.size}")
             processingContentId = null
-            webView.loadUrl("https://epaper.dawn.com/DetailImage.php?StoryImage=$storyId")
+            inspectionWebView.loadUrl("https://epaper.dawn.com/DetailImage.php?StoryImage=$storyId")
             return
         }
 
-        val page = edition.pages.getOrNull(editionPageIndex)
+        val page = edition.readingOrder.getOrNull(editionPageIndex)
         if (page == null) {
+            pageScanInProgress = false
             downloadLinkedContent(edition)
             return
         }
-        pageLabel.text = "Reading page links · ${editionPageIndex + 1}/${edition.pages.size}"
+        updateDownloadStatus("Reading page links · ${editionPageIndex + 1}/${edition.pages.size}")
         processingContentId = null
         val parts = edition.date.split('_')
-        webView.loadUrl(
+        inspectionWebView.loadUrl(
             "https://e.dawn.com/${parts[2]}/${parts[1]}/${parts[0]}/pages/${page.id}.html",
             mapOf("Referer" to "https://epaper.dawn.com/")
         )
@@ -456,8 +755,9 @@ class MainActivity : Activity() {
                     coordinates: coordinates}];
             }))
         """.trimIndent()
-        webView.evaluateJavascript(script) { result ->
+        inspectionWebView.evaluateJavascript(script) { result ->
             try {
+                if (editionInProgress !== edition) return@evaluateJavascript
                 val json = JSONTokener(result).nextValue() as? String
                     ?: throw IllegalStateException("Could not read story areas from page ${page.id}.")
                 val entries = org.json.JSONArray(json)
@@ -490,8 +790,10 @@ class MainActivity : Activity() {
                     }
                 }
                 editionPageIndex++
+                persistProgress(edition)
                 loadNextEditionPage()
             } catch (error: Exception) {
+                if (editionInProgress !== edition) return@evaluateJavascript
                 failEditionDownload(error.message ?: "Could not read clickable areas on ${page.id}.")
             }
         }
@@ -502,23 +804,50 @@ class MainActivity : Activity() {
             failEditionDownload("Edition storage is unavailable.")
             return
         }
+        val imageIds = fullImageIds
         downloadExecutor.execute {
             try {
-                edition.downloadFullImages(directory, fullImageIds) { completed, total ->
-                    runOnUiThread { pageLabel.text = "Downloading full-size images · $completed/$total" }
+                edition.downloadFullImages(directory, imageIds) { completed, total ->
+                    runOnUiThread {
+                        if (editionInProgress === edition) {
+                            updateDownloadStatus("Downloading full-size images · $completed/$total")
+                        }
+                    }
                 }
                 runOnUiThread {
+                    if (editionInProgress !== edition) return@runOnUiThread
+                    persistProgress(edition)
                     archivingStories = textStoryIds.isNotEmpty()
+                    storyScanInProgress = archivingStories
                     storyIndex = 0
-                    if (archivingStories) loadNextEditionPage() else completeEditionDownload(edition)
+                    if (archivingStories) {
+                        loadNextEditionPage()
+                    } else {
+                        storyScanComplete = true
+                        maybeCompleteEdition(edition)
+                    }
                 }
             } catch (error: Exception) {
-                runOnUiThread { failEditionDownload(error.message ?: "Could not download full-size images.") }
+                runOnUiThread {
+                    if (editionInProgress === edition) {
+                        failEditionDownload(error.message ?: "Could not download full-size images.")
+                    }
+                }
             }
         }
     }
 
-    private fun collectStoryText(id: String) {
+    private fun collectStoryText(edition: DawnEdition, id: String) {
+        parseStoryText(inspectionWebView, id) { article ->
+            if (editionInProgress !== edition) return@parseStoryText
+            collectedArticles = collectedArticles.filterNot { it.id == id } + article
+            storyIndex++
+            persistProgress(edition)
+            loadNextEditionPage()
+        }
+    }
+
+    private fun parseStoryText(source: WebView, id: String, onArticle: (DawnArticle) -> Unit) {
         val script = """
             (() => {
                 const article = Array.from(document.querySelectorAll('.px-4.font-merriweather > div'))
@@ -534,7 +863,7 @@ class MainActivity : Activity() {
                 return JSON.stringify({id: '$id', title: title, byline: byline, paragraphs: paragraphs});
             })()
         """.trimIndent()
-        webView.evaluateJavascript(script) { result ->
+        source.evaluateJavascript(script) { result ->
             try {
                 val json = JSONTokener(result).nextValue() as? String
                     ?: throw IllegalStateException("Could not read Dawn's text for story $id.")
@@ -550,11 +879,15 @@ class MainActivity : Activity() {
                 if (article.title.isBlank() || article.paragraphs.isEmpty()) {
                     throw IllegalStateException("Dawn returned empty text for story $id.")
                 }
-                collectedArticles = collectedArticles.filterNot { it.id == id } + article
-                storyIndex++
-                loadNextEditionPage()
+                onArticle(article)
             } catch (error: Exception) {
-                failEditionDownload(error.message ?: "Could not save Dawn story text.")
+                if (source === inspectionWebView) {
+                    failEditionDownload(error.message ?: "Could not save Dawn story text.")
+                } else {
+                    onDemandStoryId = null
+                    onDemandEdition = null
+                    showMessage(error.message ?: "Could not download this story's text.")
+                }
             }
         }
     }
@@ -570,15 +903,18 @@ class MainActivity : Activity() {
             )
             savedEdition.removeLegacyArchives(directory)
             savedEdition.saveMetadata(directory)
+            File(directory, "complete").writeText("ok", Charsets.UTF_8)
+            availableEdition = savedEdition
+            offlineEdition = savedEdition
             editionInProgress = null
             activeEditionDirectory = null
             archivingStories = false
-            setReaderControlsEnabled(true)
-            pageLabel.text =
-                "Offline edition ready · ${edition.pages.size} pages · ${collectedArticles.size} texts · ${fullImageIds.size} images"
-            showMessage("Saved page images, clickable areas, full-size images, and text stories.")
-            pageNumber = 1
-            loadPage()
+            pageScanInProgress = false
+            storyScanInProgress = false
+            dawnStatusLabel.text = "Available · downloaded"
+            dawnStatusLabel.setTextColor(Color.rgb(30, 125, 70))
+            updatePagePicker(savedEdition)
+            updatePageLabel("Offline edition ready")
         } catch (error: Exception) {
             failEditionDownload(error.message ?: "Could not save edition details.")
         }
@@ -588,24 +924,64 @@ class MainActivity : Activity() {
         editionInProgress = null
         activeEditionDirectory = null
         archivingStories = false
-        setReaderControlsEnabled(true)
+        pageScanInProgress = false
+        storyScanInProgress = false
+        dawnStatusLabel.text = "Available · download incomplete"
+        dawnStatusLabel.setTextColor(Color.rgb(180, 90, 20))
         showMessage(message)
-        pageLabel.text = "Edition download incomplete"
-        pageNumber = 1
-        loadPage()
+        updatePageLabel("Download incomplete")
     }
 
-    private fun setReaderControlsEnabled(enabled: Boolean) {
-        readerButtons.forEach { it.isEnabled = enabled }
-        if (enabled) downloadButton.isEnabled = true
+    private fun persistProgress(edition: DawnEdition) {
+        val directory = activeEditionDirectory ?: return
+        val progress = edition.copy(
+            fullImageIds = fullImageIds,
+            hotspots = collectedHotspots,
+            articles = collectedArticles
+        )
+        progress.saveMetadata(directory)
+        availableEdition = progress
+        if (offlineEdition?.date == progress.date) offlineEdition = progress
+        updatePagePicker(progress)
+        if (readerMode) {
+            val page = progress.readingOrder.firstOrNull {
+                it.id.takeLast(3).toIntOrNull() == pageNumber
+            }
+            if (page != null && progress.hasPageImage(directory, page.id)) {
+                openOfflinePage(progress, page, directory)
+            }
+        }
     }
+
+    private fun maybeCompleteEdition(edition: DawnEdition) {
+        if (editionInProgress !== edition || !storyScanComplete || pageDownloadsRemaining > 0) return
+        val queueEmpty = synchronized(pageDownloadLock) {
+            !pageDownloadWorkerRunning && pageDownloadQueue.isEmpty()
+        }
+        if (!queueEmpty) return
+        if (pageDownloadFailed) {
+            dawnStatusLabel.text = "Available · download needs retry"
+            dawnStatusLabel.setTextColor(Color.rgb(180, 90, 20))
+            persistProgress(edition)
+            return
+        }
+        completeEditionDownload(edition)
+    }
+
+    private fun updateDownloadStatus(status: String) {
+        dawnStatusLabel.text = "Available · $status"
+        dawnStatusLabel.setTextColor(Color.rgb(35, 95, 160))
+        if (readerMode) updatePageLabel(status)
+    }
+
+    private fun selectedDateKey(): String = dateFormat.format(selectedDate.time)
 
     private fun showOfflineEditions() {
         val editionDirectory = File(filesDir, "editions")
         val editions = editionDirectory.listFiles()
             ?.mapNotNull { directory ->
                 val metadata = File(directory, "edition.json")
-                if (!metadata.isFile) return@mapNotNull null
+                if (!metadata.isFile || !File(directory, "complete").isFile) return@mapNotNull null
                 try {
                     DawnEdition.readMetadata(metadata) to directory
                 } catch (_: Exception) {
@@ -640,14 +1016,21 @@ class MainActivity : Activity() {
     }
 
     private fun openOfflinePage(edition: DawnEdition, page: DawnPage, directory: File) {
-        if (!File(directory, page.imageFileName).isFile) {
+        if (!edition.hasPageImage(directory, page.id)) {
             showMessage("This page image is missing from the offline edition.")
             return
         }
         offlineEdition = edition
         offlineDirectory = directory
+        availableEdition = edition
+        readerMode = true
+        homePanel.visibility = View.GONE
+        readerPanel.visibility = View.VISIBLE
+        webView.visibility = View.VISIBLE
         selectedDate.time = dateFormat.parse(edition.date) ?: selectedDate.time
         pageNumber = page.id.takeLast(3).toInt()
+        updateDateButton()
+        updatePagePicker(edition)
         updatePageLabel("Offline · ${page.title}")
         val pageHotspots = edition.hotspots.filter { it.pageId == page.id }
         val html = renderOfflinePage(page, pageHotspots)
@@ -661,14 +1044,23 @@ class MainActivity : Activity() {
     }
 
     private fun renderOfflinePage(page: DawnPage, hotspots: List<DawnHotspot>): String {
+        val points = hotspots.joinToString(" ") { hotspot ->
+            val route = if (hotspot.type == DawnHotspotType.TEXT) "text" else "image"
+            val label = hotspot.label.ifBlank { "Story ${hotspot.targetId.takeLast(3)}" }
+            """<a href="https://offline.dawn/$route/${hotspot.targetId}">${htmlEscape(label)}</a>"""
+        }
         val areas = hotspots.joinToString("") { hotspot ->
             val route = if (hotspot.type == DawnHotspotType.TEXT) "text" else "image"
             """<area shape="${htmlEscape(hotspot.shape)}" coords="${hotspot.coordinates.joinToString(",")}" href="https://offline.dawn/$route/${hotspot.targetId}" alt="${htmlEscape(hotspot.label)}" title="${htmlEscape(hotspot.label)}">"""
         }
         return """
             <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-            <style>body{margin:0;background:#222;text-align:center}img{display:block;width:100%;height:auto;margin:auto}</style>
-            </head><body><img id="page" src="${page.imageFileName}" usemap="#page-map"><map name="page-map">$areas</map>
+            <style>body{margin:0;background:#222;text-align:center;color:#fff;font:14px sans-serif}
+            .points{padding:10px;text-align:left;background:#333}.points a{display:inline-block;margin:4px;padding:6px 9px;
+            border-radius:4px;background:#fff;color:#234;text-decoration:none}
+            img{display:block;width:100%;height:auto;margin:auto}</style>
+            </head><body><nav class="points">News points: $points</nav>
+            <img id="page" src="${page.imageFileName}" usemap="#page-map"><map name="page-map">$areas</map>
             <script>
             (function(){const img=document.getElementById('page');const areas=document.querySelectorAll('area');
             function scale(){if(!img.naturalWidth)return;const sx=img.clientWidth/img.naturalWidth,sy=img.clientHeight/img.naturalHeight;
@@ -688,7 +1080,7 @@ class MainActivity : Activity() {
         when (parts[0]) {
             "text" -> {
                 val article = edition.articles.firstOrNull { it.id == id } ?: run {
-                    showMessage("This story's text is missing from the offline edition.")
+                    requestStoryText(edition, directory, id)
                     return
                 }
                 webView.loadDataWithBaseURL(
@@ -700,14 +1092,88 @@ class MainActivity : Activity() {
                 )
             }
             "image" -> {
-                if (id !in edition.fullImageIds) return
                 val image = File(File(directory, "images"), "$id.jpg")
                 if (!image.isFile) {
-                    showMessage("This full-size image is missing from the offline edition.")
+                    requestStoryImage(edition, directory, id)
                     return
                 }
                 webView.loadUrl(Uri.fromFile(image).toString())
             }
+        }
+    }
+
+    private fun requestStoryText(edition: DawnEdition, directory: File, id: String) {
+            if (edition.hotspots.none {
+                    it.targetId == id && it.type == DawnHotspotType.TEXT
+                }
+            ) {
+                showMessage("This text story is not listed in this edition.")
+                return
+            }
+            if (onDemandStoryId != null) {
+                showMessage("Another story is still downloading.")
+                return
+            }
+            onDemandStoryId = id
+            onDemandEdition = edition
+            onDemandDirectory = directory
+            webView.loadData(
+                "<html><body style='font:18px sans-serif;padding:24px'>Downloading story text…</body></html>",
+                "text/html",
+                "UTF-8"
+            )
+            detailWebView.loadUrl("https://epaper.dawn.com/DetailImage.php?StoryImage=$id")
+        }
+
+    private fun requestStoryImage(edition: DawnEdition, directory: File, id: String) {
+            if (edition.hotspots.none {
+                    it.targetId == id && it.type == DawnHotspotType.IMAGE
+                }
+            ) {
+                showMessage("This image is not listed in this edition.")
+                return
+            }
+            val imageDir = File(directory, "images")
+            webView.loadData(
+                "<html><body style='font:18px sans-serif;padding:24px'>Downloading full-size image…</body></html>",
+                "text/html",
+                "UTF-8"
+            )
+            downloadExecutor.execute {
+                try {
+                    edition.downloadFullImages(directory, listOf(id)) { _, _ -> }
+                    val updated = edition.copy(fullImageIds = (edition.fullImageIds + id).distinct())
+                    runOnUiThread {
+                        try {
+                            persistEdition(updated, directory)
+                        } catch (error: Exception) {
+                            showMessage(error.message ?: "Could not save this image to the edition.")
+                            return@runOnUiThread
+                        }
+                        if (offlineEdition?.date == edition.date) offlineEdition = updated
+                        if (availableEdition?.date == edition.date) availableEdition = updated
+                        val image = File(imageDir, "$id.jpg")
+                        webView.loadUrl(Uri.fromFile(image).toString())
+                    }
+                } catch (error: Exception) {
+                    runOnUiThread {
+                        showMessage(error.message ?: "Could not download this image.")
+                        edition.pages.firstOrNull { page ->
+                            edition.hotspots.any { it.pageId == page.id && it.targetId == id }
+                        }?.let { page -> openOfflinePage(edition, page, directory) }
+                    }
+                }
+            }
+        }
+
+    private fun persistEdition(edition: DawnEdition, directory: File?) {
+        val targetDirectory = directory
+            ?: throw IllegalStateException("Edition storage is unavailable.")
+        val marker = File(targetDirectory, "complete")
+        val complete = marker.isFile
+        edition.saveMetadata(targetDirectory)
+        if (!complete && marker.exists() && !marker.delete()) {
+            throw IllegalStateException("Could not update the edition details.")
         }
     }
 
@@ -767,20 +1233,6 @@ class MainActivity : Activity() {
             .show()
     }
 
-    private fun syncPageFromUrl(uri: Uri) {
-        if (uri.host != "epaper.dawn.com") return
-        val pageId = uri.getQueryParameter("page") ?: return
-        val parts = pageId.split('_')
-        if (parts.size != 4) return
-        val parsedDate = Calendar.getInstance()
-        val date = dateFormat.parse(parts.take(3).joinToString("_")) ?: return
-        parsedDate.time = date
-        val parsedPage = parts[3].toIntOrNull() ?: return
-        selectedDate = parsedDate
-        pageNumber = parsedPage
-        updatePageLabel()
-    }
-
     private fun updatePageLabel(status: String? = null) {
         val date = SimpleDateFormat("EEE, d MMM yyyy", Locale.getDefault()).format(selectedDate.time)
         val page = "$date  ·  Page ${pageNumber.toString().padStart(3, '0')}"
@@ -794,7 +1246,7 @@ class MainActivity : Activity() {
             minHeight = dp(40)
             setPadding(dp(6), 0, dp(6), 0)
             setOnClickListener { onClick() }
-        }.also(readerButtons::add)
+        }
 
     private fun showMessage(message: String) {
         Toast.makeText(this, message, Toast.LENGTH_LONG).show()
@@ -805,6 +1257,29 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         downloadExecutor.shutdownNow()
         webView.destroy()
+        inspectionWebView.destroy()
+        detailWebView.destroy()
         super.onDestroy()
     }
+
+    @Deprecated("Use the system back dispatcher in newer Android versions.")
+    override fun onBackPressed() {
+        if (readerMode) {
+            if (webView.canGoBack()) {
+                webView.goBack()
+            } else {
+                showHome()
+            }
+        } else {
+            super.onBackPressed()
+        }
+    }
 }
+
+private data class PageDownloadRequest(
+    val page: DawnPage,
+    val directory: File,
+    val edition: DawnEdition,
+    val priority: Int,
+    val sequence: Long
+)
