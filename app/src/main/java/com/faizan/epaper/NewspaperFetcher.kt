@@ -20,6 +20,23 @@ interface NewspaperFetcher {
     fun articleUrl(storyId: String): String
     fun isPageUrl(url: String, date: String, pageId: String): Boolean
     fun hotspotExtractionScript(date: String, pageId: String): String
+    fun availabilityDiscoveryScript(date: String): String
+    fun isAvailabilityPageUrl(url: String, date: String): Boolean
+    fun parseAvailability(json: String): NewspaperEdition
+    fun downloadEdition(
+        edition: NewspaperEdition,
+        directory: File,
+        onProgress: (Int, Int) -> Unit
+    ) {
+        val pages = edition.readingOrder
+        pages.forEachIndexed { index, page ->
+            if (!edition.hasPageImage(directory, page.id)) {
+                edition.downloadPageImage(directory, page.id)
+            }
+            onProgress(index + 1, pages.size)
+        }
+    }
+
     fun parseHotspots(json: String, edition: NewspaperEdition, page: NewspaperPage): List<NewspaperHotspot>
 }
 
@@ -60,6 +77,45 @@ private class DawnFetcher : NewspaperFetcher {
     override fun isPageUrl(url: String, date: String, pageId: String): Boolean =
         url.startsWith("https://e.dawn.com/") &&
             url.substringBefore('?').endsWith("/pages/$pageId.html")
+
+    override fun isAvailabilityPageUrl(url: String, date: String): Boolean =
+        url.substringBefore('?') == "https://epaper.dawn.com/"
+
+    override fun parseAvailability(json: String): NewspaperEdition =
+        NewspaperEdition.fromJson(json)
+
+    override fun availabilityDiscoveryScript(date: String): String = """
+        (function() {
+            const requestedDate = '$date';
+            const datePattern = /^\d{2}_\d{2}_\d{4}_001$/;
+            const selector = Array.from(document.querySelectorAll('select'))
+                .find(select => Array.from(select.options).some(option => datePattern.test(option.value)));
+            if (!selector || !selector.options.length) {
+                return JSON.stringify({error: 'No edition dates'});
+            }
+            const dates = Array.from(selector.options).map(option => option.value.substring(0, 10));
+            if (!dates.includes(requestedDate)) {
+                return JSON.stringify({error: 'NOT_AVAILABLE'});
+            }
+            const pages = [];
+            const seen = new Set();
+            for (const link of document.querySelectorAll('a[href*="page="]')) {
+                const url = new URL(link.href, location.href);
+                const id = url.searchParams.get('page');
+                if (id && id.startsWith(requestedDate + '_') &&
+                    /^\d{2}_\d{2}_\d{4}_\d{3}$/.test(id) && !seen.has(id)) {
+                    seen.add(id);
+                    pages.push({id: id, title: link.innerText.trim()});
+                }
+            }
+            if (!pages.length) return JSON.stringify({error: 'NOT_AVAILABLE'});
+            return JSON.stringify({
+                date: requestedDate,
+                latestDate: selector.options[0].value.substring(0, 10),
+                pages: pages
+            });
+        })();
+    """.trimIndent()
 
     override fun hotspotExtractionScript(date: String, pageId: String): String = """
         JSON.stringify(Array.from(document.querySelectorAll('area[href]')).flatMap(area => {
@@ -122,6 +178,44 @@ private class JangLahoreFetcher : NewspaperFetcher {
 
     override fun isPageUrl(url: String, date: String, pageId: String): Boolean =
         url.startsWith(pageUrl(date, pageId))
+
+    override fun isAvailabilityPageUrl(url: String, date: String): Boolean =
+        url.substringBefore('?') == availabilityUrl(date)
+
+    override fun parseAvailability(json: String): NewspaperEdition =
+        NewspaperEdition.fromJson(json)
+
+    override fun availabilityDiscoveryScript(date: String): String = """
+        (() => {
+            const pageText = (document.body?.innerText || '').toLowerCase();
+            if (document.title.toLowerCase().includes('moment, please') ||
+                pageText.includes('verify you are human') ||
+                pageText.includes('security verification')) {
+                return JSON.stringify({error: 'VERIFYING'});
+            }
+            const requested = '${date.replace('_', '-')}';
+            const pages = [];
+            const seen = new Set();
+            for (const link of document.querySelectorAll('a[href*="/lahore/"]')) {
+                const url = new URL(link.href, location.href);
+                const match = url.pathname.match(/^\/lahore\/(\d{2}-\d{2}-\d{4})\/page(\d+)$/);
+                if (!match || match[1] !== requested || seen.has(match[2])) continue;
+                seen.add(match[2]);
+                const number = Number(match[2]);
+                if (number < 1 || number > 99) continue;
+                pages.push({id: 'J${date}_' + String(number).padStart(3, '0'),
+                    title: link.innerText.trim() || 'Page ' + number});
+            }
+            if (!pages.length) return JSON.stringify({error: 'NOT_AVAILABLE'});
+            pages.sort((a, b) => a.id.localeCompare(b.id));
+            return JSON.stringify({
+                date: '${date}',
+                latestDate: '${date}',
+                isJangEdition: true,
+                pages: pages
+            });
+        })()
+    """.trimIndent()
 
     override fun hotspotExtractionScript(date: String, pageId: String): String {
         val pageNumber = pageId.takeLast(3)

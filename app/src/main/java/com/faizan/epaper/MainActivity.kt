@@ -1016,14 +1016,38 @@ class MainActivity : Activity() {
                     dawnStatusLabel.setTextColor(Color.RED)
                     pageLabel.text = message
                 } else {
-                    val edition = NewspaperEdition.fromJson(json)
+                    val discoveredEdition = NewspaperEdition.fromJson(json)
+                    val directory = editionDirectory(discoveredEdition)
+                    if (!directory.exists() && !directory.mkdirs()) {
+                        throw IllegalStateException("Could not create Dawn edition storage.")
+                    }
+                    val metadata = File(directory, "edition.json")
+                    val previousEdition = if (metadata.isFile) {
+                        try {
+                            NewspaperEdition.readMetadata(metadata).takeIf {
+                                !it.isJangEdition && it.date == requestedDate
+                            }
+                        } catch (error: Exception) {
+                            showMessage(error.message ?: "Saved edition metadata is invalid and will be rebuilt.")
+                            null
+                        }
+                    } else null
+                    val edition = if (previousEdition == null) {
+                        discoveredEdition
+                    } else {
+                        discoveredEdition.copy(
+                            fullImageIds = previousEdition.fullImageIds,
+                            hotspots = previousEdition.hotspots,
+                            articles = previousEdition.articles,
+                            processedPageIds = previousEdition.processedPageIds
+                        )
+                    }
+                    edition.saveMetadata(directory)
                     val jangIsActive = readerMode && offlineEdition?.isJangEdition == true
                     if (!jangIsActive) {
                         availableEdition = edition
                         updatePagePicker(edition)
                     }
-                    val directory = editionDirectory(edition)
-                    val metadata = File(directory, "edition.json")
                     val savedEdition = if (metadata.isFile) {
                         try {
                             NewspaperEdition.readMetadata(metadata)

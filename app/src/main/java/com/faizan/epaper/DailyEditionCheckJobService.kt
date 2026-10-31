@@ -29,78 +29,44 @@ import java.util.concurrent.Executors
 
 class DailyEditionCheckJobService : JobService() {
     private val worker = Executors.newSingleThreadExecutor()
+    private val mainHandler = Handler(Looper.getMainLooper())
     private var webView: WebView? = null
     private var activeJob: JobParameters? = null
+    private var checkDate: String? = null
+    private var fetchersToCheck: List<NewspaperFetcher> = emptyList()
+    private var fetcherIndex = 0
+    private var currentFetcher: NewspaperFetcher? = null
+    private var verificationAttempts = 0
+    private var shouldRetry = false
 
     override fun onStartJob(params: JobParameters): Boolean {
+        if (activeJob != null) {
+            jobFinished(params, true)
+            return false
+        }
         activeJob = params
         val today = DATE_FORMAT.format(Calendar.getInstance().time)
-        val dawnFetcher = NewspaperFetchers[NewspaperId.DAWN]
-        val directory = dawnFetcher.editionDirectory(File(filesDir, "editions"), today)
-        val completionMarker = File(directory, "complete")
-        if (completionMarker.isFile) {
-            try {
-                notifyEditionAvailable(NewspaperEdition.readMetadata(File(directory, "edition.json")))
-                jobFinished(params, false)
-                return false
-            } catch (error: Exception) {
-                Log.e(TAG, "Today's saved Dawn edition is invalid; retrying the download.", error)
-                if (!completionMarker.delete()) {
-                    Log.e(TAG, "Could not remove the invalid Dawn completion marker.")
-                    jobFinished(params, true)
-                    return false
-                }
-            }
-        }
         if (!NewspaperAvailability.checksAreAllowed(today)) {
             scheduleNineAmCheck(this)
             jobFinished(params, false)
+            activeJob = null
             return false
         }
 
+        checkDate = today
+        fetchersToCheck = NewspaperFetchers.all
+        fetcherIndex = 0
+        shouldRetry = false
         val browser = WebView(this)
         webView = browser
         browser.settings.javaScriptEnabled = true
         browser.settings.domStorageEnabled = true
         browser.webViewClient = object : WebViewClient() {
             override fun onPageFinished(view: WebView, url: String) {
-                if (activeJob !== params || url.substringBefore('?') != "https://epaper.dawn.com/") return
-                view.evaluateJavascript(editionDiscoveryScript(today)) { result ->
-                    val json = runCatching { JSONTokener(result).nextValue() as? String }.getOrNull()
-                    if (json == null) {
-                        finish(params, retry = true)
-                        return@evaluateJavascript
-                    }
-                    if (runCatching { JSONTokener(json).nextValue() as? org.json.JSONObject }
-                            .getOrNull()?.optString("error") == "NOT_AVAILABLE"
-                    ) {
-                        finish(params, retry = false)
-                        return@evaluateJavascript
-                    }
-                    val edition = try {
-                        NewspaperEdition.fromJson(json)
-                    } catch (error: Exception) {
-                        Log.e(TAG, "Could not read the discovered Dawn edition.", error)
-                        finish(params, retry = true)
-                        return@evaluateJavascript
-                    }
-                    notifyEditionAvailable(edition)
-                    worker.execute {
-                        try {
-                            val targetDirectory = dawnFetcher.editionDirectory(
-                                File(filesDir, "editions"),
-                                edition.date
-                            )
-                            edition.downloadPageImages(targetDirectory) { _, _ -> }
-                            edition.saveMetadata(targetDirectory)
-                            File(targetDirectory, "complete").writeText("ok", Charsets.UTF_8)
-                            finish(params, retry = false)
-                        } catch (error: Exception) {
-                            Log.e(TAG, "Could not download today's Dawn edition.", error)
-                            finish(params, retry = true)
-                        }
-                    }
-                }
+                val fetcher = currentFetcher ?: return
+                val date = checkDate ?: return
+                if (activeJob !== params || !fetcher.isAvailabilityPageUrl(url, date)) return
+                discoverEdition(view, params, fetcher, date)
             }
 
             override fun onReceivedError(
@@ -109,20 +75,179 @@ class DailyEditionCheckJobService : JobService() {
                 error: android.webkit.WebResourceError
             ) {
                 if (request.isForMainFrame && activeJob === params) {
-                    Log.e(TAG, "Could not load Dawn while checking today's edition: ${error.description}")
-                    finish(params, retry = true)
+                    val fetcher = currentFetcher ?: return
+                    Log.e(TAG, "Could not check ${fetcher.id.displayName}: ${error.description}")
+                    shouldRetry = true
+                    checkNextFetcher(params)
                 }
             }
         }
-        browser.loadUrl(dawnFetcher.availabilityUrl(today))
+        checkNextFetcher(params)
         return true
+    }
+
+    private fun checkNextFetcher(params: JobParameters) {
+        if (activeJob !== params) return
+        if (fetcherIndex >= fetchersToCheck.size) {
+            finish(params, shouldRetry)
+            return
+        }
+        val fetcher = fetchersToCheck[fetcherIndex++]
+        currentFetcher = fetcher
+        verificationAttempts = 0
+        val date = checkDate ?: return
+        val directory = fetcher.editionDirectory(File(filesDir, "editions"), date)
+        val completionMarker = File(directory, "complete")
+        val metadataFile = File(directory, "edition.json")
+        if (metadataFile.isFile) {
+            val savedEdition = try {
+                NewspaperEdition.readMetadata(metadataFile).also {
+                    require(NewspaperFetchers.forEdition(it).id == fetcher.id) {
+                        "Saved edition belongs to another newspaper."
+                    }
+                    require(it.date == date) {
+                        "Saved edition has an unexpected date."
+                    }
+                }
+            } catch (error: Exception) {
+                Log.e(TAG, "Today's saved ${fetcher.id.displayName} edition is invalid.", error)
+                if (completionMarker.exists() && !completionMarker.delete()) {
+                    Log.e(TAG, "Could not remove ${fetcher.id.displayName}'s invalid completion marker.")
+                    shouldRetry = true
+                    checkNextFetcher(params)
+                    return
+                }
+                null
+            }
+            if (savedEdition != null) {
+                notifyEditionAvailable(fetcher, savedEdition)
+                val complete = completionMarker.isFile &&
+                    savedEdition.pages.all { savedEdition.hasPageImage(directory, it.id) }
+                if (complete) {
+                    checkNextFetcher(params)
+                } else {
+                    if (completionMarker.exists() && !completionMarker.delete()) {
+                        Log.e(TAG, "Could not reset ${fetcher.id.displayName}'s incomplete marker.")
+                        shouldRetry = true
+                        checkNextFetcher(params)
+                    } else {
+                        downloadKnownEdition(params, fetcher, savedEdition, directory)
+                    }
+                }
+                return
+            }
+        } else if (completionMarker.exists() && !completionMarker.delete()) {
+            Log.e(TAG, "Could not remove ${fetcher.id.displayName}'s invalid completion marker.")
+            shouldRetry = true
+            checkNextFetcher(params)
+            return
+        }
+        webView?.loadUrl(fetcher.availabilityUrl(date))
+            ?: run {
+                shouldRetry = true
+                checkNextFetcher(params)
+            }
+    }
+
+    private fun discoverEdition(
+        view: WebView,
+        params: JobParameters,
+        fetcher: NewspaperFetcher,
+        date: String
+    ) {
+        view.evaluateJavascript(fetcher.availabilityDiscoveryScript(date)) { result ->
+            if (activeJob !== params || currentFetcher != fetcher) return@evaluateJavascript
+            val json = runCatching { JSONTokener(result).nextValue() as? String }.getOrNull()
+            if (json == null) {
+                Log.e(TAG, "Could not read ${fetcher.id.displayName}'s availability response.")
+                shouldRetry = true
+                checkNextFetcher(params)
+                return@evaluateJavascript
+            }
+            val response = runCatching {
+                JSONTokener(json).nextValue() as? org.json.JSONObject
+            }.getOrNull()
+            when (response?.optString("error")) {
+                "NOT_AVAILABLE" -> {
+                    checkNextFetcher(params)
+                    return@evaluateJavascript
+                }
+                "VERIFYING" -> {
+                    if (verificationAttempts++ < MAX_VERIFICATION_ATTEMPTS) {
+                        mainHandler.postDelayed({
+                            if (activeJob === params && currentFetcher == fetcher) {
+                                discoverEdition(view, params, fetcher, date)
+                            }
+                        }, VERIFICATION_RETRY_MILLIS)
+                    } else {
+                        Log.e(TAG, "${fetcher.id.displayName} verification did not finish in time.")
+                        shouldRetry = true
+                        checkNextFetcher(params)
+                    }
+                    return@evaluateJavascript
+                }
+                null -> Unit
+                else -> {
+                    Log.e(TAG, "${fetcher.id.displayName} availability check failed: ${response.optString("error")}")
+                    shouldRetry = true
+                    checkNextFetcher(params)
+                    return@evaluateJavascript
+                }
+            }
+            val edition = try {
+                fetcher.parseAvailability(json)
+            } catch (error: Exception) {
+                Log.e(TAG, "Could not parse ${fetcher.id.displayName}'s available edition.", error)
+                shouldRetry = true
+                checkNextFetcher(params)
+                return@evaluateJavascript
+            }
+            val targetDirectory = fetcher.editionDirectory(File(filesDir, "editions"), edition.date)
+            try {
+                if (!targetDirectory.exists() && !targetDirectory.mkdirs()) {
+                    throw IllegalStateException(
+                        "Could not create ${fetcher.id.displayName}'s edition storage."
+                    )
+                }
+                edition.saveMetadata(targetDirectory)
+            } catch (error: Exception) {
+                Log.e(TAG, "Could not save ${fetcher.id.displayName}'s availability metadata.", error)
+                shouldRetry = true
+                checkNextFetcher(params)
+                return@evaluateJavascript
+            }
+            notifyEditionAvailable(fetcher, edition)
+            downloadKnownEdition(params, fetcher, edition, targetDirectory)
+        }
+    }
+
+    private fun downloadKnownEdition(
+        params: JobParameters,
+        fetcher: NewspaperFetcher,
+        edition: NewspaperEdition,
+        targetDirectory: File
+    ) {
+        worker.execute {
+            try {
+                fetcher.downloadEdition(edition, targetDirectory) { _, _ -> }
+                edition.saveMetadata(targetDirectory)
+                File(targetDirectory, "complete").writeText("ok", Charsets.UTF_8)
+            } catch (error: Exception) {
+                Log.e(TAG, "Could not download ${fetcher.id.displayName}'s edition.", error)
+                shouldRetry = true
+            }
+            mainHandler.post {
+                if (activeJob === params) checkNextFetcher(params)
+            }
+        }
     }
 
     override fun onStopJob(params: JobParameters): Boolean {
         activeJob = null
-        webView?.stopLoading()
-        webView?.destroy()
-        webView = null
+        cleanupWebView()
+        currentFetcher = null
+        fetchersToCheck = emptyList()
+        checkDate = null
         return true
     }
 
@@ -130,17 +255,24 @@ class DailyEditionCheckJobService : JobService() {
         Handler(Looper.getMainLooper()).post {
             if (activeJob !== params) return@post
             activeJob = null
-            webView?.stopLoading()
-            webView?.destroy()
-            webView = null
+            cleanupWebView()
+            currentFetcher = null
+            fetchersToCheck = emptyList()
+            checkDate = null
             jobFinished(params, retry)
         }
     }
 
-    private fun notifyEditionAvailable(edition: NewspaperEdition) {
+    private fun cleanupWebView() {
+        webView?.stopLoading()
+        webView?.destroy()
+        webView = null
+    }
+
+    private fun notifyEditionAvailable(fetcher: NewspaperFetcher, edition: NewspaperEdition) {
         createNotificationChannel()
         val preferences = getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
-        val key = "notified_${edition.date}"
+        val key = "notified_${fetcher.id.storageName}_${edition.date}"
         if (preferences.getBoolean(key, false)) return
 
         val intent = Intent(this, MainActivity::class.java).apply {
@@ -148,7 +280,7 @@ class DailyEditionCheckJobService : JobService() {
         }
         val pendingIntent = PendingIntent.getActivity(
             this,
-            1,
+            NOTIFICATION_ID + fetcher.id.ordinal,
             intent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
@@ -158,7 +290,7 @@ class DailyEditionCheckJobService : JobService() {
             @Suppress("DEPRECATION")
             Notification.Builder(this)
         }.setSmallIcon(android.R.drawable.ic_dialog_info)
-            .setContentTitle("Today's Dawn is available")
+            .setContentTitle("Today's ${fetcher.id.displayName} is available")
             .setContentText("Downloading today's paper.")
             .setContentIntent(pendingIntent)
             .setAutoCancel(true)
@@ -169,7 +301,7 @@ class DailyEditionCheckJobService : JobService() {
             checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) ==
             android.content.pm.PackageManager.PERMISSION_GRANTED
         ) {
-            manager.notify(NOTIFICATION_ID, notification)
+            manager.notify(NOTIFICATION_ID + fetcher.id.ordinal, notification)
             preferences.edit().putBoolean(key, true).apply()
         }
     }
@@ -220,7 +352,7 @@ class DailyEditionCheckJobService : JobService() {
                 .setOverrideDeadline(delayMillis + 5 * 60 * 1000L)
                 .build()
             if (scheduler.schedule(job) != JobScheduler.RESULT_SUCCESS) {
-                Log.e(TAG, "Could not schedule Dawn's 9 AM availability check.")
+                Log.e(TAG, "Could not schedule the 9 AM availability check.")
             }
         }
 
@@ -233,42 +365,11 @@ class DailyEditionCheckJobService : JobService() {
                 .setPeriodic(INTERVAL_MILLIS)
                 .build()
             if (scheduler.schedule(job) != JobScheduler.RESULT_SUCCESS) {
-                Log.e(TAG, "Could not schedule the periodic Dawn availability check.")
+                Log.e(TAG, "Could not schedule the periodic newspaper availability check.")
             }
         }
-
-        private fun editionDiscoveryScript(date: String) = """
-            (function() {
-                const requestedDate = '$date';
-                const datePattern = /^\d{2}_\d{2}_\d{4}_001$/;
-                const selector = Array.from(document.querySelectorAll('select'))
-                    .find(select => Array.from(select.options).some(option => datePattern.test(option.value)));
-                if (!selector || !selector.options.length) {
-                    return JSON.stringify({error: 'No edition dates'});
-                }
-                const dates = Array.from(selector.options).map(option => option.value.substring(0, 10));
-                if (!dates.includes(requestedDate)) {
-                    return JSON.stringify({error: 'NOT_AVAILABLE'});
-                }
-                const pages = [];
-                const seen = new Set();
-                for (const link of document.querySelectorAll('a[href*="page="]')) {
-                    const url = new URL(link.href, location.href);
-                    const id = url.searchParams.get('page');
-                    if (id && id.startsWith(requestedDate + '_') &&
-                        /^\d{2}_\d{2}_\d{4}_\d{3}$/.test(id) && !seen.has(id)) {
-                        seen.add(id);
-                        pages.push({id: id, title: link.innerText.trim()});
-                    }
-                }
-                if (!pages.length) return JSON.stringify({error: 'NOT_AVAILABLE'});
-                return JSON.stringify({
-                    date: requestedDate,
-                    latestDate: selector.options[0].value.substring(0, 10),
-                    pages: pages
-                });
-            })();
-        """.trimIndent()
+        private const val MAX_VERIFICATION_ATTEMPTS = 20
+        private const val VERIFICATION_RETRY_MILLIS = 1_500L
     }
 }
 
