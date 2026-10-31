@@ -662,15 +662,32 @@ class MainActivity : Activity() {
     }
 
     private fun openDawnEdition() {
-        val edition = availableEdition?.takeUnless { it.isJangEdition }
+        val requestedDate = selectedDateKey()
+        val cachedEdition = availableEdition?.takeIf {
+            !it.isJangEdition && it.date == requestedDate
+        } ?: run {
+            val metadata = File(File(filesDir, "editions"), requestedDate)
+                .resolve("edition.json")
+            if (!metadata.isFile) null else try {
+                DawnEdition.readMetadata(metadata).also {
+                    require(!it.isJangEdition) { "Saved Dawn edition metadata is invalid." }
+                }
+            } catch (error: Exception) {
+                showMessage(error.message ?: "Could not read the saved Dawn edition.")
+                null
+            }
+        }
+        val edition = cachedEdition
         if (edition == null) {
-            if (!availabilityCheckInProgress) checkAvailability()
-            showMessage(
-                if (availabilityCheckInProgress) "Checking Dawn availability…"
-                else "Dawn is not available for this date."
-            )
+            if (!availabilityCheckInProgress || checkedEditionDate != requestedDate) {
+                checkAvailability()
+            }
+            val status = dawnStatusLabel.text.toString()
+            if (status != "Not available") showMessage("Checking Dawn availability…")
+            else showMessage("Dawn is not available for this date.")
             return
         }
+        availableEdition = edition
         openEdition(edition)
     }
 
