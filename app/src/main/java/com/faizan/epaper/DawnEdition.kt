@@ -30,7 +30,8 @@ data class DawnArticle(
     val id: String,
     val title: String,
     val byline: String,
-    val paragraphs: List<String>
+    val paragraphs: List<String>,
+    val imageUrls: List<String> = emptyList()
 )
 
 data class DawnEdition(
@@ -40,7 +41,8 @@ data class DawnEdition(
     val fullImageIds: List<String> = emptyList(),
     val hotspots: List<DawnHotspot> = emptyList(),
     val articles: List<DawnArticle> = emptyList(),
-    val processedPageIds: List<String> = emptyList()
+    val processedPageIds: List<String> = emptyList(),
+    val isJangEdition: Boolean = false
 ) {
     val readingOrder: List<DawnPage>
         get() {
@@ -54,8 +56,12 @@ data class DawnEdition(
         }
 
     fun downloadPageImage(directory: File, id: String) {
-        require(pages.any { it.id == id }) { "Invalid Dawn page ID." }
-        downloadImages(directory, listOf(id), "pages", { pageId -> "$pageId.jpg" }) { _, _ -> }
+        require(pages.any { it.id == id }) { "Invalid newspaper page ID." }
+        if (isJangEdition) {
+            downloadJangPageImage(directory, id)
+        } else {
+            downloadImages(directory, listOf(id), "pages", { pageId -> "$pageId.jpg" }) { _, _ -> }
+        }
     }
 
     fun hasPageImage(directory: File, id: String): Boolean =
@@ -104,6 +110,7 @@ data class DawnEdition(
         val metadata = JSONObject().apply {
             put("date", date)
             put("latestDate", latestDate)
+            put("isJangEdition", isJangEdition)
             put("pages", JSONArray().apply {
                 pages.forEach { page ->
                     put(JSONObject().apply {
@@ -134,6 +141,7 @@ data class DawnEdition(
                         put("title", article.title)
                         put("byline", article.byline)
                         put("paragraphs", JSONArray(article.paragraphs))
+                        put("imageUrls", JSONArray(article.imageUrls))
                     })
                 }
             })
@@ -189,6 +197,7 @@ data class DawnEdition(
             instanceFollowRedirects = true
             setRequestProperty("User-Agent", "DawnEpaperAndroid/1.0")
         }
+
         try {
             connection.connect()
             if (connection.responseCode !in 200..299) {
@@ -235,23 +244,107 @@ data class DawnEdition(
         }
     }
 
+    private fun downloadJangPageImage(directory: File, id: String) {
+        require(JANG_PAGE_PATTERN.matches(id) && id.startsWith("J${date}_")) {
+            "Invalid Jang page ID."
+        }
+        if (!directory.exists() && !directory.mkdirs()) {
+            throw IllegalStateException("Could not create image storage.")
+        }
+        val dateParts = date.split('_')
+        val jangDate = "${dateParts[1]}-${dateParts[0]}-${dateParts[2]}"
+        val pageNumber = id.substringAfterLast('_').toInt()
+        val url = URL(
+            "https://e.jang.com.pk/static_pages/$jangDate/lahore/mainpage/page$pageNumber.jpg"
+        )
+        val destination = File(directory, "$id.jpg")
+        val temporaryImage = File(directory, "$id.jpg.tmp")
+        val connection = (url.openConnection() as HttpURLConnection).apply {
+            connectTimeout = 15_000
+            readTimeout = 30_000
+            instanceFollowRedirects = true
+            setRequestProperty(
+                "User-Agent",
+                "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0 Mobile Safari/537.36"
+            )
+            setRequestProperty(
+                "Referer",
+                "https://e.jang.com.pk/lahore/${
+                    dateParts[0]
+                }-${dateParts[1]}-${dateParts[2]}/page$pageNumber"
+            )
+        }
+        try {
+            connection.connect()
+            if (connection.responseCode !in 200..299) {
+                throw IllegalStateException("Jang returned HTTP ${connection.responseCode} for page $pageNumber.")
+            }
+            if (connection.contentType?.substringBefore(';')?.trim() != "image/jpeg") {
+                throw IllegalStateException("Jang did not return a JPEG for page $pageNumber.")
+            }
+            if (connection.contentLengthLong > MAX_IMAGE_BYTES) {
+                throw IllegalStateException("Jang page $pageNumber is larger than expected.")
+            }
+            connection.inputStream.use { input ->
+                FileOutputStream(temporaryImage).use { output ->
+                    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                    var totalBytes = 0L
+                    var firstByte = -1
+                    var secondByte = -1
+                    while (true) {
+                        val read = input.read(buffer)
+                        if (read < 0) break
+                        if (read == 0) continue
+                        if (firstByte < 0) firstByte = buffer[0].toInt() and 0xff
+                        if (secondByte < 0 && read > 1) secondByte = buffer[1].toInt() and 0xff
+                        totalBytes += read
+                        if (totalBytes > MAX_IMAGE_BYTES) {
+                            throw IllegalStateException("Jang page $pageNumber is larger than expected.")
+                        }
+                        output.write(buffer, 0, read)
+                    }
+                    if (firstByte != 0xff || secondByte != 0xd8) {
+                        throw IllegalStateException("Jang returned an invalid image for page $pageNumber.")
+                    }
+                }
+            }
+            if (destination.exists() && !destination.delete()) {
+                throw IllegalStateException("Could not replace Jang page $pageNumber.")
+            }
+            if (!temporaryImage.renameTo(destination)) {
+                throw IllegalStateException("Could not save Jang page $pageNumber.")
+            }
+        } catch (error: Exception) {
+            temporaryImage.delete()
+            throw error
+        } finally {
+            connection.disconnect()
+        }
+    }
+
     companion object {
         private const val MAX_IMAGE_BYTES = 25L * 1024 * 1024
         private val DATE_PATTERN = Regex("\\d{2}_\\d{2}_\\d{4}")
         private val PAGE_PATTERN = Regex("\\d{2}_\\d{2}_\\d{4}_\\d{3}")
+        private val JANG_PAGE_PATTERN = Regex("J\\d{2}_\\d{2}_\\d{4}_\\d{3}")
         private val STORY_PATTERN = Regex("\\d{2}_\\d{2}_\\d{4}_\\d{3}_\\d{3}")
+
+        private fun isValidPageId(id: String, date: String, isJangEdition: Boolean): Boolean =
+            if (isJangEdition) JANG_PAGE_PATTERN.matches(id) && id.startsWith("J${date}_")
+            else PAGE_PATTERN.matches(id) && id.startsWith("${date}_")
 
         fun fromJson(json: String): DawnEdition {
             val data = JSONObject(json)
             val date = data.getString("date")
             val latestDate = data.getString("latestDate")
+            val isJangEdition = data.optBoolean("isJangEdition", false)
             require(DATE_PATTERN.matches(date) && DATE_PATTERN.matches(latestDate)) {
-                "Dawn returned an invalid edition date."
+                "The newspaper returned an invalid edition date."
             }
             val pages = data.getJSONArray("pages").objects().map { item ->
                 val id = item.getString("id")
-                require(PAGE_PATTERN.matches(id) && id.startsWith("${date}_")) {
-                    "Dawn returned an invalid page ID."
+                require(isValidPageId(id, date, isJangEdition)) {
+                    "The newspaper returned an invalid page ID."
                 }
                 DawnPage(id, item.optString("title").ifBlank { "Page ${id.takeLast(3)}" })
             }.distinctBy { it.id }
@@ -260,11 +353,14 @@ data class DawnEdition(
             val hotspots = data.optJSONArray("hotspots")?.objects()?.map { item ->
                 val pageId = item.getString("pageId")
                 val targetId = item.getString("targetId")
-                require(PAGE_PATTERN.matches(pageId) && pageId.startsWith("${date}_")) {
-                    "Dawn returned an invalid hotspot page ID."
+                require(isValidPageId(pageId, date, isJangEdition)) {
+                    "The newspaper returned an invalid hotspot page ID."
                 }
-                require(STORY_PATTERN.matches(targetId) && targetId.startsWith("${date}_")) {
-                    "Dawn returned an invalid hotspot target ID."
+                require(
+                    if (isJangEdition) targetId.matches(Regex("\\d+"))
+                    else STORY_PATTERN.matches(targetId) && targetId.startsWith("${date}_")
+                ) {
+                    "The newspaper returned an invalid hotspot target ID."
                 }
                 val type = DawnHotspotType.valueOf(item.getString("type"))
                 val coordinates = item.getJSONArray("coordinates").ints()
@@ -285,19 +381,23 @@ data class DawnEdition(
             }
             val articles = data.optJSONArray("articles")?.objects()?.map { item ->
                 val id = item.getString("id")
-                require(STORY_PATTERN.matches(id) && id.startsWith("${date}_")) {
-                    "Dawn returned an invalid story ID."
+                require(
+                    if (isJangEdition) id.matches(Regex("\\d+"))
+                    else STORY_PATTERN.matches(id) && id.startsWith("${date}_")
+                ) {
+                    "The newspaper returned an invalid story ID."
                 }
                 DawnArticle(
                     id,
                     item.getString("title"),
                     item.optString("byline"),
-                    item.getJSONArray("paragraphs").strings()
+                    item.getJSONArray("paragraphs").strings(),
+                    item.optJSONArray("imageUrls")?.strings().orEmpty()
                 )
             }.orEmpty()
             val processedPageIds = data.optJSONArray("processedPageIds")?.strings().orEmpty()
             require(processedPageIds.all { id ->
-                PAGE_PATTERN.matches(id) && id.startsWith("${date}_") && pages.any { it.id == id }
+                isValidPageId(id, date, isJangEdition) && pages.any { it.id == id }
             }) {
                 "Dawn returned invalid processed page IDs."
             }
@@ -308,7 +408,8 @@ data class DawnEdition(
                 fullImageIds.distinct(),
                 hotspots,
                 articles,
-                processedPageIds.distinct()
+                processedPageIds.distinct(),
+                isJangEdition
             )
         }
 
