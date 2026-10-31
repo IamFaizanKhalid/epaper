@@ -290,7 +290,7 @@ class MainActivity : Activity() {
                         ) {
                             webView.loadDataWithBaseURL(
                                 "https://offline.dawn/",
-                                renderArticle(article),
+                                renderArticle(article, NewspaperProvider.DAWN),
                                 "text/html",
                                 "UTF-8",
                                 null
@@ -1342,7 +1342,7 @@ class MainActivity : Activity() {
             <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
             <style>body{margin:0;background:#222;text-align:center;position:relative}
             img{display:block;width:100%;height:auto;margin:auto}
-            .hotspot-highlight{position:absolute;z-index:2;pointer-events:none;
+            .hotspot-highlight{position:fixed;z-index:2;pointer-events:none;
               background:rgba(255,210,0,.32);border:3px solid #ffd400;box-sizing:border-box;
               box-shadow:0 0 12px rgba(255,212,0,.9)}</style>
             </head><body><img id="page" src="${page.imageFileName}" usemap="#page-map"><map id="page-map" name="page-map">$areas</map>
@@ -1356,18 +1356,21 @@ class MainActivity : Activity() {
             area.coords=item.coordinates.join(',');area.href='https://offline.dawn/'+item.route+'/'+item.targetId;
             area.alt=item.label;area.title=item.label;map.appendChild(area)});scale()};
             document.getElementById('page-map').addEventListener('click',function(event){
-            const area=event.target.closest('area');if(!area)return;event.preventDefault();
-            const coords=area.coords.split(',').map(Number);if(coords.length<4)return;
+            const area=event.target.closest('area');if(!area)return;
+            const shape=area.shape.toLowerCase(),coords=area.coords.split(',').map(Number);
+            if((shape==='circle'&&coords.length<3)||(shape!=='circle'&&coords.length<4))return;
+            event.preventDefault();
             let left,top,right,bottom;
-            if(area.shape.toLowerCase()==='circle'&&coords.length>=3){
+            if(shape==='circle'){
             left=coords[0]-coords[2];top=coords[1]-coords[2];
             right=coords[0]+coords[2];bottom=coords[1]+coords[2]}
             else{const xs=coords.filter((_,i)=>i%2===0),ys=coords.filter((_,i)=>i%2===1);
             left=Math.min(...xs);top=Math.min(...ys);right=Math.max(...xs);bottom=Math.max(...ys)}
+            const bounds=img.getBoundingClientRect();
             const mark=document.createElement('div');mark.className='hotspot-highlight';
-            mark.style.left=(img.offsetLeft+left)+'px';mark.style.top=(img.offsetTop+top)+'px';
+            mark.style.left=(bounds.left+left)+'px';mark.style.top=(bounds.top+top)+'px';
             mark.style.width=(right-left)+'px';mark.style.height=(bottom-top)+'px';
-            if(area.shape.toLowerCase()==='circle')mark.style.borderRadius='50%';
+            if(shape==='circle')mark.style.borderRadius='50%';
             document.body.appendChild(mark);const target=area.href;
             setTimeout(()=>{location.href=target},180)});
             img.addEventListener('load',scale);new ResizeObserver(scale).observe(img);scale();})();
@@ -1418,7 +1421,7 @@ class MainActivity : Activity() {
                 displayedArticleId = article.id
                 webView.loadDataWithBaseURL(
                     "https://offline.dawn/",
-                    renderArticle(article),
+                    renderArticle(article, NewspaperProvider.DAWN),
                     "text/html",
                     "UTF-8",
                     null
@@ -1431,7 +1434,7 @@ class MainActivity : Activity() {
                 displayedArticleId = article.id
                 webView.loadDataWithBaseURL(
                     "https://offline.dawn/",
-                    renderArticle(article),
+                    renderArticle(article, NewspaperProvider.DAWN),
                     "text/html",
                     "UTF-8",
                     null
@@ -1660,15 +1663,17 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun renderArticle(article: DawnArticle): String {
+    private fun renderArticle(article: DawnArticle, newspaper: NewspaperProvider): String {
         val paragraphs = article.paragraphs.joinToString("") {
             "<p>${htmlEscape(it)}</p>"
         }
-        val imageButton = """
+        val imageButton = if (newspaper in IMAGE_DETAIL_SUPPORTED_PAPERS &&
+            DAWN_STORY_ID_PATTERN.matches(article.id)
+        ) """
             <a class="image-button" href="https://offline.dawn/article-image/${article.id}">
               Display as image
             </a>
-        """.trimIndent()
+        """.trimIndent() else ""
         return """
             <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
             <style>body{max-width:760px;margin:24px auto;padding:0 20px;font:18px/1.65 Georgia,serif;color:#222}
@@ -1710,6 +1715,16 @@ class MainActivity : Activity() {
         dawnDownloadIndicator.visibility = if (downloading) View.VISIBLE else View.GONE
     }
 
+    private enum class NewspaperProvider {
+        DAWN,
+        JANG
+    }
+
+    private companion object {
+        val IMAGE_DETAIL_SUPPORTED_PAPERS = setOf(NewspaperProvider.DAWN)
+        val DAWN_STORY_ID_PATTERN = Regex("\\d{2}_\\d{2}_\\d{4}_\\d{3}_\\d{3}")
+    }
+
     private fun refreshDownloadIndicator() {
         val date = selectedDateKey()
         val pageDownloadActive = synchronized(pageDownloadLock) {
@@ -1745,7 +1760,7 @@ class MainActivity : Activity() {
                     viewingArticleImage = false
                     webView.loadDataWithBaseURL(
                         "https://offline.dawn/",
-                        renderArticle(article),
+                        renderArticle(article, NewspaperProvider.DAWN),
                         "text/html",
                         "UTF-8",
                         null
