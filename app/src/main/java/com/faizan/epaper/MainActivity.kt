@@ -11,6 +11,7 @@ import android.view.View
 import android.view.Gravity
 import android.widget.AdapterView
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.ArrayAdapter
@@ -24,6 +25,7 @@ import android.widget.Toast
 import org.json.JSONObject
 import org.json.JSONTokener
 import java.io.File
+import java.io.FileInputStream
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
@@ -258,6 +260,44 @@ class MainActivity : Activity() {
             settings.displayZoomControls = false
             settings.allowFileAccess = true
             webViewClient = object : WebViewClient() {
+                override fun shouldInterceptRequest(
+                    view: WebView,
+                    request: WebResourceRequest
+                ): WebResourceResponse? {
+                    val uri = request.url
+                    if (uri.host == "offline.jang" &&
+                        uri.pathSegments.firstOrNull() == "article-asset"
+                    ) {
+                        val parts = uri.pathSegments
+                        val edition = offlineEdition
+                        val directory = offlineDirectory
+                        if (parts.size == 3 && edition?.isJangEdition == true &&
+                            directory != null
+                        ) {
+                            val article = edition.articles.firstOrNull { it.id == parts[1] }
+                            val index = parts[2].toIntOrNull()
+                            val image = if (article != null && index != null) {
+                                edition.articleImageFile(directory, article, index)
+                            } else {
+                                null
+                            }
+                            if (image?.isFile == true) {
+                                val contentType = if (image.extension.equals("png", true)) {
+                                    "image/png"
+                                } else {
+                                    "image/jpeg"
+                                }
+                                return WebResourceResponse(
+                                    contentType,
+                                    null,
+                                    FileInputStream(image)
+                                )
+                            }
+                        }
+                    }
+                    return super.shouldInterceptRequest(view, request)
+                }
+
                 override fun onPageFinished(view: WebView, url: String) {
                     if (displayedPageId != null && !viewingStoryContent) {
                         paperPageReady = true
@@ -332,7 +372,8 @@ class MainActivity : Activity() {
                                     NewspaperFetchers.forEdition(request.edition).offlineOrigin,
                                     renderArticle(
                                         article,
-                                        NewspaperFetchers[NewspaperId.JANG_LAHORE]
+                                        NewspaperFetchers[NewspaperId.JANG_LAHORE],
+                                        request.directory
                                     ),
                                     "text/html",
                                     "UTF-8",
@@ -1250,8 +1291,7 @@ class MainActivity : Activity() {
             val storyId = textStoryIds.getOrNull(storyIndex)
             if (storyId == null) {
                 storyScanInProgress = false
-                storyScanComplete = true
-                maybeCompleteEdition(edition)
+                downloadLinkedImages(edition)
                 return
             }
             processingContentId = null
@@ -1352,7 +1392,7 @@ class MainActivity : Activity() {
             .map { it.targetId }
             .distinct()
             .filter { id ->
-                !edition.fullImageFile(directory, id).isFile &&
+                !edition.hasFullImage(directory, id) &&
                     id !in prefetchingImageIds
             }
             .toList()
@@ -1509,26 +1549,45 @@ class MainActivity : Activity() {
     }
 
     private fun downloadLinkedContent(edition: NewspaperEdition) {
+        persistProgress(edition)
+        archivingStories = textStoryIds.isNotEmpty()
+        storyScanInProgress = archivingStories
+        storyIndex = 0
+        if (archivingStories) {
+            loadNextEditionPage()
+        } else {
+            downloadLinkedImages(edition)
+        }
+    }
+
+    private fun downloadLinkedImages(edition: NewspaperEdition) {
         val directory = activeEditionDirectory ?: run {
             failEditionDownload("Edition storage is unavailable.")
             return
         }
-        val imageIds = fullImageIds.filterNot { it in prefetchingImageIds }
+        val detailImageIds = if (NewspaperFetchers.forEdition(edition).supportsImageDetail) {
+            textStoryIds
+        } else {
+            emptyList()
+        }
+        val imageIds = (fullImageIds + detailImageIds)
+            .distinct()
+            .filterNot { edition.hasFullImage(directory, it) }
+        fullImageIds = (fullImageIds + detailImageIds).distinct()
+        val downloadEdition = edition.copy(
+            fullImageIds = fullImageIds,
+            hotspots = collectedHotspots,
+            articles = collectedArticles
+        )
         downloadExecutor.execute {
             try {
-                edition.downloadFullImages(directory, imageIds) { _, _ -> }
+                downloadEdition.downloadFullImages(directory, imageIds) { _, _ -> }
+                downloadEdition.downloadArticleImages(directory)
                 runOnUiThread {
                     if (editionInProgress !== edition) return@runOnUiThread
+                    storyScanComplete = true
                     persistProgress(edition)
-                    archivingStories = textStoryIds.isNotEmpty()
-                    storyScanInProgress = archivingStories
-                    storyIndex = 0
-                    if (archivingStories) {
-                        loadNextEditionPage()
-                    } else {
-                        storyScanComplete = true
-                        maybeCompleteEdition(edition)
-                    }
+                    maybeCompleteEdition(edition)
                 }
             } catch (error: Exception) {
                 runOnUiThread {
@@ -1931,7 +1990,7 @@ class MainActivity : Activity() {
                 val article = edition.articles.firstOrNull { it.id == parts[1] } ?: return
                 val imageIndex = parts[2].toIntOrNull() ?: return
                 val imageUrl = article.imageUrls.getOrNull(imageIndex) ?: return
-                showJangArticleImage(article, imageUrl, imageIndex)
+                showJangArticleImage(article, imageUrl, imageIndex, directory)
                 return
             }
         }
@@ -1956,10 +2015,7 @@ class MainActivity : Activity() {
                 displayedArticleId = article.id
                 webView.loadDataWithBaseURL(
                     NewspaperFetchers.forEdition(edition).offlineOrigin,
-                    renderArticle(
-                        article,
-                        NewspaperFetchers.forEdition(edition)
-                    ),
+                    renderArticle(article, NewspaperFetchers.forEdition(edition), directory),
                     "text/html",
                     "UTF-8",
                     null
@@ -1979,10 +2035,7 @@ class MainActivity : Activity() {
                 displayedArticleId = article.id
                 webView.loadDataWithBaseURL(
                     NewspaperFetchers.forEdition(edition).offlineOrigin,
-                    renderArticle(
-                        article,
-                        NewspaperFetchers.forEdition(edition)
-                    ),
+                    renderArticle(article, NewspaperFetchers.forEdition(edition), directory),
                     "text/html",
                     "UTF-8",
                     null
@@ -2008,7 +2061,7 @@ class MainActivity : Activity() {
             "image" -> {
                 viewingStoryContent = true
                 viewingArticleImage = false
-                if (!edition.fullImageFile(directory, id).isFile) {
+                if (!edition.hasFullImage(directory, id)) {
                     requestStoryImage(edition, directory, id)
                     return
                 }
@@ -2017,10 +2070,19 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun showJangArticleImage(article: NewspaperArticle, imageUrl: String, imageIndex: Int) {
+    private fun showJangArticleImage(
+        article: NewspaperArticle,
+        imageUrl: String,
+        imageIndex: Int,
+        directory: File
+    ) {
         viewingStoryContent = true
         viewingArticleImage = true
         displayedArticleId = article.id
+        val localImage = offlineEdition?.articleImageFile(directory, article, imageIndex)
+            ?.takeIf { it.isFile }
+            ?.let { "https://offline.jang/article-asset/${Uri.encode(article.id)}/$imageIndex" }
+        val displayedImageUrl = localImage ?: imageUrl
         val html = """
             <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
             <style>html,body{margin:0;width:100%;height:100%;background:#111;color:#fff;font:16px sans-serif}
@@ -2028,7 +2090,7 @@ class MainActivity : Activity() {
             a{color:#fff}img{display:block;width:100%;height:calc(100% - 48px);margin:0 auto;object-fit:contain}
             #error{padding:24px;text-align:center}</style></head>
             <body><header><a href="https://offline.jang/article/${article.id}">Back to story text</a></header>
-            <img src="${htmlEscape(imageUrl)}" alt="${htmlEscape(article.title)}"
+            <img src="${htmlEscape(displayedImageUrl)}" alt="${htmlEscape(article.title)}"
                 onerror="this.hidden=true;document.getElementById('error').hidden=false">
             <div id="error" hidden>Image could not be displayed.</div></body></html>
         """.trimIndent()
@@ -2240,12 +2302,22 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun renderArticle(article: NewspaperArticle, newspaper: NewspaperFetcher): String {
+    private fun renderArticle(
+        article: NewspaperArticle,
+        newspaper: NewspaperFetcher,
+        directory: File? = null
+    ): String {
         val paragraphs = article.paragraphs.joinToString("") {
             "<p>${htmlEscape(it)}</p>"
         }
         val images = article.imageUrls.mapIndexed { index, imageUrl ->
-            val image = """<img src="${htmlEscape(imageUrl)}" alt="" loading="lazy">"""
+            val localImage = directory?.let {
+                offlineEdition?.articleImageFile(it, article, index)
+            }?.takeIf { it.isFile }?.let {
+                "https://offline.jang/article-asset/${Uri.encode(article.id)}/$index"
+            }
+            val displayedImageUrl = localImage ?: imageUrl
+            val image = """<img src="${htmlEscape(displayedImageUrl)}" alt="" loading="lazy">"""
             if (newspaper.id == NewspaperId.JANG_LAHORE) {
                 """<a href="https://offline.jang/article-image/${article.id}/$index">$image</a>"""
             } else {
@@ -2344,7 +2416,7 @@ class MainActivity : Activity() {
                     val newspaper = NewspaperFetchers.forEdition(edition)
                     webView.loadDataWithBaseURL(
                         newspaper.offlineOrigin,
-                        renderArticle(article, newspaper),
+                        renderArticle(article, newspaper, directory),
                         "text/html",
                         "UTF-8",
                         null

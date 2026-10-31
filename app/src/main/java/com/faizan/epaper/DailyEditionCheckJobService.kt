@@ -20,6 +20,7 @@ import android.util.Log
 import android.webkit.WebView
 import android.webkit.WebResourceRequest
 import android.webkit.WebViewClient
+import org.json.JSONObject
 import org.json.JSONTokener
 import java.io.File
 import java.text.SimpleDateFormat
@@ -38,6 +39,13 @@ class DailyEditionCheckJobService : JobService() {
     private var currentFetcher: NewspaperFetcher? = null
     private var verificationAttempts = 0
     private var shouldRetry = false
+    private var backgroundEdition: NewspaperEdition? = null
+    private var backgroundDirectory: File? = null
+    private var backgroundPages: List<NewspaperPage> = emptyList()
+    private var backgroundPageIndex = 0
+    private var backgroundStories: List<String> = emptyList()
+    private var backgroundStoryIndex = 0
+    private var backgroundStoryAttempt = 0
 
     override fun onStartJob(params: JobParameters): Boolean {
         if (activeJob != null) {
@@ -65,8 +73,21 @@ class DailyEditionCheckJobService : JobService() {
             override fun onPageFinished(view: WebView, url: String) {
                 val fetcher = currentFetcher ?: return
                 val date = checkDate ?: return
-                if (activeJob !== params || !fetcher.isAvailabilityPageUrl(url, date)) return
-                discoverEdition(view, params, fetcher, date)
+                if (activeJob !== params) return
+                if (fetcher.isAvailabilityPageUrl(url, date)) {
+                    discoverEdition(view, params, fetcher, date)
+                    return
+                }
+                val edition = backgroundEdition ?: return
+                val page = backgroundPages.getOrNull(backgroundPageIndex)
+                if (page != null && fetcher.isPageUrl(url, edition.date, page.id)) {
+                    collectBackgroundPageHotspots(view, params, fetcher, edition, page)
+                    return
+                }
+                val storyId = backgroundStories.getOrNull(backgroundStoryIndex) ?: return
+                if (fetcher.isArticleUrl(url, storyId)) {
+                    collectBackgroundArticle(view, params, fetcher, edition, storyId)
+                }
             }
 
             override fun onReceivedError(
@@ -78,7 +99,11 @@ class DailyEditionCheckJobService : JobService() {
                     val fetcher = currentFetcher ?: return
                     Log.e(TAG, "Could not check ${fetcher.id.displayName}: ${error.description}")
                     shouldRetry = true
-                    checkNextFetcher(params)
+                    if (backgroundEdition != null) {
+                        skipBackgroundItem(params)
+                    } else {
+                        checkNextFetcher(params)
+                    }
                 }
             }
         }
@@ -94,6 +119,12 @@ class DailyEditionCheckJobService : JobService() {
         }
         val fetcher = fetchersToCheck[fetcherIndex++]
         currentFetcher = fetcher
+        backgroundEdition = null
+        backgroundDirectory = null
+        backgroundPages = emptyList()
+        backgroundPageIndex = 0
+        backgroundStories = emptyList()
+        backgroundStoryIndex = 0
         verificationAttempts = 0
         val date = checkDate ?: return
         val directory = fetcher.editionDirectory(File(filesDir, "editions"), date)
@@ -121,8 +152,12 @@ class DailyEditionCheckJobService : JobService() {
             }
             if (savedEdition != null) {
                 notifyEditionAvailable(fetcher, savedEdition)
-                val complete = completionMarker.isFile &&
-                    savedEdition.pages.all { savedEdition.hasPageImage(directory, it.id) }
+                val complete = isBackgroundEditionComplete(
+                    fetcher,
+                    savedEdition,
+                    directory,
+                    completionMarker
+                )
                 if (complete) {
                     checkNextFetcher(params)
                 } else {
@@ -227,18 +262,352 @@ class DailyEditionCheckJobService : JobService() {
         edition: NewspaperEdition,
         targetDirectory: File
     ) {
+        backgroundEdition = edition
+        backgroundDirectory = targetDirectory
         worker.execute {
+            var downloadFailed = false
             try {
                 fetcher.downloadEdition(edition, targetDirectory) { _, _ -> }
                 edition.saveMetadata(targetDirectory)
-                File(targetDirectory, "complete").writeText("ok", Charsets.UTF_8)
             } catch (error: Exception) {
                 Log.e(TAG, "Could not download ${fetcher.id.displayName}'s edition.", error)
                 shouldRetry = true
+                downloadFailed = true
             }
             mainHandler.post {
-                if (activeJob === params) checkNextFetcher(params)
+                if (activeJob === params) {
+                    if (downloadFailed) checkNextFetcher(params)
+                    else beginBackgroundPageScan(params, fetcher, edition, targetDirectory)
+                }
             }
+        }
+    }
+
+    private fun beginBackgroundPageScan(
+        params: JobParameters,
+        fetcher: NewspaperFetcher,
+        edition: NewspaperEdition,
+        directory: File
+    ) {
+        backgroundEdition = edition
+        backgroundDirectory = directory
+        backgroundPages = edition.readingOrder.filterNot { it.id in edition.processedPageIds }
+        backgroundPageIndex = 0
+        if (backgroundPages.isEmpty()) {
+            beginBackgroundStoryScan(params, fetcher, edition, directory)
+        } else {
+            loadNextBackgroundPage(params, fetcher, edition)
+        }
+    }
+
+    private fun loadNextBackgroundPage(
+        params: JobParameters,
+        fetcher: NewspaperFetcher,
+        edition: NewspaperEdition
+    ) {
+        if (activeJob !== params || backgroundEdition !== edition) return
+        val page = backgroundPages.getOrNull(backgroundPageIndex)
+        if (page == null) {
+            beginBackgroundStoryScan(
+                params,
+                fetcher,
+                backgroundEdition ?: edition,
+                backgroundDirectory ?: return
+            )
+            return
+        }
+        webView?.loadUrl(
+            fetcher.pageUrl(edition.date, page.id),
+            mapOf("Referer" to fetcher.availabilityUrl(edition.date))
+        ) ?: skipBackgroundItem(params)
+    }
+
+    private fun collectBackgroundPageHotspots(
+        view: WebView,
+        params: JobParameters,
+        fetcher: NewspaperFetcher,
+        edition: NewspaperEdition,
+        page: NewspaperPage,
+        attempt: Int = 0
+    ) {
+        view.evaluateJavascript(fetcher.hotspotExtractionScript(edition.date, page.id)) { result ->
+            if (activeJob !== params || backgroundEdition !== edition) return@evaluateJavascript
+            try {
+                val json = JSONTokener(result).nextValue() as? String
+                    ?: throw IllegalStateException("Could not read story areas.")
+                val response = runCatching { JSONObject(json) }.getOrNull()
+                if (response?.optBoolean("verifying") == true) {
+                    retryBackgroundPage(params, fetcher, edition, page, attempt)
+                    return@evaluateJavascript
+                }
+                val hotspots = fetcher.parseHotspots(json, edition, page)
+                val updated = edition.copy(
+                    hotspots = (edition.hotspots.filterNot { it.pageId == page.id } + hotspots)
+                        .distinctBy { it.pageId to it.targetId },
+                    processedPageIds = (edition.processedPageIds + page.id).distinct(),
+                    jangImageAreasVersion = if (edition.isJangEdition) 1
+                    else edition.jangImageAreasVersion
+                )
+                updated.saveMetadata(backgroundDirectory ?: return@evaluateJavascript)
+                backgroundEdition = updated
+                backgroundPageIndex++
+                loadNextBackgroundPage(params, fetcher, updated)
+            } catch (error: Exception) {
+                Log.e(TAG, "Could not read clickable areas on ${page.title}.", error)
+                shouldRetry = true
+                backgroundPageIndex++
+                loadNextBackgroundPage(params, fetcher, edition)
+            }
+        }
+    }
+
+    private fun retryBackgroundPage(
+        params: JobParameters,
+        fetcher: NewspaperFetcher,
+        edition: NewspaperEdition,
+        page: NewspaperPage,
+        attempt: Int
+    ) {
+        if (attempt >= MAX_VERIFICATION_ATTEMPTS) {
+            Log.e(TAG, "${fetcher.id.displayName} verification did not finish on ${page.title}.")
+            shouldRetry = true
+            backgroundPageIndex++
+            loadNextBackgroundPage(params, fetcher, edition)
+            return
+        }
+        mainHandler.postDelayed({
+            if (activeJob === params && backgroundEdition === edition) {
+                collectBackgroundPageHotspots(
+                    webView ?: return@postDelayed,
+                    params,
+                    fetcher,
+                    edition,
+                    page,
+                    attempt + 1
+                )
+            }
+        }, VERIFICATION_RETRY_MILLIS)
+    }
+
+    private fun beginBackgroundStoryScan(
+        params: JobParameters,
+        fetcher: NewspaperFetcher,
+        edition: NewspaperEdition,
+        directory: File
+    ) {
+        backgroundEdition = edition
+        backgroundDirectory = directory
+        val existingIds = edition.articles.map { it.id }.toSet()
+        backgroundStories = edition.readingOrder
+            .flatMap { page ->
+                edition.hotspots.filter {
+                    it.pageId == page.id && it.type == NewspaperHotspotType.TEXT
+                }.map { it.targetId }
+            }
+            .distinct()
+            .filterNot { it in existingIds }
+        backgroundStoryIndex = 0
+        loadNextBackgroundStory(params, fetcher, edition)
+    }
+
+    private fun loadNextBackgroundStory(
+        params: JobParameters,
+        fetcher: NewspaperFetcher,
+        edition: NewspaperEdition
+    ) {
+        if (activeJob !== params || backgroundEdition !== edition) return
+        val storyId = backgroundStories.getOrNull(backgroundStoryIndex)
+        if (storyId == null) {
+            downloadBackgroundImages(params, fetcher, edition, backgroundDirectory ?: return)
+            return
+        }
+        backgroundStoryAttempt = 0
+        webView?.loadUrl(fetcher.articleUrl(storyId)) ?: skipBackgroundItem(params)
+    }
+
+    private fun collectBackgroundArticle(
+        view: WebView,
+        params: JobParameters,
+        fetcher: NewspaperFetcher,
+        edition: NewspaperEdition,
+        storyId: String
+    ) {
+        view.evaluateJavascript(fetcher.articleExtractionScript(storyId)) { result ->
+            if (activeJob !== params || backgroundEdition !== edition) return@evaluateJavascript
+            try {
+                val json = JSONTokener(result).nextValue() as? String
+                    ?: throw IllegalStateException("Could not read story text.")
+                val response = runCatching { JSONObject(json) }.getOrNull()
+                if (response?.optBoolean("verifying") == true ||
+                    response?.optBoolean("pending") == true
+                ) {
+                    if (backgroundStoryAttempt++ < MAX_VERIFICATION_ATTEMPTS) {
+                        mainHandler.postDelayed({
+                            if (activeJob === params && backgroundEdition === edition) {
+                                collectBackgroundArticle(
+                                    view,
+                                    params,
+                                    fetcher,
+                                    edition,
+                                    storyId
+                                )
+                            }
+                        }, VERIFICATION_RETRY_MILLIS)
+                    } else {
+                        Log.e(TAG, "${fetcher.id.displayName} story $storyId did not finish loading.")
+                        shouldRetry = true
+                        advanceBackgroundStory(params, fetcher, edition)
+                    }
+                    return@evaluateJavascript
+                }
+                val article = fetcher.parseArticle(json, storyId)
+                val updated = edition.copy(
+                    articles = (edition.articles.filterNot { it.id == storyId } + article)
+                )
+                updated.saveMetadata(backgroundDirectory ?: return@evaluateJavascript)
+                backgroundEdition = updated
+                advanceBackgroundStory(params, fetcher, updated)
+            } catch (error: Exception) {
+                Log.e(TAG, "Could not save ${fetcher.id.displayName} story $storyId.", error)
+                shouldRetry = true
+                advanceBackgroundStory(params, fetcher, edition)
+            }
+        }
+    }
+
+    private fun advanceBackgroundStory(
+        params: JobParameters,
+        fetcher: NewspaperFetcher,
+        edition: NewspaperEdition
+    ) {
+        backgroundStoryIndex++
+        loadNextBackgroundStory(params, fetcher, edition)
+    }
+
+    private fun downloadBackgroundImages(
+        params: JobParameters,
+        fetcher: NewspaperFetcher,
+        edition: NewspaperEdition,
+        directory: File
+    ) {
+        val hotspotImageIds = edition.readingOrder.flatMap { page ->
+            edition.hotspots.filter {
+                it.pageId == page.id && it.type == NewspaperHotspotType.IMAGE
+            }.map { it.targetId }
+        }
+        val detailImageIds = if (fetcher.supportsImageDetail) {
+            edition.readingOrder.flatMap { page ->
+                edition.hotspots.filter {
+                    it.pageId == page.id && it.type == NewspaperHotspotType.TEXT
+                }.map { it.targetId }
+            }
+        } else {
+            emptyList()
+        }
+        val imageIds = (hotspotImageIds + detailImageIds)
+            .distinct()
+            .filterNot { edition.hasFullImage(directory, it) }
+        val updated = edition.copy(fullImageIds = (edition.fullImageIds + imageIds).distinct())
+        try {
+            updated.saveMetadata(directory)
+        } catch (error: Exception) {
+            Log.e(TAG, "Could not save image prefetch metadata for ${fetcher.id.displayName}.", error)
+            shouldRetry = true
+            checkNextFetcher(params)
+            return
+        }
+        backgroundEdition = updated
+        val hasJangArticleImages = updated.isJangEdition &&
+            updated.articles.any { it.imageUrls.isNotEmpty() }
+        if (imageIds.isEmpty() && !hasJangArticleImages) {
+            completeBackgroundEdition(params, fetcher, updated, directory)
+            return
+        }
+        worker.execute {
+            var downloadFailed = false
+            try {
+                if (imageIds.isNotEmpty()) {
+                    updated.downloadFullImages(directory, imageIds) { _, _ -> }
+                }
+                updated.downloadArticleImages(directory)
+            } catch (error: Exception) {
+                Log.e(TAG, "Could not download all images for ${fetcher.id.displayName}.", error)
+                downloadFailed = true
+            }
+            mainHandler.post {
+                if (activeJob !== params) return@post
+                if (downloadFailed || imageIds.any { !updated.hasFullImage(directory, it) } ||
+                    !updated.hasArticleImages(directory)
+                ) {
+                    shouldRetry = true
+                    checkNextFetcher(params)
+                } else {
+                    completeBackgroundEdition(params, fetcher, updated, directory)
+                }
+            }
+        }
+    }
+
+    private fun completeBackgroundEdition(
+        params: JobParameters,
+        fetcher: NewspaperFetcher,
+        edition: NewspaperEdition,
+        directory: File
+    ) {
+        try {
+            edition.saveMetadata(directory)
+            if (isBackgroundContentReady(fetcher, edition, directory)) {
+                File(directory, "complete").writeText("ok", Charsets.UTF_8)
+            } else {
+                shouldRetry = true
+                Log.e(TAG, "${fetcher.id.displayName}'s prefetch is incomplete; it will be resumed.")
+            }
+        } catch (error: Exception) {
+            Log.e(TAG, "Could not mark ${fetcher.id.displayName}'s edition as complete.", error)
+            shouldRetry = true
+        }
+        checkNextFetcher(params)
+    }
+
+    private fun isBackgroundEditionComplete(
+        fetcher: NewspaperFetcher,
+        edition: NewspaperEdition,
+        directory: File,
+        marker: File
+    ): Boolean = marker.isFile && isBackgroundContentReady(fetcher, edition, directory)
+
+    private fun isBackgroundContentReady(
+        fetcher: NewspaperFetcher,
+        edition: NewspaperEdition,
+        directory: File
+    ): Boolean {
+        if (edition.pages.any { !edition.hasPageImage(directory, it.id) }) return false
+        if (edition.pages.any { it.id !in edition.processedPageIds }) return false
+        val textIds = edition.hotspots.filter { it.type == NewspaperHotspotType.TEXT }
+            .map { it.targetId }.toSet()
+        if (textIds.any { id -> edition.articles.none { it.id == id } }) return false
+        val imageIds = edition.hotspots.filter { it.type == NewspaperHotspotType.IMAGE }
+            .map { it.targetId } + if (fetcher.supportsImageDetail) textIds else emptySet()
+        return imageIds.all { edition.hasFullImage(directory, it) } &&
+            edition.hasArticleImages(directory)
+    }
+
+    private fun skipBackgroundItem(params: JobParameters) {
+        shouldRetry = true
+        val fetcher = currentFetcher ?: return
+        val edition = backgroundEdition ?: run {
+            checkNextFetcher(params)
+            return
+        }
+        when {
+            backgroundPageIndex < backgroundPages.size -> {
+                backgroundPageIndex++
+                loadNextBackgroundPage(params, fetcher, edition)
+            }
+            backgroundStoryIndex < backgroundStories.size -> {
+                advanceBackgroundStory(params, fetcher, edition)
+            }
+            else -> checkNextFetcher(params)
         }
     }
 
@@ -248,6 +617,10 @@ class DailyEditionCheckJobService : JobService() {
         currentFetcher = null
         fetchersToCheck = emptyList()
         checkDate = null
+        backgroundEdition = null
+        backgroundDirectory = null
+        backgroundPages = emptyList()
+        backgroundStories = emptyList()
         return true
     }
 
@@ -259,6 +632,10 @@ class DailyEditionCheckJobService : JobService() {
             currentFetcher = null
             fetchersToCheck = emptyList()
             checkDate = null
+            backgroundEdition = null
+            backgroundDirectory = null
+            backgroundPages = emptyList()
+            backgroundStories = emptyList()
             jobFinished(params, retry)
         }
     }

@@ -18,11 +18,14 @@ interface NewspaperFetcher {
     fun availabilityUrl(date: String): String
     fun pageUrl(date: String, pageId: String): String
     fun articleUrl(storyId: String): String
+    fun isArticleUrl(url: String, storyId: String): Boolean
     fun isPageUrl(url: String, date: String, pageId: String): Boolean
     fun hotspotExtractionScript(date: String, pageId: String): String
     fun availabilityDiscoveryScript(date: String): String
     fun isAvailabilityPageUrl(url: String, date: String): Boolean
     fun parseAvailability(json: String): NewspaperEdition
+    fun articleExtractionScript(storyId: String): String
+    fun parseArticle(json: String, storyId: String): NewspaperArticle
     fun downloadEdition(
         edition: NewspaperEdition,
         directory: File,
@@ -74,6 +77,9 @@ private class DawnFetcher : NewspaperFetcher {
     override fun articleUrl(storyId: String): String =
         "https://epaper.dawn.com/DetailImage.php?StoryImage=$storyId"
 
+    override fun isArticleUrl(url: String, storyId: String): Boolean =
+        url.substringBefore('#').startsWith(articleUrl(storyId))
+
     override fun isPageUrl(url: String, date: String, pageId: String): Boolean =
         url.startsWith("https://e.dawn.com/") &&
             url.substringBefore('?').endsWith("/pages/$pageId.html")
@@ -116,6 +122,38 @@ private class DawnFetcher : NewspaperFetcher {
             });
         })();
     """.trimIndent()
+
+    override fun articleExtractionScript(storyId: String): String = """
+        (() => {
+            const article = Array.from(document.querySelectorAll('.px-4.font-merriweather > div'))
+                .find(element => element.querySelector('h2') &&
+                    element.querySelector('.overflow-hidden'));
+            if (!article) return JSON.stringify({error: 'Could not find the text for story $storyId.'});
+            const title = article.querySelector('h2')?.innerText.trim() || '';
+            const byline = article.querySelector(':scope > .my-3')?.innerText.trim() || '';
+            const body = article.querySelector(':scope > .overflow-hidden');
+            const paragraphs = Array.from(body.querySelectorAll('p'))
+                .map(paragraph => paragraph.innerText.trim()).filter(Boolean);
+            if (!paragraphs.length && body.innerText.trim()) paragraphs.push(body.innerText.trim());
+            return JSON.stringify({id: '$storyId', title: title, byline: byline, paragraphs: paragraphs});
+        })()
+    """.trimIndent()
+
+    override fun parseArticle(json: String, storyId: String): NewspaperArticle {
+        val data = JSONObject(json)
+        if (data.has("error")) throw IllegalStateException(data.getString("error"))
+        val paragraphs = data.getJSONArray("paragraphs").toStringList()
+        val article = NewspaperArticle(
+            storyId,
+            data.getString("title"),
+            data.optString("byline"),
+            paragraphs
+        )
+        require(article.title.isNotBlank() && article.paragraphs.isNotEmpty()) {
+            "Dawn returned empty text for story $storyId."
+        }
+        return article
+    }
 
     override fun hotspotExtractionScript(date: String, pageId: String): String = """
         JSON.stringify(Array.from(document.querySelectorAll('area[href]')).flatMap(area => {
@@ -176,6 +214,9 @@ private class JangLahoreFetcher : NewspaperFetcher {
     override fun articleUrl(storyId: String): String =
         "https://e.jang.com.pk/detail/$storyId"
 
+    override fun isArticleUrl(url: String, storyId: String): Boolean =
+        url.substringBefore('#').startsWith(articleUrl(storyId))
+
     override fun isPageUrl(url: String, date: String, pageId: String): Boolean =
         url.startsWith(pageUrl(date, pageId))
 
@@ -217,10 +258,76 @@ private class JangLahoreFetcher : NewspaperFetcher {
         })()
     """.trimIndent()
 
+    override fun articleExtractionScript(storyId: String): String = """
+        (() => {
+            const title = document.title.toLowerCase();
+            const text = (document.body?.innerText || '').slice(0, 4000).toLowerCase();
+            if (title.includes('moment, please') || title.includes('just a moment') ||
+                text.includes('verify you are human') || text.includes('checking your browser') ||
+                text.includes('security verification') || document.querySelector('#challenge-running, #challenge-stage')) {
+                return JSON.stringify({verifying: true});
+            }
+            const content = document.querySelector('.detail-content');
+            const body = content?.querySelector('.description-area .detail_view_content') ||
+                content?.querySelector('.description-area');
+            const articleTitle = document.querySelector('h1')?.innerText.trim() || '';
+            const author = document.querySelector('.detail-w-t .authorFullName')
+                ?.innerText.trim() || '';
+            const date = Array.from(document.querySelectorAll('.detail-w-t .detail-time'))
+                .map(element => element.innerText.trim())
+                .find(value => value && value !== author) || '';
+            if (!body || !articleTitle || !body.innerText.trim()) {
+                return JSON.stringify({pending: true});
+            }
+            let paragraphs = Array.from(body.querySelectorAll('p'))
+                .map(paragraph => paragraph.innerText.trim())
+                .filter(value => value && !value.startsWith('فوٹو:'));
+            if (!paragraphs.length) {
+                paragraphs = body.innerText.split(/\n+/)
+                    .map(value => value.trim())
+                    .filter(value => value && !value.startsWith('فوٹو:'));
+            }
+            const imageUrls = Array.from(content.querySelectorAll('img[src*="/assets/uploads/"]'))
+                .map(image => image.currentSrc || image.src).filter(Boolean);
+            return JSON.stringify({id: '$storyId', title: articleTitle, author: author,
+                date: date, paragraphs: paragraphs, imageUrls: imageUrls});
+        })()
+    """.trimIndent()
+
+    override fun parseArticle(json: String, storyId: String): NewspaperArticle {
+        val data = JSONObject(json)
+        if (data.has("error")) throw IllegalStateException(data.getString("error"))
+        if (data.optBoolean("verifying")) throw IllegalStateException("VERIFYING")
+        if (data.optBoolean("pending")) throw IllegalStateException("PENDING")
+        val byline = listOf(data.optString("author"), data.optString("date"))
+            .filter { it.isNotBlank() }
+            .joinToString(" · ")
+        val article = NewspaperArticle(
+            storyId,
+            data.getString("title"),
+            byline,
+            data.getJSONArray("paragraphs").toStringList(),
+            data.getJSONArray("imageUrls").toStringList()
+        )
+        require(article.title.isNotBlank() && article.paragraphs.isNotEmpty()) {
+            "Jang returned empty text for story $storyId."
+        }
+        return article
+    }
+
     override fun hotspotExtractionScript(date: String, pageId: String): String {
         val pageNumber = pageId.takeLast(3)
         return """
-            JSON.stringify(Array.from(document.querySelectorAll('area[href]')).flatMap(area => {
+            (() => {
+              const title = document.title.toLowerCase();
+              const text = (document.body?.innerText || '').slice(0, 4000).toLowerCase();
+              if (title.includes('moment, please') || title.includes('just a moment') ||
+                  text.includes('verify you are human') || text.includes('checking your browser') ||
+                  text.includes('security verification') ||
+                  document.querySelector('#challenge-running, #challenge-stage')) {
+                return JSON.stringify({verifying: true});
+              }
+              return JSON.stringify(Array.from(document.querySelectorAll('area[href]')).flatMap(area => {
                 const href = area.getAttribute('href') || '';
                 const story = href.match(/\/detail\/(\d+)/i);
                 const onclick = area.getAttribute('onclick') || '';
@@ -245,7 +352,8 @@ private class JangLahoreFetcher : NewspaperFetcher {
                 return [{targetId: targetId, type: type, imageUrl: imageUrl,
                     coordinates: coordinates, label: area.alt || area.title || '',
                     shape: area.shape || 'poly'}];
-            }))
+              }));
+            })()
         """.trimIndent()
     }
 
@@ -274,3 +382,6 @@ private class JangLahoreFetcher : NewspaperFetcher {
 
 private fun JSONArray.toIntList(): List<Int> =
     (0 until length()).map { getInt(it) }
+
+private fun JSONArray.toStringList(): List<String> =
+    (0 until length()).map { getString(it) }
