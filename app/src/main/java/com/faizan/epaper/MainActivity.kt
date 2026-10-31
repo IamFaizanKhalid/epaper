@@ -41,6 +41,7 @@ class MainActivity : Activity() {
 
     private lateinit var webView: WebView
     private lateinit var inspectionWebView: WebView
+    private lateinit var onDemandWebView: WebView
     private lateinit var jangWebView: WebView
     private lateinit var detailWebView: WebView
     private lateinit var pageLabel: TextView
@@ -147,7 +148,7 @@ class MainActivity : Activity() {
                     val browser = WebView(this).apply {
                         settings.javaScriptEnabled = true
                         settings.domStorageEnabled = true
-                        alpha = 0f
+                        visibility = View.INVISIBLE
                         importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
                         webViewClient = object : WebViewClient() {
                             override fun onPageFinished(view: WebView, url: String) {
@@ -521,16 +522,25 @@ class MainActivity : Activity() {
             settings.domStorageEnabled = true
             settings.useWideViewPort = true
             settings.loadWithOverviewMode = true
-            alpha = 0f
+            visibility = View.INVISIBLE
             importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
         }
         inspectionWebView.webViewClient = inspectionClient()
+        onDemandWebView = WebView(this).apply {
+            settings.javaScriptEnabled = true
+            settings.domStorageEnabled = true
+            settings.useWideViewPort = true
+            settings.loadWithOverviewMode = true
+            visibility = View.INVISIBLE
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+        }
+        onDemandWebView.webViewClient = onDemandPageClient()
         jangWebView = WebView(this).apply {
             settings.javaScriptEnabled = true
             settings.domStorageEnabled = true
             settings.useWideViewPort = true
             settings.loadWithOverviewMode = true
-            alpha = 0f
+            visibility = View.INVISIBLE
             importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
         }
         jangWebView.webViewClient = jangInspectionClient()
@@ -539,7 +549,7 @@ class MainActivity : Activity() {
             settings.domStorageEnabled = true
             settings.useWideViewPort = true
             settings.loadWithOverviewMode = true
-            alpha = 0f
+            visibility = View.INVISIBLE
             importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
         }
         detailWebView.webViewClient = object : WebViewClient() {
@@ -658,6 +668,13 @@ class MainActivity : Activity() {
             )
         )
         webViewContainer.addView(
+            onDemandWebView,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+        )
+        webViewContainer.addView(
             jangWebView,
             FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
@@ -695,22 +712,6 @@ class MainActivity : Activity() {
     private fun inspectionClient() = object : WebViewClient() {
         override fun onPageFinished(view: WebView, url: String) {
             val uri = Uri.parse(url)
-            val requestedPage = onDemandPage
-            if (requestedPage != null &&
-                !Papers.forEdition(requestedPage.first).requiresPageVerification &&
-                Papers.forEdition(requestedPage.first).isPageUrl(
-                    url,
-                    requestedPage.first.date,
-                    requestedPage.second.id
-                )
-            ) {
-                view.postDelayed({
-                    if (onDemandPage == requestedPage) {
-                        collectOnDemandPageHotspots(requestedPage.first, requestedPage.second)
-                    }
-                }, 250)
-                return
-            }
             val edition = editionInProgress ?: return
             if (pageScanInProgress) {
                 val page = edition.readingOrder.getOrNull(editionPageIndex) ?: return
@@ -740,6 +741,38 @@ class MainActivity : Activity() {
                     }, 250)
                 }
             }
+        }
+    }
+
+    private fun onDemandPageClient() = object : WebViewClient() {
+        override fun onPageFinished(view: WebView, url: String) {
+            val requestedPage = onDemandPage ?: return
+            val (edition, page) = requestedPage
+            val paper = Papers.forEdition(edition)
+            if (paper.requiresPageVerification ||
+                !paper.isPageUrl(url, edition.date, page.id)
+            ) return
+            view.postDelayed({
+                if (onDemandPage == requestedPage) {
+                    collectOnDemandPageHotspots(edition, page)
+                }
+            }, 250)
+        }
+
+        override fun onReceivedError(
+            view: WebView,
+            request: WebResourceRequest,
+            error: android.webkit.WebResourceError
+        ) {
+            if (!request.isForMainFrame) return
+            val requestedPage = onDemandPage ?: return
+            val (edition, page) = requestedPage
+            val paper = Papers.forEdition(edition)
+            if (paper.requiresPageVerification ||
+                !paper.isPageUrl(request.url.toString(), edition.date, page.id)
+            ) return
+            onDemandPage = null
+            showMessage("Could not load page details for ${page.title}: ${error.description}")
         }
     }
 
@@ -832,12 +865,18 @@ class MainActivity : Activity() {
             request: WebResourceRequest,
             error: android.webkit.WebResourceError
         ) {
-            if (!request.isForMainFrame || request.url.host != "e.jang.com.pk") return
+            if (!request.isForMainFrame) return
             if (request.url.path?.contains("/cdn-cgi/") == true) return
-            if (onDemandPage?.first?.paperId == NewspaperId.JANG_LAHORE) {
-                onDemandPage = null
-                showMessage("Could not load Jang page details: ${error.description}")
-            }
+            val requestedPage = onDemandPage ?: return
+            val (edition, page) = requestedPage
+            val paper = Papers.forEdition(edition)
+            if (!paper.requiresPageVerification ||
+                !paper.isPageUrl(request.url.toString(), edition.date, page.id)
+            ) return
+            onDemandPage = null
+            jangVerificationGeneration++
+            jangVerificationKey = null
+            showMessage("Could not load ${page.title} details: ${error.description}")
         }
     }
 
@@ -879,6 +918,7 @@ class MainActivity : Activity() {
     }
 
     private fun showHome() {
+        cancelOnDemandPageRequest()
         readerMode = false
         homeScreen.visibility = View.VISIBLE
         readerScreen.visibility = View.GONE
@@ -1207,19 +1247,34 @@ class MainActivity : Activity() {
     }
 
     private fun ensurePageHotspots(edition: NewspaperEdition, page: NewspaperPage) {
-        if (page.id in edition.processedPageIds || pageScanInProgress ||
-            onDemandPage != null
-        ) return
-        onDemandPage = edition to page
+        val requestedPage = edition to page
+        if (onDemandPage != null && onDemandPage != requestedPage) {
+            cancelOnDemandPageRequest()
+        }
+        if (page.id in edition.processedPageIds) return
+        if (onDemandPage == requestedPage) return
+        onDemandPage = requestedPage
         if (Papers.forEdition(edition).requiresPageVerification) {
             jangWebView.loadUrl(
                 Papers.forEdition(edition).pageUrl(edition.date, page.id)
             )
         } else {
-            inspectionWebView.loadUrl(
+            onDemandWebView.loadUrl(
                 Papers.forEdition(edition).pageUrl(edition.date, page.id),
                 mapOf("Referer" to "https://epaper.dawn.com/")
             )
+        }
+    }
+
+    private fun cancelOnDemandPageRequest() {
+        val request = onDemandPage ?: return
+        onDemandPage = null
+        if (Papers.forEdition(request.first).requiresPageVerification) {
+            jangVerificationGeneration++
+            jangVerificationKey = null
+            jangWebView.stopLoading()
+        } else {
+            onDemandWebView.stopLoading()
         }
     }
 
@@ -1363,7 +1418,7 @@ class MainActivity : Activity() {
 
     private fun collectOnDemandPageHotspots(edition: NewspaperEdition, page: NewspaperPage) {
         val fetcher = Papers.forEdition(edition)
-        val source = if (fetcher.requiresPageVerification) jangWebView else inspectionWebView
+        val source = if (fetcher.requiresPageVerification) jangWebView else onDemandWebView
         source.evaluateJavascript(fetcher.hotspotExtractionScript(edition.date, page.id)) { result ->
             try {
                 if (onDemandPage != (edition to page)) return@evaluateJavascript

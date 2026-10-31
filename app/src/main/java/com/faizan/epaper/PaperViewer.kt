@@ -33,34 +33,68 @@ class WebPaperViewer : PaperViewer {
         } else {
             "${page.id}.png"
         }
-        val areas = hotspots.joinToString("") { hotspot ->
-            val route = if (hotspot.type == NewspaperHotspotType.TEXT) "text" else "image"
-            """<area shape="${escape(hotspot.shape)}" coords="${hotspot.coordinates.joinToString(",")}" href="${paper.offlineOrigin}$route/${escape(hotspot.targetId)}" alt="${escape(hotspot.label)}" title="${escape(hotspot.label)}">"""
+        val hotspotData = org.json.JSONArray().apply {
+            hotspots.forEach { hotspot ->
+                put(org.json.JSONObject().apply {
+                    put("shape", hotspot.shape)
+                    put("coordinates", org.json.JSONArray(hotspot.coordinates))
+                    put("route", if (hotspot.type == NewspaperHotspotType.TEXT) "text" else "image")
+                    put("targetId", hotspot.targetId)
+                    put("label", hotspot.label)
+                })
+            }
         }
         return """
-            <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+            <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1,minimum-scale=1,maximum-scale=5,user-scalable=yes">
             <style>body{margin:0;background:#222;text-align:center}
-            area,a{-webkit-tap-highlight-color:transparent;outline:none}
-            area:focus,area:active,a:focus,a:active{outline:none}
+            a,img{-webkit-tap-highlight-color:transparent;outline:none;-webkit-user-select:none;user-select:none}
             #paper-container{position:relative;width:100%}
-            #page{display:block;width:100%;height:auto;margin:auto}
+            #page{display:block;width:100%;height:auto;margin:auto;-webkit-user-drag:none}
+            #hotspots{position:absolute;inset:0}
+            #hotspots a{position:absolute;display:block;color:transparent;outline:none}
             .hotspot-highlight{position:absolute;z-index:2;pointer-events:none;
               background:rgba(255,210,0,.32);border:3px solid #ffd400;box-sizing:border-box;
               box-shadow:0 0 12px rgba(255,212,0,.9)}</style>
-            </head><body><div id="paper-container"><img id="page" src="$imageFileName" usemap="#page-map"><map id="page-map" name="page-map">$areas</map></div>
+            </head><body><div id="paper-container"><img id="page" src="$imageFileName"><div id="hotspots"></div></div>
             <script>
             (function(){const img=document.getElementById('page');
-            function scale(){if(!img.naturalWidth)return;const sx=img.clientWidth/img.naturalWidth,sy=img.clientHeight/img.naturalHeight;
-            document.querySelectorAll('area').forEach(a=>{if(!a.dataset.original)a.dataset.original=a.coords;const c=a.dataset.original.split(',').map(Number);
-            a.coords=c.map((n,i)=>Math.round(n*(i%2?sy:sx))).join(',')})}
-            window.updatePageHotspots=function(items){const map=document.getElementById('page-map');map.replaceChildren();
-            items.forEach(item=>{const area=document.createElement('area');area.shape=item.shape;
-            area.coords=item.coordinates.join(',');area.href='${paper.offlineOrigin}'+item.route+'/'+item.targetId;
-            area.alt=item.label;area.title=item.label;map.appendChild(area)});scale()};
-            document.getElementById('page-map').addEventListener('click',function(event){
-            const area=event.target.closest('area');if(!area)return;
-            const shape=area.shape.toLowerCase(),coords=area.coords.split(',').map(Number);
-            if((shape==='circle'&&coords.length<3)||(shape!=='circle'&&coords.length<4))return;
+            const layer=document.getElementById('hotspots');
+            window.updatePageHotspots=function(items){layer.replaceChildren();
+            if(!img.naturalWidth||!img.naturalHeight)return;
+            items.forEach(item=>{const coords=item.coordinates;
+            const shape=item.shape.toLowerCase();
+            const link=document.createElement('a');
+            link.href='${paper.offlineOrigin}'+item.route+'/'+encodeURIComponent(item.targetId);
+            link.setAttribute('aria-label',item.label||'Open story');
+            if(shape==='circle'&&coords.length>=3){
+            const x=coords[0],y=coords[1],r=coords[2];
+            link.style.left=(100*(x-r)/img.naturalWidth)+'%';
+            link.style.top=(100*(y-r)/img.naturalHeight)+'%';
+            link.style.width=(200*r/img.naturalWidth)+'%';
+            link.style.height=(200*r/img.naturalHeight)+'%';
+            link.style.borderRadius='50%';
+            }else if(shape==='rect'&&coords.length>=4){
+            const left=Math.min(coords[0],coords[2]),right=Math.max(coords[0],coords[2]);
+            const top=Math.min(coords[1],coords[3]),bottom=Math.max(coords[1],coords[3]);
+            link.style.left=(100*left/img.naturalWidth)+'%';
+            link.style.top=(100*top/img.naturalHeight)+'%';
+            link.style.width=(100*(right-left)/img.naturalWidth)+'%';
+            link.style.height=(100*(bottom-top)/img.naturalHeight)+'%';
+            }else if(coords.length>=6){
+            const points=[];
+            for(let i=0;i+1<coords.length;i+=2)
+            points.push((100*coords[i]/img.naturalWidth)+'% '+(100*coords[i+1]/img.naturalHeight)+'%');
+            link.style.inset='0';
+            link.style.clipPath='polygon('+points.join(',')+')';
+            }else{return}
+            link.dataset.shape=shape;
+            link.dataset.coordinates=coords.join(',');
+            layer.appendChild(link);
+            })};
+            function renderHotspots(){window.updatePageHotspots($hotspotData)};
+            layer.addEventListener('click',function(event){
+            const link=event.target.closest('a');if(!link)return;
+            const shape=link.dataset.shape,coords=link.dataset.coordinates.split(',').map(Number);
             event.preventDefault();
             let left,top,right,bottom;
             if(shape==='circle'){
@@ -69,12 +103,16 @@ class WebPaperViewer : PaperViewer {
             else{const xs=coords.filter((_,i)=>i%2===0),ys=coords.filter((_,i)=>i%2===1);
             left=Math.min(...xs);top=Math.min(...ys);right=Math.max(...xs);bottom=Math.max(...ys)}
             const mark=document.createElement('div');mark.className='hotspot-highlight';
-            mark.style.left=left+'px';mark.style.top=top+'px';
-            mark.style.width=(right-left)+'px';mark.style.height=(bottom-top)+'px';
+            const sx=img.clientWidth/img.naturalWidth,sy=img.clientHeight/img.naturalHeight;
+            mark.style.left=(left*sx)+'px';mark.style.top=(top*sy)+'px';
+            mark.style.width=((right-left)*sx)+'px';mark.style.height=((bottom-top)*sy)+'px';
             if(shape==='circle')mark.style.borderRadius='50%';
-            document.getElementById('paper-container').appendChild(mark);const target=area.href;
+            document.getElementById('paper-container').appendChild(mark);const target=link.href;
             setTimeout(()=>{location.href=target},180)});
-            img.addEventListener('load',scale);new ResizeObserver(scale).observe(img);scale();})();
+            img.addEventListener('load',renderHotspots);
+            if(img.complete)renderHotspots();
+            new ResizeObserver(renderHotspots).observe(img);
+            })();
             </script></body></html>
         """.trimIndent()
     }

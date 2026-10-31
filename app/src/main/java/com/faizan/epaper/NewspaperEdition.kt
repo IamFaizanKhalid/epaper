@@ -309,6 +309,35 @@ data class NewspaperEdition(
         pageNumber: Int,
         destination: File
     ) {
+        var lastFailure: Exception? = null
+        repeat(3) { attempt ->
+            try {
+                downloadJangImageOnce(url, jangDate, pageNumber, destination)
+                return
+            } catch (error: Exception) {
+                lastFailure = error
+                val retryable = error is java.io.IOException ||
+                    error.message == "Jang returned an unexpected image type." ||
+                    error.message == "Jang returned an invalid image." ||
+                    error.message?.startsWith("Jang returned HTTP 5") == true
+                if (!retryable || attempt == 2) throw error
+                try {
+                    Thread.sleep(500L * (attempt + 1))
+                } catch (interrupted: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    throw IllegalStateException("Jang image download was interrupted.", interrupted)
+                }
+            }
+        }
+        throw IllegalStateException("Could not download the Jang image.", lastFailure)
+    }
+
+    private fun downloadJangImageOnce(
+        url: URL,
+        jangDate: String,
+        pageNumber: Int,
+        destination: File
+    ) {
         val temporaryImage = File(destination.parentFile, "${destination.name}.tmp")
         val connection = (url.openConnection() as HttpURLConnection).apply {
             connectTimeout = 15_000
@@ -327,12 +356,9 @@ data class NewspaperEdition(
             }
             val extension = url.path.substringAfterLast('.').lowercase()
             val contentType = connection.contentType?.substringBefore(';')?.trim()?.lowercase()
-            val expectedTypes = if (extension == "png") {
-                setOf("image/png", "image/x-png", "application/octet-stream")
-            } else {
-                setOf("image/jpeg", "image/jpg", "application/octet-stream")
-            }
-            if (contentType !in expectedTypes) {
+            if (contentType?.startsWith("image/") != true &&
+                contentType != "application/octet-stream"
+            ) {
                 throw IllegalStateException("Jang returned an unexpected image type.")
             }
             if (connection.contentLengthLong > MAX_IMAGE_BYTES) {
