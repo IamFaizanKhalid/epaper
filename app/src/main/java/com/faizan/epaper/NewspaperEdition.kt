@@ -7,27 +7,27 @@ import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 
-data class DawnPage(val id: String, val title: String) {
+data class NewspaperPage(val id: String, val title: String) {
     val imageFileName: String
         get() = "$id.jpg"
 }
 
-enum class DawnHotspotType {
+enum class NewspaperHotspotType {
     TEXT,
     IMAGE
 }
 
-data class DawnHotspot(
+data class NewspaperHotspot(
     val pageId: String,
     val targetId: String,
-    val type: DawnHotspotType,
+    val type: NewspaperHotspotType,
     val label: String,
     val shape: String,
     val coordinates: List<Int>,
     val imageUrl: String? = null
 )
 
-data class DawnArticle(
+data class NewspaperArticle(
     val id: String,
     val title: String,
     val byline: String,
@@ -35,18 +35,18 @@ data class DawnArticle(
     val imageUrls: List<String> = emptyList()
 )
 
-data class DawnEdition(
+data class NewspaperEdition(
     val date: String,
     val latestDate: String,
-    val pages: List<DawnPage>,
+    val pages: List<NewspaperPage>,
     val fullImageIds: List<String> = emptyList(),
-    val hotspots: List<DawnHotspot> = emptyList(),
-    val articles: List<DawnArticle> = emptyList(),
+    val hotspots: List<NewspaperHotspot> = emptyList(),
+    val articles: List<NewspaperArticle> = emptyList(),
     val processedPageIds: List<String> = emptyList(),
     val isJangEdition: Boolean = false,
     val jangImageAreasVersion: Int = 0
 ) {
-    val readingOrder: List<DawnPage>
+    val readingOrder: List<NewspaperPage>
         get() {
             val front = pages.filter { it.title.contains("front", ignoreCase = true) }
             val back = pages.filter { it.title.contains("back", ignoreCase = true) }
@@ -64,6 +64,7 @@ data class DawnEdition(
         } else {
             downloadImages(directory, listOf(id), "pages", { pageId -> "$pageId.jpg" }) { _, _ -> }
         }
+
     }
 
     fun hasPageImage(directory: File, id: String): Boolean =
@@ -127,7 +128,7 @@ data class DawnEdition(
         }
         ids.forEachIndexed { index, id ->
             val hotspot = hotspots.firstOrNull {
-                it.targetId == id && it.type == DawnHotspotType.IMAGE
+                it.targetId == id && it.type == NewspaperHotspotType.IMAGE
             } ?: throw IllegalStateException("Jang image $id is not listed in this edition.")
             val imageUrl = hotspot.imageUrl
                 ?: throw IllegalStateException("Jang image $id has no saved source URL.")
@@ -501,7 +502,7 @@ data class DawnEdition(
             if (isJangEdition) JANG_PAGE_PATTERN.matches(id) && id.startsWith("J${date}_")
             else PAGE_PATTERN.matches(id) && id.startsWith("${date}_")
 
-        fun fromJson(json: String): DawnEdition {
+        fun fromJson(json: String): NewspaperEdition {
             val data = JSONObject(json)
             val date = data.getString("date")
             val latestDate = data.getString("latestDate")
@@ -514,19 +515,19 @@ data class DawnEdition(
                 require(isValidPageId(id, date, isJangEdition)) {
                     "The newspaper returned an invalid page ID."
                 }
-                DawnPage(id, item.optString("title").ifBlank { "Page ${id.takeLast(3)}" })
+                NewspaperPage(id, item.optString("title").ifBlank { "Page ${id.takeLast(3)}" })
             }.distinctBy { it.id }
             require(pages.isNotEmpty()) { "No pages were listed for this edition." }
 
             val hotspots = data.optJSONArray("hotspots")?.objects()?.map { item ->
                 val pageId = item.getString("pageId")
                 val targetId = item.getString("targetId")
-                val type = DawnHotspotType.valueOf(item.getString("type"))
+                val type = NewspaperHotspotType.valueOf(item.getString("type"))
                 require(isValidPageId(pageId, date, isJangEdition)) {
                     "The newspaper returned an invalid hotspot page ID."
                 }
                 require(
-                    if (isJangEdition && type == DawnHotspotType.IMAGE) {
+                    if (isJangEdition && type == NewspaperHotspotType.IMAGE) {
                         JANG_IMAGE_ID_PATTERN.matches(targetId) &&
                             targetId.startsWith("J${date}_")
                     } else if (isJangEdition) targetId.matches(Regex("\\d+"))
@@ -534,14 +535,14 @@ data class DawnEdition(
                 ) {
                     "The newspaper returned an invalid hotspot target ID."
                 }
-                if (isJangEdition && type == DawnHotspotType.IMAGE) {
+                if (isJangEdition && type == NewspaperHotspotType.IMAGE) {
                     require(item.optString("imageUrl").matches(JANG_IMAGE_PATH_PATTERN)) {
                         "The newspaper returned an invalid Jang image URL."
                     }
                 }
                 val coordinates = item.getJSONArray("coordinates").ints()
                 require(coordinates.size >= 4) { "Dawn returned invalid hotspot coordinates." }
-                DawnHotspot(
+                NewspaperHotspot(
                     pageId,
                     targetId,
                     type,
@@ -568,7 +569,7 @@ data class DawnEdition(
                 ) {
                     "The newspaper returned an invalid story ID."
                 }
-                DawnArticle(
+                NewspaperArticle(
                     id,
                     item.getString("title"),
                     item.optString("byline"),
@@ -588,7 +589,7 @@ data class DawnEdition(
             }) {
                 "Dawn returned invalid processed page IDs."
             }
-            return DawnEdition(
+            return NewspaperEdition(
                 date,
                 latestDate,
                 pages,
@@ -601,7 +602,7 @@ data class DawnEdition(
             )
         }
 
-        fun readMetadata(file: File): DawnEdition =
+        fun readMetadata(file: File): NewspaperEdition =
             fromJson(file.readText(Charsets.UTF_8))
 
         private fun JSONArray.objects(): List<JSONObject> =

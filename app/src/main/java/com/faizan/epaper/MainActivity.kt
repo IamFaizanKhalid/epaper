@@ -61,21 +61,21 @@ class MainActivity : Activity() {
     private var viewingArticleImage = false
     private var paperPageReady = false
     private var shuttingDown = false
-    private var availableEdition: DawnEdition? = null
+    private var availableEdition: NewspaperEdition? = null
     private var pageAdapter: ArrayAdapter<String>? = null
     private var updatingPagePicker = false
-    private var editionInProgress: DawnEdition? = null
+    private var editionInProgress: NewspaperEdition? = null
     private var activeEditionDirectory: File? = null
     private var editionPageIndex = 0
     private var textStoryIds: List<String> = emptyList()
     private var fullImageIds: List<String> = emptyList()
-    private var collectedHotspots: List<DawnHotspot> = emptyList()
-    private var collectedArticles: List<DawnArticle> = emptyList()
+    private var collectedHotspots: List<NewspaperHotspot> = emptyList()
+    private var collectedArticles: List<NewspaperArticle> = emptyList()
     private var processedPageIds: List<String> = emptyList()
     private var storyIndex = 0
     private var archivingStories = false
     private var processingContentId: String? = null
-    private var offlineEdition: DawnEdition? = null
+    private var offlineEdition: NewspaperEdition? = null
     private var offlineDirectory: File? = null
     private var latestEditionStatus: String? = null
     private var checkedEditionDate: String? = null
@@ -89,9 +89,9 @@ class MainActivity : Activity() {
     private var storyScanInProgress = false
     private var onDemandStoryId: String? = null
     private var onDemandImageId: String? = null
-    private var onDemandEdition: DawnEdition? = null
+    private var onDemandEdition: NewspaperEdition? = null
     private var onDemandDirectory: File? = null
-    private var onDemandPage: Pair<DawnEdition, DawnPage>? = null
+    private var onDemandPage: Pair<NewspaperEdition, NewspaperPage>? = null
     private var storyLoadingDialog: ProgressDialog? = null
     private var activeTextStory: TextStoryRequest? = null
     private var parsingJangStoryId: String? = null
@@ -161,7 +161,7 @@ class MainActivity : Activity() {
             setOnClickListener { openDawnEdition() }
         }
         val dawnTitle = TextView(this).apply {
-            text = "Dawn"
+            text = NewspaperFetchers[NewspaperId.DAWN].id.displayName
             textSize = 18f
             setTextColor(Color.rgb(34, 50, 70))
         }
@@ -193,7 +193,7 @@ class MainActivity : Activity() {
             setOnClickListener { openJangEdition() }
         }
         val jangTitle = TextView(this).apply {
-            text = "Jang Lahore"
+            text =             NewspaperId.JANG_LAHORE.displayName
             textSize = 18f
             setTextColor(Color.rgb(34, 50, 70))
         }
@@ -329,8 +329,11 @@ class MainActivity : Activity() {
                                 viewingStoryContent
                             ) {
                                 webView.loadDataWithBaseURL(
-                                    "https://offline.jang/",
-                                    renderArticle(article, NewspaperProvider.JANG),
+                                    NewspaperFetchers.forEdition(request.edition).offlineOrigin,
+                                    renderArticle(
+                                        article,
+                                        NewspaperFetchers[NewspaperId.JANG_LAHORE]
+                                    ),
                                     "text/html",
                                     "UTF-8",
                                     null
@@ -357,8 +360,8 @@ class MainActivity : Activity() {
                             viewingStoryContent
                         ) {
                             webView.loadDataWithBaseURL(
-                                "https://offline.dawn/",
-                                renderArticle(article, NewspaperProvider.DAWN),
+                                NewspaperFetchers.forEdition(request.edition).offlineOrigin,
+                                renderArticle(article, NewspaperFetchers[NewspaperId.DAWN]),
                                 "text/html",
                                 "UTF-8",
                                 null
@@ -456,8 +459,11 @@ class MainActivity : Activity() {
             }
             val requestedPage = onDemandPage
             if (requestedPage != null && !requestedPage.first.isJangEdition &&
-                uri.host == "e.dawn.com" &&
-                uri.lastPathSegment?.removeSuffix(".html") == requestedPage.second.id
+                NewspaperFetchers.forEdition(requestedPage.first).isPageUrl(
+                    url,
+                    requestedPage.first.date,
+                    requestedPage.second.id
+                )
             ) {
                 view.postDelayed({
                     if (onDemandPage == requestedPage) {
@@ -467,9 +473,9 @@ class MainActivity : Activity() {
                 return
             }
             val edition = editionInProgress ?: return
-            if (pageScanInProgress && uri.host == "e.dawn.com") {
+            if (pageScanInProgress) {
                 val page = edition.readingOrder.getOrNull(editionPageIndex) ?: return
-                if (uri.lastPathSegment?.removeSuffix(".html") == page.id &&
+                if (NewspaperFetchers.forEdition(edition).isPageUrl(url, edition.date, page.id) &&
                     processingContentId != page.id
                 ) {
                     processingContentId = page.id
@@ -506,20 +512,24 @@ class MainActivity : Activity() {
                 (uri.host == "e.jang.com.pk" || uri.host == "www.e.jang.com.pk")
             ) {
                 awaitJangVerification(
-                    "https://e.jang.com.pk/lahore/${requestedDate.replace('_', '-')}/page1",
+                    NewspaperFetchers[NewspaperId.JANG_LAHORE].availabilityUrl(requestedDate),
                     requestedDate,
                     null
                 ) { discoverJangEdition(requestedDate) }
                 return
             }
-            if (uri.host != "e.jang.com.pk") return
             val requestedPage = onDemandPage
             if (requestedPage?.first?.isJangEdition == true &&
-                uri.path == "/lahore/${requestedPage.first.date.replace('_', '-')}/page${requestedPage.second.id.takeLast(3).toInt()}"
+                NewspaperFetchers.forEdition(requestedPage.first).isPageUrl(
+                    url,
+                    requestedPage.first.date,
+                    requestedPage.second.id
+                )
             ) {
-                val requestedPageUrl = "https://e.jang.com.pk${uri.path}"
+                val requestedPageUrl = NewspaperFetchers.forEdition(requestedPage.first)
+                    .pageUrl(requestedPage.first.date, requestedPage.second.id)
                 awaitJangVerification(requestedPageUrl, null, requestedPage) {
-                    collectOnDemandJangPageHotspots(requestedPage.first, requestedPage.second)
+                    collectOnDemandPageHotspots(requestedPage.first, requestedPage.second)
                 }
             }
         }
@@ -527,7 +537,7 @@ class MainActivity : Activity() {
         private fun awaitJangVerification(
                 expectedUrl: String,
                 editionDate: String?,
-                requestedPage: Pair<DawnEdition, DawnPage>?,
+                requestedPage: Pair<NewspaperEdition, NewspaperPage>?,
                 attempt: Int = 0,
                 onReady: () -> Unit
             ) {
@@ -669,7 +679,7 @@ class MainActivity : Activity() {
             val metadata = File(File(filesDir, "editions"), requestedDate)
                 .resolve("edition.json")
             if (!metadata.isFile) null else try {
-                DawnEdition.readMetadata(metadata).also {
+                NewspaperEdition.readMetadata(metadata).also {
                     require(!it.isJangEdition) { "Saved Dawn edition metadata is invalid." }
                 }
             } catch (error: Exception) {
@@ -691,7 +701,7 @@ class MainActivity : Activity() {
         openEdition(edition)
     }
 
-    private fun openEdition(edition: DawnEdition) {
+    private fun openEdition(edition: NewspaperEdition) {
         availableEdition = edition
         readerMode = true
         homeScreen.visibility = View.GONE
@@ -718,11 +728,12 @@ class MainActivity : Activity() {
 
     private fun checkJangAvailability(openWhenAvailable: Boolean = false) {
         val requestedDate = selectedDateKey()
-        val directory = File(File(filesDir, "editions/jang"), requestedDate)
+        val directory = NewspaperFetchers[NewspaperId.JANG_LAHORE]
+            .editionDirectory(File(filesDir, "editions"), requestedDate)
         val metadata = File(directory, "edition.json")
         if (metadata.isFile) {
             try {
-                val edition = DawnEdition.readMetadata(metadata)
+                val edition = NewspaperEdition.readMetadata(metadata)
                 if (!edition.isJangEdition) {
                     throw IllegalStateException("Saved Jang edition metadata is invalid.")
                 }
@@ -745,7 +756,7 @@ class MainActivity : Activity() {
         jangStatusLabel.text = "Checking availability…"
         jangStatusLabel.setTextColor(Color.DKGRAY)
         jangWebView.loadUrl(
-            "https://e.jang.com.pk/lahore/${requestedDate.replace('_', '-')}/page1"
+            NewspaperFetchers[NewspaperId.JANG_LAHORE].availabilityUrl(requestedDate)
         )
     }
 
@@ -793,18 +804,19 @@ class MainActivity : Activity() {
                     val entry = pageEntries.getJSONObject(index)
                     val number = entry.getInt("number")
                     require(number in 1..99) { "Jang returned an invalid page number." }
-                    DawnPage(
+                    NewspaperPage(
                         "J${requestedDate}_${number.toString().padStart(3, '0')}",
                         entry.optString("title").ifBlank { "Page $number" }
                     )
                 }
-                val edition = DawnEdition(
+                val edition = NewspaperEdition(
                     date = requestedDate,
                     latestDate = requestedDate,
                     pages = pages,
                     isJangEdition = true
                 )
-                val directory = File(File(filesDir, "editions/jang"), requestedDate)
+                val directory = NewspaperFetchers[NewspaperId.JANG_LAHORE]
+                    .editionDirectory(File(filesDir, "editions"), requestedDate)
                 if (!directory.exists() && !directory.mkdirs()) {
                     throw IllegalStateException("Could not create Jang edition storage.")
                 }
@@ -828,14 +840,11 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun editionDirectory(edition: DawnEdition): File =
-        if (edition.isJangEdition) {
-            File(File(filesDir, "editions/jang"), edition.date)
-        } else {
-            File(File(filesDir, "editions"), edition.date)
-        }
+    private fun editionDirectory(edition: NewspaperEdition): File =
+        NewspaperFetchers.forEdition(edition)
+            .editionDirectory(File(filesDir, "editions"), edition.date)
 
-    private fun updatePagePicker(edition: DawnEdition) {
+    private fun updatePagePicker(edition: NewspaperEdition) {
         val adapter = pageAdapter ?: return
         updatingPagePicker = true
         adapter.clear()
@@ -848,7 +857,7 @@ class MainActivity : Activity() {
         updatingPagePicker = false
     }
 
-    private fun openReaderPage(page: DawnPage) {
+    private fun openReaderPage(page: NewspaperPage) {
         val edition = readerEdition() ?: return
         val directory = editionDirectory(edition)
         if (displayedPageId != page.id || displayedEditionDate != edition.date) {
@@ -876,7 +885,7 @@ class MainActivity : Activity() {
         prefetchPageStories(edition, page)
     }
 
-    private fun renderPageLoading(page: DawnPage): String =
+    private fun renderPageLoading(page: NewspaperPage): String =
         "<html><body style='font:18px sans-serif;padding:24px'>Loading ${htmlEscape(page.title)}…</body></html>"
 
     private fun isRequestedPageVisible(request: PageDownloadRequest): Boolean =
@@ -885,7 +894,7 @@ class MainActivity : Activity() {
             readerEdition()?.isJangEdition == request.edition.isJangEdition &&
             pageNumber == request.page.id.takeLast(3).toIntOrNull()
 
-    private fun showPageLoadFailure(page: DawnPage, message: String?) {
+    private fun showPageLoadFailure(page: NewspaperPage, message: String?) {
         val edition = readerEdition() ?: return
         val host = if (edition.isJangEdition) "offline.jang" else "offline.dawn"
         val details = message?.takeIf { it.isNotBlank() } ?: "The page image could not be downloaded."
@@ -910,7 +919,7 @@ class MainActivity : Activity() {
         val metadata = File(directory, "edition.json")
         if (metadata.isFile) {
             try {
-                val savedEdition = DawnEdition.readMetadata(metadata)
+                val savedEdition = NewspaperEdition.readMetadata(metadata)
                 availableEdition = savedEdition
                 updatePagePicker(savedEdition)
                 dawnStatusLabel.text = "Available"
@@ -992,7 +1001,7 @@ class MainActivity : Activity() {
                     dawnStatusLabel.setTextColor(Color.RED)
                     pageLabel.text = message
                 } else {
-                    val edition = DawnEdition.fromJson(json)
+                    val edition = NewspaperEdition.fromJson(json)
                     val jangIsActive = readerMode && offlineEdition?.isJangEdition == true
                     if (!jangIsActive) {
                         availableEdition = edition
@@ -1002,7 +1011,7 @@ class MainActivity : Activity() {
                     val metadata = File(directory, "edition.json")
                     val savedEdition = if (metadata.isFile) {
                         try {
-                            DawnEdition.readMetadata(metadata)
+                            NewspaperEdition.readMetadata(metadata)
                         } catch (error: Exception) {
                             showMessage(error.message ?: "Saved edition metadata is invalid and will be rebuilt.")
                             null
@@ -1038,7 +1047,7 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun downloadEdition(edition: DawnEdition) {
+    private fun downloadEdition(edition: NewspaperEdition) {
         if (editionInProgress?.date == edition.date) return
 
         val directory = editionDirectory(edition)
@@ -1076,9 +1085,9 @@ class MainActivity : Activity() {
     }
 
     private fun enqueuePageDownloads(
-        edition: DawnEdition,
+        edition: NewspaperEdition,
         directory: File,
-        pages: List<DawnPage>
+        pages: List<NewspaperPage>
     ) {
         synchronized(pageDownloadLock) {
             pages.forEachIndexed { index, page ->
@@ -1096,9 +1105,9 @@ class MainActivity : Activity() {
     }
 
     private fun requestPageDownload(
-        edition: DawnEdition,
+        edition: NewspaperEdition,
         directory: File,
-        page: DawnPage,
+        page: NewspaperPage,
         priority: Int
     ) {
         synchronized(pageDownloadLock) {
@@ -1218,60 +1227,37 @@ class MainActivity : Activity() {
             return
         }
         processingContentId = null
-        val parts = edition.date.split('_')
         inspectionWebView.loadUrl(
-            "https://e.dawn.com/${parts[2]}/${parts[1]}/${parts[0]}/pages/${page.id}.html",
+            NewspaperFetchers.forEdition(edition).pageUrl(edition.date, page.id),
             mapOf("Referer" to "https://epaper.dawn.com/")
         )
     }
 
-    private fun collectPageHotspots(edition: DawnEdition, page: DawnPage) {
-        val script = """
-            JSON.stringify(Array.from(document.querySelectorAll('area[href]')).flatMap(area => {
-                const href = area.getAttribute('href') || '';
-                const text = href.match(/StoryText=([0-9_]+)/i);
-                const image = href.match(/StoryImage=([0-9_]+)/i);
-                const match = text || image;
-                if (!match) return [];
-                const coordinates = (area.getAttribute('coords') || '')
-                    .split(/[;,]/).map(value => value.trim()).filter(Boolean)
-                    .map(Number).filter(Number.isFinite);
-                return [{targetId: match[1], type: text ? 'TEXT' : 'IMAGE',
-                    label: area.alt || area.title || '', shape: area.shape || 'rect',
-                    coordinates: coordinates}];
-            }))
-        """.trimIndent()
-        inspectionWebView.evaluateJavascript(script) { result ->
+    private fun collectPageHotspots(edition: NewspaperEdition, page: NewspaperPage) {
+        val fetcher = NewspaperFetchers.forEdition(edition)
+        inspectionWebView.evaluateJavascript(
+            fetcher.hotspotExtractionScript(edition.date, page.id)
+        ) { result ->
             try {
                 if (editionInProgress !== edition) return@evaluateJavascript
                 val json = JSONTokener(result).nextValue() as? String
                     ?: throw IllegalStateException("Could not read story areas from page ${page.id}.")
-                val entries = org.json.JSONArray(json)
-                for (index in 0 until entries.length()) {
-                    val entry = entries.getJSONObject(index)
-                    val targetId = entry.getString("targetId")
-                    if (!targetId.startsWith("${edition.date}_")) continue
-                    val type = DawnHotspotType.valueOf(entry.getString("type"))
-                    val coordinates = entry.getJSONArray("coordinates")
-                    if (coordinates.length() < 4) continue
-                    val hotspot = DawnHotspot(
-                        page.id,
-                        targetId,
-                        type,
-                        entry.optString("label"),
-                        entry.optString("shape", "rect"),
-                        (0 until coordinates.length()).map { coordinates.getInt(it) }
-                    )
+                val hotspots = fetcher.parseHotspots(json, edition, page)
+                for (hotspot in hotspots) {
                     if (collectedHotspots.none {
                             it.pageId == hotspot.pageId && it.targetId == hotspot.targetId
                         }
                     ) {
                         collectedHotspots = collectedHotspots + hotspot
-                        when (type) {
-                            DawnHotspotType.TEXT ->
-                                if (targetId !in textStoryIds) textStoryIds = textStoryIds + targetId
-                            DawnHotspotType.IMAGE ->
-                                if (targetId !in fullImageIds) fullImageIds = fullImageIds + targetId
+                        when (hotspot.type) {
+                            NewspaperHotspotType.TEXT ->
+                                if (hotspot.targetId !in textStoryIds) {
+                                    textStoryIds = textStoryIds + hotspot.targetId
+                                }
+                            NewspaperHotspotType.IMAGE ->
+                                if (hotspot.targetId !in fullImageIds) {
+                                    fullImageIds = fullImageIds + hotspot.targetId
+                                }
                         }
                     }
                 }
@@ -1286,111 +1272,30 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun ensurePageHotspots(edition: DawnEdition, page: DawnPage) {
+    private fun ensurePageHotspots(edition: NewspaperEdition, page: NewspaperPage) {
         if (page.id in edition.processedPageIds || pageScanInProgress ||
             onDemandPage != null
         ) return
         onDemandPage = edition to page
         if (edition.isJangEdition) {
-            val pageNumber = page.id.takeLast(3).toInt()
             jangWebView.loadUrl(
-                "https://e.jang.com.pk/lahore/${edition.date.replace('_', '-')}/page$pageNumber"
+                NewspaperFetchers.forEdition(edition).pageUrl(edition.date, page.id)
             )
         } else {
-            val parts = edition.date.split('_')
             inspectionWebView.loadUrl(
-                "https://e.dawn.com/${parts[2]}/${parts[1]}/${parts[0]}/pages/${page.id}.html",
+                NewspaperFetchers.forEdition(edition).pageUrl(edition.date, page.id),
                 mapOf("Referer" to "https://epaper.dawn.com/")
             )
         }
     }
 
-    private fun collectOnDemandJangPageHotspots(edition: DawnEdition, page: DawnPage) {
-        val script = """
-            JSON.stringify(Array.from(document.querySelectorAll('area[href]')).flatMap(area => {
-                const href = area.getAttribute('href') || '';
-                const story = href.match(/\/detail\/(\d+)/i);
-                const onclick = area.getAttribute('onclick') || '';
-                const image = onclick.match(/window\.open\s*\(\s*['"]([^'"]+)['"]/i);
-                let type, targetId, imageUrl = null;
-                if (story) {
-                    type = 'TEXT';
-                    targetId = story[1];
-                } else if (image) {
-                    const path = image[1];
-                    const asset = path.match(/^pic\/([A-Za-z0-9_.-]+\.(?:jpe?g|png))(?:\?farman=1)?$/i);
-                    if (!asset) return [];
-                    type = 'IMAGE';
-                    imageUrl = path;
-                    targetId = 'J${edition.date}_I${page.id.takeLast(3)}_' + asset[1];
-                } else {
-                    return [];
-                }
-                const coordinates = (area.getAttribute('coords') || '')
-                    .split(/[;,]/).map(value => value.trim()).filter(Boolean)
-                    .map(Number).filter(Number.isFinite);
-                return [{targetId: targetId, type: type, imageUrl: imageUrl,
-                    coordinates: coordinates, label: area.alt || area.title || '',
-                    shape: area.shape || 'poly'}];
-            }))
-        """.trimIndent()
-        jangWebView.evaluateJavascript(script) { result ->
-            try {
-                if (onDemandPage != (edition to page)) return@evaluateJavascript
-                val json = JSONTokener(result).nextValue() as? String
-                    ?: throw IllegalStateException("Could not read Jang story areas on ${page.title}.")
-                val entries = org.json.JSONArray(json)
-                val hotspots = (0 until entries.length()).mapNotNull { index ->
-                    val entry = entries.getJSONObject(index)
-                    val coordinates = entry.getJSONArray("coordinates")
-                    if (coordinates.length() < 4) return@mapNotNull null
-                    DawnHotspot(
-                        page.id,
-                        entry.getString("targetId"),
-                        DawnHotspotType.valueOf(entry.getString("type")),
-                        entry.optString("label"),
-                        entry.optString("shape", "poly"),
-                        (0 until coordinates.length()).map { coordinates.getInt(it) },
-                        entry.optString("imageUrl").takeIf {
-                            it.isNotBlank() && it != "null"
-                        }
-                    )
-                }
-                val directory = editionDirectory(edition)
-                if (!directory.exists() && !directory.mkdirs()) {
-                    throw IllegalStateException("Could not save Jang's clickable areas.")
-                }
-                val metadata = File(directory, "edition.json")
-                val latest = if (metadata.isFile) DawnEdition.readMetadata(metadata) else edition
-                val updated = latest.copy(
-                    hotspots = latest.hotspots.filterNot { it.pageId == page.id } + hotspots,
-                    processedPageIds = (latest.processedPageIds + page.id).distinct(),
-                    jangImageAreasVersion = 1
-                )
-                updated.saveMetadata(directory)
-                availableEdition = updated
-                if (offlineEdition?.date == updated.date &&
-                    offlineEdition?.isJangEdition == updated.isJangEdition
-                ) offlineEdition = updated
-                if (readerMode && selectedDateKey() == updated.date &&
-                    pageNumber == page.id.takeLast(3).toIntOrNull()
-                ) prefetchPageStories(updated, page)
-                if (!viewingStoryContent) updateRenderedHotspots()
-                onDemandPage = null
-            } catch (error: Exception) {
-                onDemandPage = null
-                showMessage(error.message ?: "Could not read Jang story areas on ${page.title}.")
-            }
-        }
-    }
-
-    private fun prefetchPageStories(edition: DawnEdition, page: DawnPage) {
+    private fun prefetchPageStories(edition: NewspaperEdition, page: NewspaperPage) {
         if (edition.date != dateFormat.format(Calendar.getInstance().time)) return
         val directory = editionDirectory(edition)
         val pageHotspots = edition.hotspots.filter { it.pageId == page.id }
         if (pageHotspots.isEmpty()) return
 
-        pageHotspots.filter { it.type == DawnHotspotType.TEXT }
+        pageHotspots.filter { it.type == NewspaperHotspotType.TEXT }
             .map { it.targetId }
             .distinct()
             .filterNot { id ->
@@ -1404,7 +1309,7 @@ class MainActivity : Activity() {
         startNextTextStory()
 
         val missingImages = pageHotspots.asSequence()
-            .filter { it.type == DawnHotspotType.IMAGE }
+            .filter { it.type == NewspaperHotspotType.IMAGE }
             .map { it.targetId }
             .distinct()
             .filter { id ->
@@ -1422,7 +1327,7 @@ class MainActivity : Activity() {
                     runOnUiThread {
                         try {
                             val metadata = File(directory, "edition.json")
-                            val latest = if (metadata.isFile) DawnEdition.readMetadata(metadata) else edition
+                            val latest = if (metadata.isFile) NewspaperEdition.readMetadata(metadata) else edition
                             val updated = latest.copy(
                                 fullImageIds = (latest.fullImageIds + id).distinct()
                             )
@@ -1487,15 +1392,11 @@ class MainActivity : Activity() {
         val request = pendingTextStories.removeFirst()
         activeTextStory = request
         refreshDownloadIndicator()
-        val url = if (request.edition.isJangEdition) {
-            "https://e.jang.com.pk/detail/${request.id}"
-        } else {
-            "https://epaper.dawn.com/DetailImage.php?StoryImage=${request.id}"
-        }
+        val url = NewspaperFetchers.forEdition(request.edition).articleUrl(request.id)
         detailWebView.loadUrl(url)
     }
 
-    private fun saveStoryArticle(request: TextStoryRequest, article: DawnArticle) {
+    private fun saveStoryArticle(request: TextStoryRequest, article: NewspaperArticle) {
         val directory = request.directory
         try {
             if (editionInProgress?.date == request.edition.date &&
@@ -1506,7 +1407,7 @@ class MainActivity : Activity() {
                 return
             }
             val metadata = File(directory, "edition.json")
-            val latest = if (metadata.isFile) DawnEdition.readMetadata(metadata) else request.edition
+            val latest = if (metadata.isFile) NewspaperEdition.readMetadata(metadata) else request.edition
             val updated = latest.copy(
                 articles = latest.articles.filterNot { it.id == article.id } + article
             )
@@ -1517,7 +1418,7 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun updateEditionReferences(edition: DawnEdition) {
+    private fun updateEditionReferences(edition: NewspaperEdition) {
         if (offlineEdition?.date == edition.date &&
             offlineEdition?.isJangEdition == edition.isJangEdition
         ) offlineEdition = edition
@@ -1526,47 +1427,15 @@ class MainActivity : Activity() {
         ) availableEdition = edition
     }
 
-    private fun collectOnDemandPageHotspots(edition: DawnEdition, page: DawnPage) {
-        if (edition.isJangEdition) {
-            collectOnDemandJangPageHotspots(edition, page)
-            return
-        }
-        val script = """
-                JSON.stringify(Array.from(document.querySelectorAll('area[href]')).flatMap(area => {
-                    const href = area.getAttribute('href') || '';
-                    const text = href.match(/StoryText=([0-9_]+)/i);
-                    const image = href.match(/StoryImage=([0-9_]+)/i);
-                    const match = text || image;
-                    if (!match) return [];
-                    const coordinates = (area.getAttribute('coords') || '')
-                        .split(/[;,]/).map(value => value.trim()).filter(Boolean)
-                        .map(Number).filter(Number.isFinite);
-                    return [{targetId: match[1], type: text ? 'TEXT' : 'IMAGE',
-                        label: area.alt || area.title || '', shape: area.shape || 'rect',
-                        coordinates: coordinates}];
-                }))
-        """.trimIndent()
-        inspectionWebView.evaluateJavascript(script) { result ->
+    private fun collectOnDemandPageHotspots(edition: NewspaperEdition, page: NewspaperPage) {
+        val fetcher = NewspaperFetchers.forEdition(edition)
+        val source = if (edition.isJangEdition) jangWebView else inspectionWebView
+        source.evaluateJavascript(fetcher.hotspotExtractionScript(edition.date, page.id)) { result ->
             try {
                 if (onDemandPage != (edition to page)) return@evaluateJavascript
                 val json = JSONTokener(result).nextValue() as? String
                     ?: throw IllegalStateException("Could not read story areas from page ${page.id}.")
-                val entries = org.json.JSONArray(json)
-                val hotspots = (0 until entries.length()).mapNotNull { index ->
-                    val entry = entries.getJSONObject(index)
-                    val targetId = entry.getString("targetId")
-                    if (!targetId.startsWith("${edition.date}_")) return@mapNotNull null
-                    val coordinates = entry.getJSONArray("coordinates")
-                    if (coordinates.length() < 4) return@mapNotNull null
-                    DawnHotspot(
-                        page.id,
-                        targetId,
-                        DawnHotspotType.valueOf(entry.getString("type")),
-                        entry.optString("label"),
-                        entry.optString("shape", "rect"),
-                        (0 until coordinates.length()).map { coordinates.getInt(it) }
-                    )
-                }
+                val hotspots = fetcher.parseHotspots(json, edition, page)
                 val directory = editionDirectory(edition)
                 if (!directory.exists() && !directory.mkdirs()) {
                     onDemandPage = null
@@ -1575,11 +1444,13 @@ class MainActivity : Activity() {
                 }
                 val savedMetadata = File(directory, "edition.json")
                 val latest = if (savedMetadata.isFile) {
-                    DawnEdition.readMetadata(savedMetadata)
+                    NewspaperEdition.readMetadata(savedMetadata)
                 } else edition
                 val updated = latest.copy(
                     hotspots = latest.hotspots.filterNot { it.pageId == page.id } + hotspots,
-                    processedPageIds = (latest.processedPageIds + page.id).distinct()
+                    processedPageIds = (latest.processedPageIds + page.id).distinct(),
+                    jangImageAreasVersion = if (edition.isJangEdition) 1
+                    else latest.jangImageAreasVersion
                 )
                 updated.saveMetadata(directory)
                 availableEdition = updated
@@ -1598,7 +1469,7 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun downloadLinkedContent(edition: DawnEdition) {
+    private fun downloadLinkedContent(edition: NewspaperEdition) {
         val directory = activeEditionDirectory ?: run {
             failEditionDownload("Edition storage is unavailable.")
             return
@@ -1630,7 +1501,7 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun collectStoryText(edition: DawnEdition, id: String) {
+    private fun collectStoryText(edition: NewspaperEdition, id: String) {
         parseStoryText(inspectionWebView, id) { article ->
             if (editionInProgress !== edition) return@parseStoryText
             collectedArticles = collectedArticles.filterNot { it.id == id } + article
@@ -1640,7 +1511,7 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun parseStoryText(source: WebView, id: String, onArticle: (DawnArticle) -> Unit) {
+    private fun parseStoryText(source: WebView, id: String, onArticle: (NewspaperArticle) -> Unit) {
         val script = """
             (() => {
                 const article = Array.from(document.querySelectorAll('.px-4.font-merriweather > div'))
@@ -1663,7 +1534,7 @@ class MainActivity : Activity() {
                 val data = JSONObject(json)
                 if (data.has("error")) throw IllegalStateException(data.getString("error"))
                 val paragraphsJson = data.getJSONArray("paragraphs")
-                val article = DawnArticle(
+                val article = NewspaperArticle(
                     id,
                     data.getString("title"),
                     data.optString("byline"),
@@ -1708,7 +1579,7 @@ class MainActivity : Activity() {
         source: WebView,
         id: String,
         attempt: Int = 0,
-        onArticle: (DawnArticle) -> Unit
+        onArticle: (NewspaperArticle) -> Unit
     ) {
         val script = """
             (() => {
@@ -1759,7 +1630,7 @@ class MainActivity : Activity() {
                 val byline = listOf(data.optString("author"), data.optString("date"))
                     .filter { it.isNotBlank() }
                     .joinToString(" · ")
-                val article = DawnArticle(
+                val article = NewspaperArticle(
                     id,
                     data.getString("title"),
                     byline,
@@ -1793,7 +1664,7 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun completeEditionDownload(edition: DawnEdition) {
+    private fun completeEditionDownload(edition: NewspaperEdition) {
         try {
             val directory = activeEditionDirectory
                 ?: throw IllegalStateException("Edition storage is unavailable.")
@@ -1840,7 +1711,7 @@ class MainActivity : Activity() {
         updatePageLabel()
     }
 
-    private fun persistProgress(edition: DawnEdition) {
+    private fun persistProgress(edition: NewspaperEdition) {
         val directory = activeEditionDirectory ?: return
         val progress = edition.copy(
             fullImageIds = fullImageIds,
@@ -1873,7 +1744,7 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun maybeCompleteEdition(edition: DawnEdition) {
+    private fun maybeCompleteEdition(edition: NewspaperEdition) {
         if (editionInProgress !== edition || !storyScanComplete || pageDownloadsRemaining > 0) return
         val queueEmpty = synchronized(pageDownloadLock) {
             !pageDownloadWorkerRunning && pageDownloadQueue.isEmpty()
@@ -1888,10 +1759,10 @@ class MainActivity : Activity() {
 
     private fun selectedDateKey(): String = dateFormat.format(selectedDate.time)
 
-    private fun readerEdition(): DawnEdition? =
+    private fun readerEdition(): NewspaperEdition? =
         if (readerMode) offlineEdition ?: availableEdition else availableEdition
 
-    private fun openOfflinePage(edition: DawnEdition, page: DawnPage, directory: File) {
+    private fun openOfflinePage(edition: NewspaperEdition, page: NewspaperPage, directory: File) {
         if (!edition.hasPageImage(directory, page.id)) {
             showMessage("This page image is missing from the offline edition.")
             return
@@ -1931,8 +1802,8 @@ class MainActivity : Activity() {
     }
 
     private fun renderOfflinePage(
-        page: DawnPage,
-        hotspots: List<DawnHotspot>,
+        page: NewspaperPage,
+        hotspots: List<NewspaperHotspot>,
         directory: File
     ): String {
         val imageFileName = if (File(directory, "${page.id}.jpg").isFile) {
@@ -1941,7 +1812,7 @@ class MainActivity : Activity() {
             "${page.id}.png"
         }
         val areas = hotspots.joinToString("") { hotspot ->
-            val route = if (hotspot.type == DawnHotspotType.TEXT) "text" else "image"
+            val route = if (hotspot.type == NewspaperHotspotType.TEXT) "text" else "image"
             """<area shape="${htmlEscape(hotspot.shape)}" coords="${hotspot.coordinates.joinToString(",")}" href="https://offline.dawn/$route/${hotspot.targetId}" alt="${htmlEscape(hotspot.label)}" title="${htmlEscape(hotspot.label)}">"""
         }
         return """
@@ -1996,7 +1867,7 @@ class MainActivity : Activity() {
                 put(JSONObject().apply {
                     put("shape", hotspot.shape)
                     put("coordinates", org.json.JSONArray(hotspot.coordinates))
-                    put("route", if (hotspot.type == DawnHotspotType.TEXT) "text" else "image")
+                    put("route", if (hotspot.type == NewspaperHotspotType.TEXT) "text" else "image")
                     put("targetId", hotspot.targetId)
                     put("label", hotspot.label)
                 })
@@ -2045,10 +1916,10 @@ class MainActivity : Activity() {
                 viewingArticleImage = false
                 displayedArticleId = article.id
                 webView.loadDataWithBaseURL(
-                    if (edition.isJangEdition) "https://offline.jang/" else "https://offline.dawn/",
+                    NewspaperFetchers.forEdition(edition).offlineOrigin,
                     renderArticle(
                         article,
-                        if (edition.isJangEdition) NewspaperProvider.JANG else NewspaperProvider.DAWN
+                        NewspaperFetchers.forEdition(edition)
                     ),
                     "text/html",
                     "UTF-8",
@@ -2068,10 +1939,10 @@ class MainActivity : Activity() {
                 viewingArticleImage = false
                 displayedArticleId = article.id
                 webView.loadDataWithBaseURL(
-                    if (edition.isJangEdition) "https://offline.jang/" else "https://offline.dawn/",
+                    NewspaperFetchers.forEdition(edition).offlineOrigin,
                     renderArticle(
                         article,
-                        if (edition.isJangEdition) NewspaperProvider.JANG else NewspaperProvider.DAWN
+                        NewspaperFetchers.forEdition(edition)
                     ),
                     "text/html",
                     "UTF-8",
@@ -2079,10 +1950,10 @@ class MainActivity : Activity() {
                 )
             }
             "article-image" -> {
-                if (!NewspaperProvider.DAWN.supportsImageDetail ||
+                if (!NewspaperFetchers.forEdition(edition).supportsImageDetail ||
                     !DAWN_STORY_ID_PATTERN.matches(id) ||
                     edition.hotspots.none {
-                        it.targetId == id && it.type == DawnHotspotType.TEXT
+                        it.targetId == id && it.type == NewspaperHotspotType.TEXT
                     }
                 ) return
                 viewingStoryContent = true
@@ -2107,7 +1978,7 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun showJangArticleImage(article: DawnArticle, imageUrl: String, imageIndex: Int) {
+    private fun showJangArticleImage(article: NewspaperArticle, imageUrl: String, imageIndex: Int) {
         viewingStoryContent = true
         viewingArticleImage = true
         displayedArticleId = article.id
@@ -2131,7 +2002,7 @@ class MainActivity : Activity() {
         )
     }
 
-    private fun showOfflineImage(edition: DawnEdition, directory: File, id: String) {
+    private fun showOfflineImage(edition: NewspaperEdition, directory: File, id: String) {
         val sourcePage = edition.hotspots.firstOrNull { it.targetId == id }?.pageId
             ?: edition.pages.firstOrNull()?.id
             ?: return
@@ -2153,7 +2024,7 @@ class MainActivity : Activity() {
         webView.loadDataWithBaseURL(baseUrl, html, "text/html", "UTF-8", null)
     }
 
-    private fun showArticleImage(edition: DawnEdition, directory: File, id: String) {
+    private fun showArticleImage(edition: NewspaperEdition, directory: File, id: String) {
         val baseUrl = Uri.fromFile(directory).toString().trimEnd('/') + "/"
         viewingStoryContent = true
         viewingArticleImage = true
@@ -2172,7 +2043,7 @@ class MainActivity : Activity() {
         webView.loadDataWithBaseURL(baseUrl, html, "text/html", "UTF-8", null)
     }
 
-    private fun requestArticleImage(edition: DawnEdition, directory: File, id: String) {
+    private fun requestArticleImage(edition: NewspaperEdition, directory: File, id: String) {
         if (id in prefetchingImageIds) {
             pendingArticleImageIds.add(id)
             refreshDownloadIndicator()
@@ -2187,7 +2058,7 @@ class MainActivity : Activity() {
                 runOnUiThread {
                     try {
                         val metadata = File(directory, "edition.json")
-                        val latest = if (metadata.isFile) DawnEdition.readMetadata(metadata) else edition
+                        val latest = if (metadata.isFile) NewspaperEdition.readMetadata(metadata) else edition
                         val updated = latest.copy(
                             fullImageIds = (latest.fullImageIds + id).distinct()
                         )
@@ -2236,9 +2107,9 @@ class MainActivity : Activity() {
         )
     }
 
-    private fun requestStoryText(edition: DawnEdition, directory: File, id: String) {
+    private fun requestStoryText(edition: NewspaperEdition, directory: File, id: String) {
         if (edition.hotspots.none {
-                it.targetId == id && it.type == DawnHotspotType.TEXT
+                it.targetId == id && it.type == NewspaperHotspotType.TEXT
             }
         ) {
             showMessage("This text story is not listed in this edition.")
@@ -2260,9 +2131,9 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun requestStoryImage(edition: DawnEdition, directory: File, id: String) {
+    private fun requestStoryImage(edition: NewspaperEdition, directory: File, id: String) {
         if (edition.hotspots.none {
-                it.targetId == id && it.type == DawnHotspotType.IMAGE
+                it.targetId == id && it.type == NewspaperHotspotType.IMAGE
             }
         ) {
             showMessage("This image is not listed in this edition.")
@@ -2283,7 +2154,7 @@ class MainActivity : Activity() {
                 runOnUiThread {
                     try {
                         val metadata = File(directory, "edition.json")
-                        val latest = if (metadata.isFile) DawnEdition.readMetadata(metadata) else edition
+                        val latest = if (metadata.isFile) NewspaperEdition.readMetadata(metadata) else edition
                         val updated = latest.copy(
                             fullImageIds = (latest.fullImageIds + id).distinct()
                         )
@@ -2319,7 +2190,7 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun persistEdition(edition: DawnEdition, directory: File?) {
+    private fun persistEdition(edition: NewspaperEdition, directory: File?) {
         val targetDirectory = directory
             ?: throw IllegalStateException("Edition storage is unavailable.")
         val marker = File(targetDirectory, "complete")
@@ -2330,13 +2201,13 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun renderArticle(article: DawnArticle, newspaper: NewspaperProvider): String {
+    private fun renderArticle(article: NewspaperArticle, newspaper: NewspaperFetcher): String {
         val paragraphs = article.paragraphs.joinToString("") {
             "<p>${htmlEscape(it)}</p>"
         }
         val images = article.imageUrls.mapIndexed { index, imageUrl ->
             val image = """<img src="${htmlEscape(imageUrl)}" alt="" loading="lazy">"""
-            if (newspaper == NewspaperProvider.JANG) {
+            if (newspaper.id == NewspaperId.JANG_LAHORE) {
                 """<a href="https://offline.jang/article-image/${article.id}/$index">$image</a>"""
             } else {
                 image
@@ -2392,11 +2263,6 @@ class MainActivity : Activity() {
         dawnDownloadIndicator.visibility = if (downloading) View.VISIBLE else View.GONE
     }
 
-    private enum class NewspaperProvider(val supportsImageDetail: Boolean) {
-        DAWN(true),
-        JANG(false)
-    }
-
     private companion object {
         val DAWN_STORY_ID_PATTERN = Regex("\\d{2}_\\d{2}_\\d{4}_\\d{3}_\\d{3}")
     }
@@ -2436,10 +2302,9 @@ class MainActivity : Activity() {
                 val article = edition?.articles?.firstOrNull { it.id == displayedArticleId }
                 if (edition != null && directory != null && article != null) {
                     viewingArticleImage = false
-                    val newspaper =
-                        if (edition.isJangEdition) NewspaperProvider.JANG else NewspaperProvider.DAWN
+                    val newspaper = NewspaperFetchers.forEdition(edition)
                     webView.loadDataWithBaseURL(
-                        if (edition.isJangEdition) "https://offline.jang/" else "https://offline.dawn/",
+                        newspaper.offlineOrigin,
                         renderArticle(article, newspaper),
                         "text/html",
                         "UTF-8",
@@ -2460,15 +2325,15 @@ class MainActivity : Activity() {
 }
 
 private data class PageDownloadRequest(
-    val page: DawnPage,
+    val page: NewspaperPage,
     val directory: File,
-    val edition: DawnEdition,
+    val edition: NewspaperEdition,
     val priority: Int,
     val sequence: Long
 )
 
 private data class TextStoryRequest(
-    val edition: DawnEdition,
+    val edition: NewspaperEdition,
     val directory: File,
     val id: String
 )

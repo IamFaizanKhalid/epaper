@@ -35,11 +35,12 @@ class DailyEditionCheckJobService : JobService() {
     override fun onStartJob(params: JobParameters): Boolean {
         activeJob = params
         val today = DATE_FORMAT.format(Calendar.getInstance().time)
-        val directory = File(File(filesDir, "editions"), today)
+        val dawnFetcher = NewspaperFetchers[NewspaperId.DAWN]
+        val directory = dawnFetcher.editionDirectory(File(filesDir, "editions"), today)
         val completionMarker = File(directory, "complete")
         if (completionMarker.isFile) {
             try {
-                notifyEditionAvailable(DawnEdition.readMetadata(File(directory, "edition.json")))
+                notifyEditionAvailable(NewspaperEdition.readMetadata(File(directory, "edition.json")))
                 jobFinished(params, false)
                 return false
             } catch (error: Exception) {
@@ -72,7 +73,7 @@ class DailyEditionCheckJobService : JobService() {
                         return@evaluateJavascript
                     }
                     val edition = try {
-                        DawnEdition.fromJson(json)
+                        NewspaperEdition.fromJson(json)
                     } catch (error: Exception) {
                         Log.e(TAG, "Could not read the discovered Dawn edition.", error)
                         finish(params, retry = true)
@@ -81,7 +82,10 @@ class DailyEditionCheckJobService : JobService() {
                     notifyEditionAvailable(edition)
                     worker.execute {
                         try {
-                            val targetDirectory = File(File(filesDir, "editions"), edition.date)
+                            val targetDirectory = dawnFetcher.editionDirectory(
+                                File(filesDir, "editions"),
+                                edition.date
+                            )
                             edition.downloadPageImages(targetDirectory) { _, _ -> }
                             edition.saveMetadata(targetDirectory)
                             File(targetDirectory, "complete").writeText("ok", Charsets.UTF_8)
@@ -105,7 +109,7 @@ class DailyEditionCheckJobService : JobService() {
                 }
             }
         }
-        browser.loadUrl("https://epaper.dawn.com/?page=${today}_001")
+        browser.loadUrl(dawnFetcher.availabilityUrl(today))
         return true
     }
 
@@ -128,7 +132,7 @@ class DailyEditionCheckJobService : JobService() {
         }
     }
 
-    private fun notifyEditionAvailable(edition: DawnEdition) {
+    private fun notifyEditionAvailable(edition: NewspaperEdition) {
         createNotificationChannel()
         val preferences = getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
         val key = "notified_${edition.date}"

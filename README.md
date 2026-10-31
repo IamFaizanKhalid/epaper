@@ -18,6 +18,12 @@ A native Android reader for Dawn and Jang Lahore e-paper, designed with the Gala
 
 Downloaded editions live in the app's private storage. Dawn editions use `editions/<date>/`; Jang Lahore editions use `editions/jang/<date>/`. Each stores downloaded page images (Dawn JPEG; Jang JPEG or PNG) and `edition.json` for page metadata, clickable areas, and article text. Full-size images are stored under `images/`, including Jang page images opened from clickable areas. Jang article text preserves links to any images included on the story page.
 
+## Newspaper sources
+
+`NewspaperFetcher` keeps source-specific edition paths, availability/page/article URLs, page URL matching, hotspot extraction/parsing, offline origins, and image-detail capability in registered Dawn and Jang Lahore fetchers. Both sources use the shared `NewspaperEdition`, `NewspaperPage`, `NewspaperHotspot`, and `NewspaperArticle` models in `NewspaperEdition.kt`; there is intentionally no separate Jang edition model because an edition's page, story, and hotspot data has the same shared shape.
+
+The shared reader uses the registry for page/story loading and clickable-area processing. Edition metadata remains backward-compatible with previously saved JSON. Image downloading and metadata validation still include source-specific behavior in the shared edition model. Availability discovery and verification are still tailored to Dawn and Jang in `MainActivity`, and the periodic background job currently checks/downloads Dawn only. Adding another source therefore still requires integrating its availability flow, UI entry, and source-specific download/metadata behavior; those paths are not yet plug-in-only.
+
 ## Build
 
 Open this directory in Android Studio and sync the Gradle project, or run `gradle assembleDebug` with an Android SDK installed. The project targets Android 8.0 (API 26) and newer.
