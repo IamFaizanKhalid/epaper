@@ -9,7 +9,9 @@ A native Android reader for Dawn's official e-paper site, designed with the Gala
 - Opens Dawn on a separate reader screen showing the paper image and page selector/navigation controls, not the newspaper website.
 - Prefetches pages in front-page, back-page, editorial, then remaining-page order. Opening a page moves it ahead of queued downloads.
 - Makes stories tappable directly on the newspaper page. A tapped story opens its saved content or is fetched and saved on demand; no separate story buttons are shown.
-- Refreshes the current paper page as page images or hotspot metadata arrive. Download progress and storage mode are handled internally.
+- Keeps the current page and zoom position intact while new story hotspots arrive. Opening a page in today's edition starts prefetching its story text and full-size images; background activity is indicated by a spinner beside Dawn.
+- Makes the “Opening story…” dialog dismissible with Back, returning to the current paper page.
+- Download progress and storage mode are handled internally.
 - Notifies when today's Dawn is detected and starts downloading its pages. Previously unsaved historical editions download only the page the user opens, and saved edition metadata avoids another availability request.
 - Uses Dawn's website temporarily to check availability and extract page/story data; full website HTML is not archived.
 
