@@ -12,26 +12,75 @@ data class DawnPage(val id: String, val title: String) {
         get() = "$id.jpg"
 }
 
+enum class DawnHotspotType {
+    TEXT,
+    IMAGE
+}
+
+data class DawnHotspot(
+    val pageId: String,
+    val targetId: String,
+    val type: DawnHotspotType,
+    val label: String,
+    val shape: String,
+    val coordinates: List<Int>
+)
+
+data class DawnArticle(
+    val id: String,
+    val title: String,
+    val byline: String,
+    val paragraphs: List<String>
+)
+
 data class DawnEdition(
     val date: String,
     val latestDate: String,
     val pages: List<DawnPage>,
-    val storyIds: List<String> = emptyList()
+    val fullImageIds: List<String> = emptyList(),
+    val hotspots: List<DawnHotspot> = emptyList(),
+    val articles: List<DawnArticle> = emptyList()
 ) {
     fun downloadPageImages(directory: File, onProgress: (Int, Int) -> Unit) {
+        downloadImages(
+            directory,
+            pages.map { it.id },
+            "pages",
+            { id -> "$id.jpg" },
+            onProgress
+        )
+    }
+
+    fun downloadFullImages(directory: File, ids: List<String>, onProgress: (Int, Int) -> Unit) {
+        downloadImages(
+            File(directory, "images"),
+            ids,
+            "stories",
+            { id -> "$id.jpg" },
+            onProgress
+        )
+    }
+
+    private fun downloadImages(
+        directory: File,
+        ids: List<String>,
+        remoteSection: String,
+        fileName: (String) -> String,
+        onProgress: (Int, Int) -> Unit
+    ) {
         if (!directory.exists() && !directory.mkdirs()) {
-            throw IllegalStateException("Could not create the edition storage folder.")
+            throw IllegalStateException("Could not create image storage.")
         }
-        pages.forEachIndexed { index, page ->
-            val destination = File(directory, page.imageFileName)
+        ids.forEachIndexed { index, id ->
+            val destination = File(directory, fileName(id))
             if (!destination.isJpeg()) {
-                downloadJpeg(page.id, destination)
+                downloadJpeg(id, remoteSection, destination)
             }
-            onProgress(index + 1, pages.size)
+            onProgress(index + 1, ids.size)
         }
     }
 
-    fun saveMetadata(directory: File, storyIds: List<String>) {
+    fun saveMetadata(directory: File) {
         val metadata = JSONObject().apply {
             put("date", date)
             put("latestDate", latestDate)
@@ -43,8 +92,30 @@ data class DawnEdition(
                     })
                 }
             })
-            put("storyIds", JSONArray().apply {
-                storyIds.forEach { put(it) }
+            put("fullImageIds", JSONArray().apply {
+                fullImageIds.forEach(::put)
+            })
+            put("hotspots", JSONArray().apply {
+                hotspots.forEach { hotspot ->
+                    put(JSONObject().apply {
+                        put("pageId", hotspot.pageId)
+                        put("targetId", hotspot.targetId)
+                        put("type", hotspot.type.name)
+                        put("label", hotspot.label)
+                        put("shape", hotspot.shape)
+                        put("coordinates", JSONArray(hotspot.coordinates))
+                    })
+                }
+            })
+            put("articles", JSONArray().apply {
+                articles.forEach { article ->
+                    put(JSONObject().apply {
+                        put("id", article.id)
+                        put("title", article.title)
+                        put("byline", article.byline)
+                        put("paragraphs", JSONArray(article.paragraphs))
+                    })
+                }
             })
         }
         val temporaryMetadata = File(directory, "edition.json.tmp")
@@ -58,32 +129,37 @@ data class DawnEdition(
         }
     }
 
-    fun removeLegacyStoryImages(directory: File, storyIds: List<String>) {
-        val storiesDirectory = File(directory, "stories")
-        storyIds.forEach { id ->
-            require(STORY_PATTERN.matches(id) && id.startsWith("${date}_")) {
-                "Invalid Dawn story ID."
+    fun removeLegacyArchives(directory: File) {
+        directory.listFiles()
+            ?.filter { it.isFile && it.extension == "mht" }
+            ?.forEach { archive ->
+                if (!archive.delete()) {
+                    throw IllegalStateException("Could not remove the old archive ${archive.name}.")
+                }
             }
-            val image = File(storiesDirectory, "$id.jpg")
-            if (image.exists() && !image.delete()) {
-                throw IllegalStateException("Could not remove the old story image for $id.")
+        val oldStoryImages = File(directory, "stories")
+        if (oldStoryImages.isDirectory) {
+            oldStoryImages.listFiles()
+                ?.filter { it.isFile && it.extension == "jpg" }
+                ?.forEach { image ->
+                    if (!image.delete()) {
+                        throw IllegalStateException("Could not remove the old story image ${image.name}.")
+                    }
+                }
+            if (oldStoryImages.list()?.isEmpty() == true && !oldStoryImages.delete()) {
+                throw IllegalStateException("Could not remove the old story image folder.")
             }
-        }
-        if (storiesDirectory.isDirectory &&
-            storiesDirectory.list()?.isEmpty() == true &&
-            !storiesDirectory.delete()
-        ) {
-            throw IllegalStateException("Could not remove the empty story image folder.")
         }
     }
 
-    private fun downloadJpeg(id: String, destination: File) {
+    private fun downloadJpeg(id: String, remoteSection: String, destination: File) {
         val parts = id.split('_')
-        require(PAGE_PATTERN.matches(id) && parts.take(3).joinToString("_") == date) {
-            "Invalid Dawn page ID."
-        }
+        require(
+            (PAGE_PATTERN.matches(id) || STORY_PATTERN.matches(id)) &&
+                parts.take(3).joinToString("_") == date
+        ) { "Invalid Dawn image ID." }
         val url = URL(
-            "https://e.dawn.com/${parts[2]}/${parts[1]}/${parts[0]}/pages/$id.jpg"
+            "https://e.dawn.com/${parts[2]}/${parts[1]}/${parts[0]}/$remoteSection/$id.jpg"
         )
         val temporaryImage = File(destination.parentFile, "$id.jpg.tmp")
         val connection = (url.openConnection() as HttpURLConnection).apply {
@@ -151,35 +227,67 @@ data class DawnEdition(
             require(DATE_PATTERN.matches(date) && DATE_PATTERN.matches(latestDate)) {
                 "Dawn returned an invalid edition date."
             }
-            val pageArray = data.getJSONArray("pages")
-            val pages = ArrayList<DawnPage>(pageArray.length())
-            val seenIds = HashSet<String>()
-            for (index in 0 until pageArray.length()) {
-                val item = pageArray.getJSONObject(index)
+            val pages = data.getJSONArray("pages").objects().map { item ->
                 val id = item.getString("id")
                 require(PAGE_PATTERN.matches(id) && id.startsWith("${date}_")) {
                     "Dawn returned an invalid page ID."
                 }
-                if (seenIds.add(id)) {
-                    pages.add(DawnPage(id, item.optString("title").ifBlank { "Page ${id.takeLast(3)}" }))
-                }
-            }
+                DawnPage(id, item.optString("title").ifBlank { "Page ${id.takeLast(3)}" })
+            }.distinctBy { it.id }
             require(pages.isNotEmpty()) { "No pages were listed for this edition." }
 
-            val storyIds = ArrayList<String>()
-            val storyArray = data.optJSONArray("storyIds") ?: JSONArray()
-            for (index in 0 until storyArray.length()) {
-                val id = storyArray.optString(index)
+            val hotspots = data.optJSONArray("hotspots")?.objects()?.map { item ->
+                val pageId = item.getString("pageId")
+                val targetId = item.getString("targetId")
+                require(PAGE_PATTERN.matches(pageId) && pageId.startsWith("${date}_")) {
+                    "Dawn returned an invalid hotspot page ID."
+                }
+                require(STORY_PATTERN.matches(targetId) && targetId.startsWith("${date}_")) {
+                    "Dawn returned an invalid hotspot target ID."
+                }
+                val type = DawnHotspotType.valueOf(item.getString("type"))
+                val coordinates = item.getJSONArray("coordinates").ints()
+                require(coordinates.size >= 4) { "Dawn returned invalid hotspot coordinates." }
+                DawnHotspot(
+                    pageId,
+                    targetId,
+                    type,
+                    item.optString("label"),
+                    item.optString("shape", "rect"),
+                    coordinates
+                )
+            }.orEmpty()
+
+            val fullImageIds = data.optJSONArray("fullImageIds")?.strings().orEmpty()
+            require(fullImageIds.all { STORY_PATTERN.matches(it) && it.startsWith("${date}_") }) {
+                "Dawn returned an invalid image ID."
+            }
+            val articles = data.optJSONArray("articles")?.objects()?.map { item ->
+                val id = item.getString("id")
                 require(STORY_PATTERN.matches(id) && id.startsWith("${date}_")) {
                     "Dawn returned an invalid story ID."
                 }
-                if (id !in storyIds) storyIds.add(id)
-            }
-            return DawnEdition(date, latestDate, pages, storyIds)
+                DawnArticle(
+                    id,
+                    item.getString("title"),
+                    item.optString("byline"),
+                    item.getJSONArray("paragraphs").strings()
+                )
+            }.orEmpty()
+            return DawnEdition(date, latestDate, pages, fullImageIds.distinct(), hotspots, articles)
         }
 
         fun readMetadata(file: File): DawnEdition =
             fromJson(file.readText(Charsets.UTF_8))
+
+        private fun JSONArray.objects(): List<JSONObject> =
+            (0 until length()).map { getJSONObject(it) }
+
+        private fun JSONArray.strings(): List<String> =
+            (0 until length()).map { getString(it) }
+
+        private fun JSONArray.ints(): List<Int> =
+            (0 until length()).map { getInt(it) }
 
         private fun File.isJpeg(): Boolean =
             isFile && length() > 2 && inputStream().use {

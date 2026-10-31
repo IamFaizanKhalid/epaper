@@ -27,20 +27,23 @@ import java.util.concurrent.Executors
 class MainActivity : Activity() {
     private lateinit var webView: WebView
     private lateinit var pageLabel: TextView
-    private lateinit var saveButton: Button
     private lateinit var downloadButton: Button
     private val downloadExecutor = Executors.newSingleThreadExecutor()
     private val readerButtons = mutableListOf<Button>()
     private var selectedDate = Calendar.getInstance()
     private var pageNumber = 1
-    private var isOfflineFile = false
     private var editionInProgress: DawnEdition? = null
-    private var editionArchiveDirectory: File? = null
-    private var editionArchiveIndex = 0
-    private var editionStoryIds: List<String> = emptyList()
-    private var storyArchiveIndex = 0
+    private var activeEditionDirectory: File? = null
+    private var editionPageIndex = 0
+    private var textStoryIds: List<String> = emptyList()
+    private var fullImageIds: List<String> = emptyList()
+    private var collectedHotspots: List<DawnHotspot> = emptyList()
+    private var collectedArticles: List<DawnArticle> = emptyList()
+    private var storyIndex = 0
     private var archivingStories = false
-    private var archivedPageId: String? = null
+    private var processingContentId: String? = null
+    private var offlineEdition: DawnEdition? = null
+    private var offlineDirectory: File? = null
     private var latestEditionStatus: String? = null
     private var checkedEditionDate: String? = null
     private val dateFormat = SimpleDateFormat("dd_MM_yyyy", Locale.US)
@@ -89,9 +92,6 @@ class MainActivity : Activity() {
             pageNumber++
             loadPage()
         })
-        saveButton = button("Save page offline") { saveCurrentPage() }
-        controls.addView(saveButton)
-        controls.addView(button("Saved pages") { showSavedPages() })
 
         val controlsScroll = HorizontalScrollView(this).apply {
             isHorizontalScrollBarEnabled = false
@@ -144,20 +144,43 @@ class MainActivity : Activity() {
                         ): Boolean {
                             val uri = request.url
                             if (uri.host != "epaper.dawn.com" ||
-                                uri.path !in setOf("/DetailNews.php", "/DetailImage.php")
+                                uri.path !in setOf(
+                                    "/DetailNews.php",
+                                    "/DetailImage.php",
+                                    "/Advt.php"
+                                )
                             ) return false
                             val storyId = uri.getQueryParameter("StoryText")
                                 ?: uri.getQueryParameter("StoryImage")
                                 ?: return false
                             val parts = storyId.split('_')
                             if (parts.size != 5) return false
-                            val offlineArticle = File(
-                                File(File(filesDir, "editions"), parts.take(3).joinToString("_")),
-                                "story_$storyId.mht"
+                            val editionDirectory = File(
+                                File(filesDir, "editions"),
+                                parts.take(3).joinToString("_")
                             )
-                            if (!offlineArticle.isFile) return false
-                            view.loadUrl(Uri.fromFile(offlineArticle).toString())
-                            return true
+                            val metadata = File(editionDirectory, "edition.json")
+                            if (!metadata.isFile) return false
+                            val edition = DawnEdition.readMetadata(metadata)
+                            val article = edition.articles.firstOrNull { it.id == storyId }
+                            if (uri.path == "/DetailImage.php" && article != null) {
+                                view.loadDataWithBaseURL(
+                                    "https://offline.dawn/",
+                                    renderArticle(article),
+                                    "text/html",
+                                    "UTF-8",
+                                    null
+                                )
+                                return true
+                            }
+                            val image = File(File(editionDirectory, "images"), "$storyId.jpg")
+                            if (uri.path in setOf("/DetailNews.php", "/Advt.php") &&
+                                storyId in edition.fullImageIds && image.isFile
+                            ) {
+                                view.loadUrl(Uri.fromFile(image).toString())
+                                return true
+                            }
+                            return false
                         }
                     }
                     dialog.setOnDismissListener { popup.destroy() }
@@ -177,42 +200,52 @@ class MainActivity : Activity() {
                     view: WebView,
                     request: WebResourceRequest
                 ): Boolean {
+                    if (request.url.host == "offline.dawn") {
+                        openOfflineTarget(request.url)
+                        return true
+                    }
                     syncPageFromUrl(request.url)
                     return false
                 }
 
                 override fun onPageFinished(view: WebView, url: String) {
-                    isOfflineFile = Uri.parse(url).scheme == "file"
                     val uri = Uri.parse(url)
                     val activeEdition = editionInProgress
-                    saveButton.isEnabled = !isOfflineFile && activeEdition == null
-                    if ((uri.host == "epaper.dawn.com" || uri.host == "e.dawn.com") &&
-                        activeEdition != null
+                    if (activeEdition != null && uri.host == "e.dawn.com" &&
+                        !archivingStories
                     ) {
-                        val expectedId = if (archivingStories) {
-                            editionStoryIds.getOrNull(storyArchiveIndex)
-                        } else {
-                            activeEdition.pages.getOrNull(editionArchiveIndex)?.id
-                        }
-                        val currentId = if (archivingStories) {
-                            uri.getQueryParameter("StoryImage")
-                        } else if (uri.host == "e.dawn.com") {
-                            uri.lastPathSegment?.removeSuffix(".html")
-                        } else {
-                            uri.getQueryParameter("page")
-                        }
-                        if (expectedId != null && currentId == expectedId &&
-                            archivedPageId != expectedId
+                        val page = activeEdition.pages.getOrNull(editionPageIndex)
+                        val currentId = uri.lastPathSegment?.removeSuffix(".html")
+                        if (page != null && currentId == page.id &&
+                            processingContentId != page.id
                         ) {
-                            archivedPageId = expectedId
+                            processingContentId = page.id
                             view.postDelayed({
                                 if (editionInProgress === activeEdition) {
-                                    archiveCurrentPage(activeEdition, expectedId, archivingStories)
+                                    collectPageHotspots(activeEdition, page)
                                 }
-                            }, 1_000)
+                            }, 250)
                         }
                         return
                     }
+                    if (activeEdition != null && archivingStories &&
+                        uri.host == "epaper.dawn.com"
+                    ) {
+                        val storyId = textStoryIds.getOrNull(storyIndex)
+                        if (storyId != null && uri.path == "/DetailImage.php" &&
+                            uri.getQueryParameter("StoryImage") == storyId &&
+                            processingContentId != storyId
+                        ) {
+                            processingContentId = storyId
+                            view.postDelayed({
+                                if (editionInProgress === activeEdition) {
+                                    collectStoryText(storyId)
+                                }
+                            }, 250)
+                        }
+                        return
+                    }
+                    if (activeEdition != null && archivingStories) return
                     if (uri.host == "epaper.dawn.com") {
                         downloadButton.isEnabled = true
                         val requestedDate = dateFormat.format(selectedDate.time)
@@ -246,8 +279,6 @@ class MainActivity : Activity() {
     }
 
     private fun loadPage() {
-        isOfflineFile = false
-        saveButton.isEnabled = false
         downloadButton.isEnabled = false
         updatePageLabel()
         val date = dateFormat.format(selectedDate.time)
@@ -344,44 +375,39 @@ class MainActivity : Activity() {
             pageNumber = 1
         }
 
-        val liveStatus = if (edition.latestDate == today) {
+        latestEditionStatus = if (edition.latestDate == today) {
             "Today's paper is live"
         } else {
             "Today's paper is not live · latest ${edition.latestDate.replace('_', '-')}"
         }
-        latestEditionStatus = liveStatus
-        pageLabel.text = "$liveStatus · ${edition.pages.size} pages found"
+        pageLabel.text = "${latestEditionStatus} · ${edition.pages.size} pages"
         downloadButton.isEnabled = false
         setReaderControlsEnabled(false)
-        showMessage("Downloading ${edition.pages.size} Dawn pages…")
+        showMessage("Downloading ${edition.pages.size} Dawn page images…")
 
         val directory = File(File(filesDir, "editions"), edition.date)
         downloadExecutor.execute {
             try {
                 edition.downloadPageImages(directory) { completed, total ->
                     runOnUiThread {
-                        pageLabel.text =
-                            "Downloading ${edition.date.replace('_', '-')} · $completed/$total pages"
+                        pageLabel.text = "Downloading page images · $completed/$total"
                     }
                 }
                 runOnUiThread {
                     editionInProgress = edition
-                    editionArchiveDirectory = directory
-                    editionArchiveIndex = 0
-                    editionStoryIds = emptyList()
-                    storyArchiveIndex = 0
+                    activeEditionDirectory = directory
+                    editionPageIndex = 0
+                    textStoryIds = emptyList()
+                    fullImageIds = emptyList()
+                    collectedHotspots = emptyList()
+                    collectedArticles = emptyList()
+                    storyIndex = 0
                     archivingStories = false
-                    archivedPageId = null
-                    pageLabel.text = "Saving Dawn page links · 0/${edition.pages.size}"
+                    processingContentId = null
                     loadNextEditionPage()
                 }
             } catch (error: Exception) {
-                runOnUiThread {
-                    downloadButton.isEnabled = true
-                    setReaderControlsEnabled(true)
-                    pageLabel.text = "Download incomplete · ${edition.date.replace('_', '-')}"
-                    showMessage(error.message ?: "Could not download the full edition.")
-                }
+                runOnUiThread { failEditionDownload(error.message ?: "Could not download Dawn's page images.") }
             }
         }
     }
@@ -389,23 +415,24 @@ class MainActivity : Activity() {
     private fun loadNextEditionPage() {
         val edition = editionInProgress ?: return
         if (archivingStories) {
-            val storyId = editionStoryIds.getOrNull(storyArchiveIndex)
+            val storyId = textStoryIds.getOrNull(storyIndex)
             if (storyId == null) {
                 completeEditionDownload(edition)
                 return
             }
-            pageLabel.text = "Saving story text · ${storyArchiveIndex + 1}/${editionStoryIds.size}"
+            pageLabel.text = "Saving story text · ${storyIndex + 1}/${textStoryIds.size}"
+            processingContentId = null
             webView.loadUrl("https://epaper.dawn.com/DetailImage.php?StoryImage=$storyId")
             return
         }
 
-        val page = edition.pages.getOrNull(editionArchiveIndex)
+        val page = edition.pages.getOrNull(editionPageIndex)
         if (page == null) {
-            downloadLinkedStories(edition)
+            downloadLinkedContent(edition)
             return
         }
-        pageLabel.text =
-            "Saving Dawn page links · ${editionArchiveIndex + 1}/${edition.pages.size}"
+        pageLabel.text = "Reading page links · ${editionPageIndex + 1}/${edition.pages.size}"
+        processingContentId = null
         val parts = edition.date.split('_')
         webView.loadUrl(
             "https://e.dawn.com/${parts[2]}/${parts[1]}/${parts[0]}/pages/${page.id}.html",
@@ -413,95 +440,143 @@ class MainActivity : Activity() {
         )
     }
 
-    private fun archiveCurrentPage(edition: DawnEdition, id: String, isStory: Boolean) {
-        val directory = editionArchiveDirectory ?: run {
-            failEditionDownload("Edition storage is unavailable.")
-            return
-        }
-        val archiveName = if (isStory) "story_$id.mht" else "$id.mht"
-        val archive = File(directory, archiveName)
-        webView.evaluateJavascript("document.title") { titleResult ->
-            val title = try {
-                JSONTokener(titleResult).nextValue() as? String
-            } catch (_: Exception) {
-                null
-            }
-            if (title?.contains("Dawn-ePaper", ignoreCase = true) != true &&
-                title?.contains("DAWN ePaper", ignoreCase = true) != true
-            ) {
-                failEditionDownload("Dawn did not load content $id; check the connection and try again.")
-                return@evaluateJavascript
-            }
-            val saveArchive = {
-                webView.saveWebArchive(archive.absolutePath, false) { savedPath ->
-                    runOnUiThread {
-                        if (editionInProgress !== edition) return@runOnUiThread
-                        if (savedPath == null || !archive.isFile || archive.length() == 0L) {
-                            failEditionDownload("Could not save Dawn content $id for offline reading.")
-                            return@runOnUiThread
+    private fun collectPageHotspots(edition: DawnEdition, page: DawnPage) {
+        val script = """
+            JSON.stringify(Array.from(document.querySelectorAll('area[href]')).flatMap(area => {
+                const href = area.getAttribute('href') || '';
+                const text = href.match(/StoryText=([0-9_]+)/i);
+                const image = href.match(/StoryImage=([0-9_]+)/i);
+                const match = text || image;
+                if (!match) return [];
+                const coordinates = (area.getAttribute('coords') || '')
+                    .split(/[;,]/).map(value => value.trim()).filter(Boolean)
+                    .map(Number).filter(Number.isFinite);
+                return [{targetId: match[1], type: text ? 'TEXT' : 'IMAGE',
+                    label: area.alt || area.title || '', shape: area.shape || 'rect',
+                    coordinates: coordinates}];
+            }))
+        """.trimIndent()
+        webView.evaluateJavascript(script) { result ->
+            try {
+                val json = JSONTokener(result).nextValue() as? String
+                    ?: throw IllegalStateException("Could not read story areas from page ${page.id}.")
+                val entries = org.json.JSONArray(json)
+                for (index in 0 until entries.length()) {
+                    val entry = entries.getJSONObject(index)
+                    val targetId = entry.getString("targetId")
+                    if (!targetId.startsWith("${edition.date}_")) continue
+                    val type = DawnHotspotType.valueOf(entry.getString("type"))
+                    val coordinates = entry.getJSONArray("coordinates")
+                    if (coordinates.length() < 4) continue
+                    val hotspot = DawnHotspot(
+                        page.id,
+                        targetId,
+                        type,
+                        entry.optString("label"),
+                        entry.optString("shape", "rect"),
+                        (0 until coordinates.length()).map { coordinates.getInt(it) }
+                    )
+                    if (collectedHotspots.none {
+                            it.pageId == hotspot.pageId && it.targetId == hotspot.targetId
                         }
-                        if (isStory) storyArchiveIndex++ else editionArchiveIndex++
-                        archivedPageId = null
-                        loadNextEditionPage()
+                    ) {
+                        collectedHotspots = collectedHotspots + hotspot
+                        when (type) {
+                            DawnHotspotType.TEXT ->
+                                if (targetId !in textStoryIds) textStoryIds = textStoryIds + targetId
+                            DawnHotspotType.IMAGE ->
+                                if (targetId !in fullImageIds) fullImageIds = fullImageIds + targetId
+                        }
                     }
                 }
-            }
-            if (isStory) {
-                saveArchive()
-            } else {
-                val script = """
-                    JSON.stringify(Array.from(document.querySelectorAll('area[href]'))
-                        .map(area => (area.getAttribute('href') || '').match(/StoryText=([0-9_]+)/i))
-                        .filter(match => match && /^\d{2}_\d{2}_\d{4}_\d{3}_\d{3}$/.test(match[1]))
-                        .map(match => match[1]))
-                """.trimIndent()
-                webView.evaluateJavascript(script) { result ->
-                    try {
-                        val json = JSONTokener(result).nextValue() as? String
-                            ?: throw IllegalStateException("Could not read Dawn's story links for page $id.")
-                        val stories = org.json.JSONArray(json)
-                        for (index in 0 until stories.length()) {
-                            val storyId = stories.getString(index)
-                            if (storyId.startsWith("${edition.date}_") && storyId !in editionStoryIds) {
-                                editionStoryIds = editionStoryIds + storyId
-                            }
-                        }
-                        saveArchive()
-                    } catch (error: Exception) {
-                        failEditionDownload(error.message ?: "Could not read story links for page $id.")
-                    }
-                }
+                editionPageIndex++
+                loadNextEditionPage()
+            } catch (error: Exception) {
+                failEditionDownload(error.message ?: "Could not read clickable areas on ${page.id}.")
             }
         }
     }
 
-    private fun downloadLinkedStories(edition: DawnEdition) {
-        if (editionArchiveDirectory == null) {
+    private fun downloadLinkedContent(edition: DawnEdition) {
+        val directory = activeEditionDirectory ?: run {
             failEditionDownload("Edition storage is unavailable.")
             return
         }
-        archivingStories = editionStoryIds.isNotEmpty()
-        storyArchiveIndex = 0
-        archivedPageId = null
-        if (archivingStories) loadNextEditionPage() else completeEditionDownload(edition)
+        downloadExecutor.execute {
+            try {
+                edition.downloadFullImages(directory, fullImageIds) { completed, total ->
+                    runOnUiThread { pageLabel.text = "Downloading full-size images · $completed/$total" }
+                }
+                runOnUiThread {
+                    archivingStories = textStoryIds.isNotEmpty()
+                    storyIndex = 0
+                    if (archivingStories) loadNextEditionPage() else completeEditionDownload(edition)
+                }
+            } catch (error: Exception) {
+                runOnUiThread { failEditionDownload(error.message ?: "Could not download full-size images.") }
+            }
+        }
+    }
+
+    private fun collectStoryText(id: String) {
+        val script = """
+            (() => {
+                const article = Array.from(document.querySelectorAll('.px-4.font-merriweather > div'))
+                    .find(element => element.querySelector('h2') &&
+                        element.querySelector('.overflow-hidden'));
+                if (!article) return JSON.stringify({error: 'Could not find the text for story $id.'});
+                const title = article.querySelector('h2')?.innerText.trim() || '';
+                const byline = article.querySelector(':scope > .my-3')?.innerText.trim() || '';
+                const body = article.querySelector(':scope > .overflow-hidden');
+                const paragraphs = Array.from(body.querySelectorAll('p'))
+                    .map(paragraph => paragraph.innerText.trim()).filter(Boolean);
+                if (!paragraphs.length && body.innerText.trim()) paragraphs.push(body.innerText.trim());
+                return JSON.stringify({id: '$id', title: title, byline: byline, paragraphs: paragraphs});
+            })()
+        """.trimIndent()
+        webView.evaluateJavascript(script) { result ->
+            try {
+                val json = JSONTokener(result).nextValue() as? String
+                    ?: throw IllegalStateException("Could not read Dawn's text for story $id.")
+                val data = JSONObject(json)
+                if (data.has("error")) throw IllegalStateException(data.getString("error"))
+                val paragraphsJson = data.getJSONArray("paragraphs")
+                val article = DawnArticle(
+                    id,
+                    data.getString("title"),
+                    data.optString("byline"),
+                    (0 until paragraphsJson.length()).map { paragraphsJson.getString(it) }
+                )
+                if (article.title.isBlank() || article.paragraphs.isEmpty()) {
+                    throw IllegalStateException("Dawn returned empty text for story $id.")
+                }
+                collectedArticles = collectedArticles.filterNot { it.id == id } + article
+                storyIndex++
+                loadNextEditionPage()
+            } catch (error: Exception) {
+                failEditionDownload(error.message ?: "Could not save Dawn story text.")
+            }
+        }
     }
 
     private fun completeEditionDownload(edition: DawnEdition) {
         try {
-            val directory = editionArchiveDirectory
+            val directory = activeEditionDirectory
                 ?: throw IllegalStateException("Edition storage is unavailable.")
-            edition.removeLegacyStoryImages(directory, editionStoryIds)
-            edition.saveMetadata(
-                directory,
-                editionStoryIds
+            val savedEdition = edition.copy(
+                fullImageIds = fullImageIds,
+                hotspots = collectedHotspots,
+                articles = collectedArticles
             )
+            savedEdition.removeLegacyArchives(directory)
+            savedEdition.saveMetadata(directory)
             editionInProgress = null
-            editionArchiveDirectory = null
+            activeEditionDirectory = null
             archivingStories = false
             setReaderControlsEnabled(true)
             pageLabel.text =
-                "Offline edition ready · ${edition.pages.size} pages · ${editionStoryIds.size} stories"
-            showMessage("Saved pages, clickable links, and ${editionStoryIds.size} text stories for offline reading.")
+                "Offline edition ready · ${edition.pages.size} pages · ${collectedArticles.size} texts · ${fullImageIds.size} images"
+            showMessage("Saved page images, clickable areas, full-size images, and text stories.")
             pageNumber = 1
             loadPage()
         } catch (error: Exception) {
@@ -511,7 +586,7 @@ class MainActivity : Activity() {
 
     private fun failEditionDownload(message: String) {
         editionInProgress = null
-        editionArchiveDirectory = null
+        activeEditionDirectory = null
         archivingStories = false
         setReaderControlsEnabled(true)
         showMessage(message)
@@ -543,7 +618,6 @@ class MainActivity : Activity() {
             showMessage("No complete editions have been downloaded yet.")
             return
         }
-
         AlertDialog.Builder(this)
             .setTitle("Offline editions")
             .setItems(editions.map { it.first.date.replace('_', '-') }.toTypedArray()) { _, index ->
@@ -557,92 +631,137 @@ class MainActivity : Activity() {
         AlertDialog.Builder(this)
             .setTitle("Pages · ${edition.date.replace('_', '-')}")
             .setItems(edition.pages.map { "${it.id.takeLast(3)} · ${it.title}" }.toTypedArray()) { _, index ->
-                val page = edition.pages[index]
-                val image = File(directory, page.imageFileName)
-                val webArchive = File(directory, "${page.id}.mht")
-                val offlineFile = if (webArchive.isFile) webArchive else image
-                if (!offlineFile.isFile) {
-                    showMessage("This page is missing from the offline edition.")
-                    return@setItems
-                }
-                val parsedDate = dateFormat.parse(edition.date)
-                if (parsedDate != null) selectedDate.time = parsedDate
-                pageNumber = page.id.takeLast(3).toInt()
-                isOfflineFile = true
-                saveButton.isEnabled = false
-                updatePageLabel("Offline · ${page.title}")
-                webView.loadUrl(Uri.fromFile(offlineFile).toString())
+                openOfflinePage(edition, edition.pages[index], directory)
             }
-            .setNeutralButton("Text stories") { _, _ -> showOfflineStories(edition, directory) }
+            .setNeutralButton("Images") { _, _ -> showOfflineImages(edition, directory) }
+            .setPositiveButton("Text stories") { _, _ -> showOfflineStories(edition, directory) }
+            .setNegativeButton("Close", null)
+            .show()
+    }
+
+    private fun openOfflinePage(edition: DawnEdition, page: DawnPage, directory: File) {
+        if (!File(directory, page.imageFileName).isFile) {
+            showMessage("This page image is missing from the offline edition.")
+            return
+        }
+        offlineEdition = edition
+        offlineDirectory = directory
+        selectedDate.time = dateFormat.parse(edition.date) ?: selectedDate.time
+        pageNumber = page.id.takeLast(3).toInt()
+        updatePageLabel("Offline · ${page.title}")
+        val pageHotspots = edition.hotspots.filter { it.pageId == page.id }
+        val html = renderOfflinePage(page, pageHotspots)
+        webView.loadDataWithBaseURL(
+            Uri.fromFile(directory).toString().trimEnd('/') + "/",
+            html,
+            "text/html",
+            "UTF-8",
+            null
+        )
+    }
+
+    private fun renderOfflinePage(page: DawnPage, hotspots: List<DawnHotspot>): String {
+        val areas = hotspots.joinToString("") { hotspot ->
+            val route = if (hotspot.type == DawnHotspotType.TEXT) "text" else "image"
+            """<area shape="${htmlEscape(hotspot.shape)}" coords="${hotspot.coordinates.joinToString(",")}" href="https://offline.dawn/$route/${hotspot.targetId}" alt="${htmlEscape(hotspot.label)}" title="${htmlEscape(hotspot.label)}">"""
+        }
+        return """
+            <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+            <style>body{margin:0;background:#222;text-align:center}img{display:block;width:100%;height:auto;margin:auto}</style>
+            </head><body><img id="page" src="${page.imageFileName}" usemap="#page-map"><map name="page-map">$areas</map>
+            <script>
+            (function(){const img=document.getElementById('page');const areas=document.querySelectorAll('area');
+            function scale(){if(!img.naturalWidth)return;const sx=img.clientWidth/img.naturalWidth,sy=img.clientHeight/img.naturalHeight;
+            areas.forEach(a=>{if(!a.dataset.original)a.dataset.original=a.coords;const c=a.dataset.original.split(',').map(Number);
+            a.coords=c.map((n,i)=>Math.round(n*(i%2?sy:sx))).join(',')})}
+            img.addEventListener('load',scale);new ResizeObserver(scale).observe(img);scale();})();
+            </script></body></html>
+        """.trimIndent()
+    }
+
+    private fun openOfflineTarget(uri: Uri) {
+        val edition = offlineEdition ?: return
+        val directory = offlineDirectory ?: return
+        val parts = uri.pathSegments
+        if (parts.size != 2) return
+        val id = parts[1]
+        when (parts[0]) {
+            "text" -> {
+                val article = edition.articles.firstOrNull { it.id == id } ?: run {
+                    showMessage("This story's text is missing from the offline edition.")
+                    return
+                }
+                webView.loadDataWithBaseURL(
+                    "https://offline.dawn/",
+                    renderArticle(article),
+                    "text/html",
+                    "UTF-8",
+                    null
+                )
+            }
+            "image" -> {
+                if (id !in edition.fullImageIds) return
+                val image = File(File(directory, "images"), "$id.jpg")
+                if (!image.isFile) {
+                    showMessage("This full-size image is missing from the offline edition.")
+                    return
+                }
+                webView.loadUrl(Uri.fromFile(image).toString())
+            }
+        }
+    }
+
+    private fun renderArticle(article: DawnArticle): String {
+        val paragraphs = article.paragraphs.joinToString("") {
+            "<p>${htmlEscape(it)}</p>"
+        }
+        return """
+            <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+            <style>body{max-width:760px;margin:24px auto;padding:0 20px;font:18px/1.65 Georgia,serif;color:#222}
+            h1{font-size:30px;line-height:1.2}.byline{color:#666;font:14px Arial,sans-serif;margin:12px 0 24px}
+            p{margin:0 0 1em}</style></head><body><h1>${htmlEscape(article.title)}</h1>
+            <div class="byline">${htmlEscape(article.byline)}</div>$paragraphs</body></html>
+        """.trimIndent()
+    }
+
+    private fun htmlEscape(value: String): String =
+        value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace("\"", "&quot;").replace("'", "&#39;")
+
+    private fun showOfflineImages(edition: DawnEdition, directory: File) {
+        if (edition.fullImageIds.isEmpty()) {
+            showMessage("No full-size images were saved for this edition.")
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Full-size images")
+            .setItems(edition.fullImageIds.map { "Page ${it.split('_')[3]} · Image ${it.split('_')[4]}" }
+                .toTypedArray()) { _, index ->
+                offlineEdition = edition
+                offlineDirectory = directory
+                openOfflineTarget(Uri.parse("https://offline.dawn/image/${edition.fullImageIds[index]}"))
+            }
             .setNegativeButton("Close", null)
             .show()
     }
 
     private fun showOfflineStories(edition: DawnEdition, directory: File) {
-        if (edition.storyIds.isEmpty()) {
-            showMessage("No story text was archived for this edition.")
+        if (edition.articles.isEmpty()) {
+            showMessage("No text stories were saved for this edition.")
             return
         }
         AlertDialog.Builder(this)
             .setTitle("Text stories · ${edition.date.replace('_', '-')}")
-            .setItems(edition.storyIds.map { id ->
-                val parts = id.split('_')
-                "Page ${parts[3]} · Story ${parts[4]}"
-            }.toTypedArray()) { _, index ->
-                val id = edition.storyIds[index]
-                val storyArchive = File(directory, "story_$id.mht")
-                if (!storyArchive.isFile) {
-                    showMessage("This story's text is missing from the offline edition.")
-                    return@setItems
-                }
-                isOfflineFile = true
-                saveButton.isEnabled = false
-                webView.loadUrl(Uri.fromFile(storyArchive).toString())
-            }
-            .setNegativeButton("Close", null)
-            .show()
-    }
-
-    private fun saveCurrentPage() {
-        val archiveDirectory = File(filesDir, "saved-pages")
-        if (!archiveDirectory.exists() && !archiveDirectory.mkdirs()) {
-            showMessage("Could not create the offline storage folder.")
-            return
-        }
-        val filename =
-            "${dateFormat.format(selectedDate.time)}_${pageNumber.toString().padStart(3, '0')}.mht"
-        val archive = File(archiveDirectory, filename)
-        saveButton.isEnabled = false
-        webView.saveWebArchive(archive.absolutePath, false) { savedPath ->
-            runOnUiThread {
-                saveButton.isEnabled = !isOfflineFile
-                if (savedPath == null || !archive.isFile || archive.length() == 0L) {
-                    showMessage("Could not save this page. Wait for it to finish loading and try again.")
-                } else {
-                    showMessage("Page saved for offline reading.")
-                }
-            }
-        }
-    }
-
-    private fun showSavedPages() {
-        val archiveDirectory = File(filesDir, "saved-pages")
-        val archives = archiveDirectory.listFiles()
-            ?.filter { it.isFile && it.extension == "mht" }
-            ?.sortedByDescending { it.lastModified() }
-            .orEmpty()
-        if (archives.isEmpty()) {
-            showMessage("No pages have been saved yet.")
-            return
-        }
-
-        val labels = archives.map { it.nameWithoutExtension.replace('_', ' ') }.toTypedArray()
-        AlertDialog.Builder(this)
-            .setTitle("Saved pages")
-            .setItems(labels) { _, index ->
-                isOfflineFile = true
-                saveButton.isEnabled = false
-                webView.loadUrl(Uri.fromFile(archives[index]).toString())
+            .setItems(edition.articles.map { it.title }.toTypedArray()) { _, index ->
+                offlineEdition = edition
+                offlineDirectory = directory
+                webView.loadDataWithBaseURL(
+                    "https://offline.dawn/",
+                    renderArticle(edition.articles[index]),
+                    "text/html",
+                    "UTF-8",
+                    null
+                )
             }
             .setNegativeButton("Close", null)
             .show()
