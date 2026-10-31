@@ -28,7 +28,9 @@ import java.util.Calendar
 import java.util.Locale
 import java.util.concurrent.Executors
 
-class DailyEditionCheckJobService : JobService() {
+abstract class NewspaperEditionCheckJobService : JobService() {
+    protected abstract val fetchersForJob: List<NewspaperFetcher>
+
     private val worker = Executors.newSingleThreadExecutor()
     private val mainHandler = Handler(Looper.getMainLooper())
     private var webView: WebView? = null
@@ -62,7 +64,7 @@ class DailyEditionCheckJobService : JobService() {
         }
 
         checkDate = today
-        fetchersToCheck = NewspaperFetchers.all
+        fetchersToCheck = fetchersForJob
         fetcherIndex = 0
         shouldRetry = false
         val browser = WebView(this)
@@ -700,8 +702,10 @@ class DailyEditionCheckJobService : JobService() {
     }
 
     companion object {
-        private const val JOB_ID = 2841
-        private const val NINE_AM_JOB_ID = 2842
+        private const val DAWN_JOB_ID = 2841
+        private const val DAWN_NINE_AM_JOB_ID = 2842
+        private const val JANG_JOB_ID = 2843
+        private const val JANG_NINE_AM_JOB_ID = 2844
         private const val INTERVAL_MILLIS = 15 * 60 * 1000L
         private const val CHANNEL_ID = "newspaper_availability"
         private const val NOTIFICATION_ID = 2841
@@ -719,30 +723,36 @@ class DailyEditionCheckJobService : JobService() {
             }
             val delayMillis = (nextCheck.timeInMillis - now.timeInMillis).coerceAtLeast(0L)
             val scheduler = context.getSystemService(Context.JOB_SCHEDULER_SERVICE) as JobScheduler
-            val job = JobInfo.Builder(
-                NINE_AM_JOB_ID,
-                ComponentName(context, DailyEditionCheckJobService::class.java)
-            )
-                .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
-                .setPersisted(true)
-                .setMinimumLatency(delayMillis)
-                .setOverrideDeadline(delayMillis + 5 * 60 * 1000L)
-                .build()
-            if (scheduler.schedule(job) != JobScheduler.RESULT_SUCCESS) {
-                Log.e(TAG, "Could not schedule the 9 AM availability check.")
+            listOf(
+                DAWN_NINE_AM_JOB_ID to DailyEditionCheckJobService::class.java,
+                JANG_NINE_AM_JOB_ID to JangEditionCheckJobService::class.java
+            ).forEach { (jobId, serviceClass) ->
+                val job = JobInfo.Builder(jobId, ComponentName(context, serviceClass))
+                    .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
+                    .setPersisted(true)
+                    .setMinimumLatency(delayMillis)
+                    .setOverrideDeadline(delayMillis + 5 * 60 * 1000L)
+                    .build()
+                if (scheduler.schedule(job) != JobScheduler.RESULT_SUCCESS) {
+                    Log.e(TAG, "Could not schedule the 9 AM availability check for $serviceClass.")
+                }
             }
         }
 
         fun schedule(context: Context) {
             val scheduler = context.getSystemService(Context.JOB_SCHEDULER_SERVICE) as JobScheduler
-            val component = ComponentName(context, DailyEditionCheckJobService::class.java)
-            val job = JobInfo.Builder(JOB_ID, component)
-                .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
-                .setPersisted(true)
-                .setPeriodic(INTERVAL_MILLIS)
-                .build()
-            if (scheduler.schedule(job) != JobScheduler.RESULT_SUCCESS) {
-                Log.e(TAG, "Could not schedule the periodic newspaper availability check.")
+            listOf(
+                DAWN_JOB_ID to DailyEditionCheckJobService::class.java,
+                JANG_JOB_ID to JangEditionCheckJobService::class.java
+            ).forEach { (jobId, serviceClass) ->
+                val job = JobInfo.Builder(jobId, ComponentName(context, serviceClass))
+                    .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
+                    .setPersisted(true)
+                    .setPeriodic(INTERVAL_MILLIS)
+                    .build()
+                if (scheduler.schedule(job) != JobScheduler.RESULT_SUCCESS) {
+                    Log.e(TAG, "Could not schedule the periodic check for $serviceClass.")
+                }
             }
         }
         private const val MAX_VERIFICATION_ATTEMPTS = 20
@@ -750,8 +760,18 @@ class DailyEditionCheckJobService : JobService() {
     }
 }
 
+class DailyEditionCheckJobService : NewspaperEditionCheckJobService() {
+    override val fetchersForJob: List<NewspaperFetcher>
+        get() = listOf(NewspaperFetchers[NewspaperId.DAWN])
+}
+
+class JangEditionCheckJobService : NewspaperEditionCheckJobService() {
+    override val fetchersForJob: List<NewspaperFetcher>
+        get() = listOf(NewspaperFetchers[NewspaperId.JANG_LAHORE])
+}
+
 object DailyEditionCheckScheduler {
-    fun schedule(context: Context) = DailyEditionCheckJobService.schedule(context)
+    fun schedule(context: Context) = NewspaperEditionCheckJobService.schedule(context)
 }
 
 object NotificationPermission {
