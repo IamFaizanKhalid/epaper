@@ -288,10 +288,14 @@ private class JangLahorePaper : Paper {
 
     override fun availabilityDiscoveryScript(date: String): String = """
         (() => {
-            const pageText = (document.body?.innerText || '').toLowerCase();
-            if (document.title.toLowerCase().includes('moment, please') ||
+            const title = (document.title || '').toLowerCase();
+            const pageText = (document.body?.innerText || '').slice(0, 4000).toLowerCase();
+            if (title.includes('moment, please') ||
+                title.includes('just a moment') ||
                 pageText.includes('verify you are human') ||
+                pageText.includes('checking your browser') ||
                 pageText.includes('security verification') ||
+                pageText.includes('performing security verification') ||
                 pageText.includes('request is being verified') ||
                 document.querySelector('#challenge-running, #challenge-stage')) {
                 return JSON.stringify({error: 'VERIFYING'});
@@ -299,18 +303,28 @@ private class JangLahorePaper : Paper {
             const requested = '${date.replace('_', '-')}';
             const pages = [];
             const seen = new Set();
-            for (const link of document.querySelectorAll('a[href*="/lahore/"]')) {
-                const url = new URL(link.href, location.href);
-                const match = url.pathname.match(/^\/lahore\/(\d{2}-\d{2}-\d{4})\/page(\d+)$/);
-                if (!match || match[1] !== requested || seen.has(match[2])) continue;
-                seen.add(match[2]);
-                const number = Number(match[2]);
-                if (number < 1 || number > 99) continue;
-                pages.push({id: 'J${date}_' + String(number).padStart(3, '0'),
-                    title: link.innerText.trim() || 'Page ' + number});
+            const pagePattern = /\/lahore\/(\d{2}-\d{2}-\d{4})\/page(\d+)(?:[/?#"' \s)]|$)/gi;
+            const addPages = (reference, label) => {
+                for (const match of String(reference || '').matchAll(pagePattern)) {
+                    if (match[1] !== requested) continue;
+                    const number = Number(match[2]);
+                    if (number < 1 || number > 99 || seen.has(number)) continue;
+                    seen.add(number);
+                    pages.push({id: 'J${date}_' + String(number).padStart(3, '0'),
+                        title: label || 'Page ' + number});
+                }
+            };
+            for (const element of document.querySelectorAll(
+                'a[href], area[href], option[value], [data-href], [data-url], [onclick]')) {
+                const label = (element.innerText || element.textContent ||
+                    element.getAttribute('aria-label') || '').trim();
+                for (const attribute of ['href', 'value', 'data-href', 'data-url', 'onclick']) {
+                    addPages(element.getAttribute(attribute), label);
+                }
             }
+            addPages(document.documentElement?.innerHTML, '');
             if (!pages.length) return JSON.stringify({error: 'NOT_AVAILABLE'});
-            pages.sort((a, b) => a.id.localeCompare(b.id));
+            pages.sort((a, b) => Number(a.id.slice(-3)) - Number(b.id.slice(-3)));
             return JSON.stringify({
                 date: '${date}',
                 latestDate: '${date}',
