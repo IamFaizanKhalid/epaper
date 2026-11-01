@@ -105,6 +105,8 @@ class MainActivity : Activity() {
     private var selectedDate = Calendar.getInstance()
     private var pageNumber = 1
     private var readerMode = false
+    private var showingJangVerificationPage = false
+    private var jangVerificationDate: String? = null
     private var viewingStoryContent = false
     private var viewingSavedStory = false
     private var articleTextViewerActive = false
@@ -243,6 +245,9 @@ class MainActivity : Activity() {
                                 error: android.webkit.WebResourceError
                             ) {
                                 if (!request.isForMainFrame) return
+                                if (paper.requiresPageVerification &&
+                                    showingJangVerificationPage
+                                ) return
                                 val date = availabilityCheckDates[paper.id] ?: return
                                 if (availabilityCheckDates[paper.id] != date) return
                                 availabilityCheckDates.remove(paper.id)
@@ -314,7 +319,12 @@ class MainActivity : Activity() {
                 browser.loadUrl(paper.availabilityUrl(requestedDate))
     }
 
-    private fun readPaperAvailability(paper: Paper, browser: WebView, date: String) {
+    private fun readPaperAvailability(
+        paper: Paper,
+        browser: WebView,
+        date: String,
+        visibleJangCheck: Boolean = false
+    ) {
                 if (availabilityCheckDates[paper.id] != date) return
                 browser.evaluateJavascript(paper.availabilityDiscoveryScript(date)) { result ->
                     if (availabilityCheckDates[paper.id] != date) return@evaluateJavascript
@@ -324,20 +334,31 @@ class MainActivity : Activity() {
                         val response = JSONObject(json)
                         when (response.optString("error")) {
                             "VERIFYING" -> {
+                                if (paper.requiresPageVerification && !visibleJangCheck) {
+                                    showJangVerificationPage(paper, date)
+                                    return@evaluateJavascript
+                                }
                                 val attempt = availabilityAttempts[paper.id] ?: 0
                                 if (attempt < MAX_AVAILABILITY_ATTEMPTS) {
                                     availabilityAttempts[paper.id] = attempt + 1
-                                    browser.postDelayed({
-                                        readPaperAvailability(paper, browser, date)
-                                    }, AVAILABILITY_RETRY_MILLIS)
+                                    if (!visibleJangCheck) {
+                                        browser.postDelayed({
+                                            readPaperAvailability(paper, browser, date)
+                                        }, AVAILABILITY_RETRY_MILLIS)
+                                    }
                                 } else {
-                                    failPaperAvailability(paper, date, "Request verification timed out.")
+                                    failPaperAvailability(
+                                        paper,
+                                        date,
+                                        "Jang's site did not finish its verification."
+                                    )
                                 }
                                 return@evaluateJavascript
                             }
                             "NOT_AVAILABLE" -> {
                                 availabilityCheckDates.remove(paper.id)
                                 papersToOpenWhenAvailable.remove(paper.id)
+                                closeJangVerificationPage()
                                 if (isToday(date)) {
                                     setPaperStatus(paper, "Not available", Color.GRAY)
                                 } else {
@@ -376,6 +397,9 @@ class MainActivity : Activity() {
                         edition.saveMetadata(directory)
                         availabilityCheckDates.remove(paper.id)
                         availabilityAttempts.remove(paper.id)
+                        val shouldOpen = papersToOpenWhenAvailable.remove(paper.id) &&
+                            date == selectedDateKey()
+                        closeJangVerificationPage()
                         if (isToday(date)) {
                             setPaperStatus(paper, "Available", Color.rgb(30, 125, 70))
                         }
@@ -389,9 +413,7 @@ class MainActivity : Activity() {
                         ) {
                             downloadEdition(edition)
                         }
-                        if (papersToOpenWhenAvailable.remove(paper.id) && date == selectedDateKey()) {
-                            openEdition(edition)
-                        }
+                        if (shouldOpen) openEdition(edition)
                     } catch (error: Exception) {
                         failPaperAvailability(
                             paper,
@@ -404,11 +426,46 @@ class MainActivity : Activity() {
 
     private fun failPaperAvailability(paper: Paper, date: String, message: String) {
                 if (availabilityCheckDates[paper.id] != date) return
+                android.util.Log.e(
+                    "MainActivity",
+                    "Could not check ${paper.id.displayName} availability: $message"
+                )
                 availabilityCheckDates.remove(paper.id)
                 availabilityAttempts.remove(paper.id)
                 papersToOpenWhenAvailable.remove(paper.id)
+                closeJangVerificationPage()
                 setPaperStatus(paper, "Could not check availability", Color.RED)
                 showMessage("${paper.id.displayName}: $message")
+    }
+
+    private fun showJangVerificationPage(paper: Paper, date: String) {
+        if (showingJangVerificationPage) return
+        showingJangVerificationPage = true
+        jangVerificationDate = date
+        homeScreen.visibility = View.GONE
+        readerScreen.visibility = View.VISIBLE
+        webView.visibility = View.VISIBLE
+        pageLabel.text = "Verifying ${paper.id.displayName}…"
+        previousPageButton.visibility = View.GONE
+        pageSpinner.visibility = View.GONE
+        nextPageButton.visibility = View.GONE
+        saveStoryButton.visibility = View.GONE
+        webView.loadUrl(paper.availabilityUrl(date))
+    }
+
+    private fun closeJangVerificationPage() {
+        if (!showingJangVerificationPage) return
+        showingJangVerificationPage = false
+        jangVerificationDate = null
+        webView.stopLoading()
+        webView.visibility = View.GONE
+        readerScreen.visibility = View.GONE
+        homeScreen.visibility = View.VISIBLE
+        pageLabel.text = ""
+        previousPageButton.visibility = View.VISIBLE
+        pageSpinner.visibility = View.VISIBLE
+        nextPageButton.visibility = View.VISIBLE
+        refreshSaveStoryButton()
     }
 
     private fun setPaperStatus(paper: Paper, text: String, color: Int) {
@@ -616,6 +673,18 @@ class MainActivity : Activity() {
                 }
 
                 override fun onPageFinished(view: WebView, url: String) {
+                    if (showingJangVerificationPage) {
+                        val date = jangVerificationDate ?: return
+                        if (Uri.parse(url).host.equals("e.jang.com.pk", ignoreCase = true)) {
+                            readPaperAvailability(
+                                Papers[NewspaperId.JANG_LAHORE],
+                                view,
+                                date,
+                                visibleJangCheck = true
+                            )
+                        }
+                        return
+                    }
                     if (displayedPageId != null && !viewingStoryContent) {
                         paperPageReady = true
                         updateRenderedHotspots()
@@ -626,6 +695,9 @@ class MainActivity : Activity() {
                     view: WebView,
                     request: WebResourceRequest
                 ): Boolean {
+                    if (showingJangVerificationPage &&
+                        request.url.host.equals("e.jang.com.pk", ignoreCase = true)
+                    ) return false
                     if (Papers.all.any { Uri.parse(it.offlineOrigin).host == request.url.host }) {
                         openOfflineTarget(request.url)
                         return true
@@ -633,6 +705,20 @@ class MainActivity : Activity() {
                     return request.url.scheme !in setOf("file", "data", "about")
                 }
 
+                override fun onReceivedError(
+                    view: WebView,
+                    request: WebResourceRequest,
+                    error: android.webkit.WebResourceError
+                ) {
+                    if (showingJangVerificationPage && request.isForMainFrame) {
+                        val date = jangVerificationDate ?: return
+                        failPaperAvailability(
+                            Papers[NewspaperId.JANG_LAHORE],
+                            date,
+                            "Could not load Jang's page: ${error.description}"
+                        )
+                    }
+                }
             }
         }
         inspectionWebView = WebView(this).apply {
@@ -1454,6 +1540,12 @@ class MainActivity : Activity() {
 
     private fun showHome() {
         cancelOnDemandPageRequest()
+        if (showingJangVerificationPage) {
+            availabilityCheckDates.remove(NewspaperId.JANG_LAHORE)
+            availabilityAttempts.remove(NewspaperId.JANG_LAHORE)
+            papersToOpenWhenAvailable.remove(NewspaperId.JANG_LAHORE)
+            closeJangVerificationPage()
+        }
         viewingSavedStory = false
         viewingStoryContent = false
         setArticleTextViewerMode(false)
@@ -1469,6 +1561,7 @@ class MainActivity : Activity() {
     }
 
     private fun openVerifiedEdition(edition: NewspaperEdition) {
+        closeJangVerificationPage()
         availableEdition = edition
         readerMode = true
         homeScreen.visibility = View.GONE
@@ -1706,8 +1799,8 @@ class MainActivity : Activity() {
                             pageDownloadsRemaining = (pageDownloadsRemaining - 1).coerceAtLeast(0)
                             if (isRequestedPageVisible(request)) {
                                 showPageLoadFailure(request.page, error.message)
+                                showMessage(error.message ?: "Could not download ${request.page.title}.")
                             }
-                            showMessage(error.message ?: "Could not download ${request.page.title}.")
                             maybeCompleteEdition(request.edition)
                         } else if (isRequestedPageVisible(request)) {
                             showPageLoadFailure(request.page, error.message)
@@ -1905,7 +1998,7 @@ class MainActivity : Activity() {
                                 showMessage(error.message ?: "Could not save this image.")
                                 returnToCurrentPaperPage()
                             } else {
-                                showMessage(error.message ?: "Could not save prefetched image $id.")
+                                android.util.Log.e("MainActivity", "Could not save prefetched image $id.", error)
                             }
                         } finally {
                             prefetchingImageIds.remove(id)
@@ -1926,7 +2019,7 @@ class MainActivity : Activity() {
                             showMessage(error.message ?: "Could not download this image.")
                             returnToCurrentPaperPage()
                         } else {
-                            showMessage(error.message ?: "Could not prefetch image $id.")
+                            android.util.Log.e("MainActivity", "Could not prefetch image $id.", error)
                         }
                     }
                 }
@@ -3019,7 +3112,7 @@ class MainActivity : Activity() {
         const val MIN_ARTICLE_TEXT_SCALE = 0.75f
         const val MAX_ARTICLE_TEXT_SCALE = 2.25f
         const val MAX_DATE_WINDOW_DAYS = 30
-        const val MAX_AVAILABILITY_ATTEMPTS = 20
+        const val MAX_AVAILABILITY_ATTEMPTS = 60
         const val AVAILABILITY_RETRY_MILLIS = 1_500L
         const val MAX_JANG_IMAGE_VERIFICATION_ATTEMPTS = 60
         const val MAX_JANG_IMAGE_REDIRECT_RETRIES = 3

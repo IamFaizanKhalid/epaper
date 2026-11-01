@@ -16,6 +16,8 @@ A native Android reader for Dawn and Jang Lahore e-paper, designed with the Gala
 - Notifies when a supported newspaper's current-day edition is detected and starts downloading its pages. Previously unsaved historical editions download only the page the user opens, and saved edition metadata avoids another availability request.
 - Uses the newspaper websites temporarily to check availability and extract page/story data; full website HTML is not archived.
 
+Android permits cleartext traffic only to `e.jang.com.pk` because Jang's e-paper flow uses HTTP; all other hosts retain the platform's default cleartext policy.
+
 Downloaded editions live in the app's private storage. Dawn editions use `editions/<date>/`; Jang Lahore editions use `editions/jang/<date>/`. Each stores downloaded page images (Dawn JPEG; Jang JPEG or PNG) and `edition.json` for page metadata, clickable areas, and article text. Full-size images are stored under `images/`, including Jang page images opened from clickable areas. Jang article photos are stored under `article-images/` and displayed from local storage when available. Jang story text uses the bundled Ali Nastaliq font from `app/src/main/assets/fonts/`.
 
 ## Paper architecture
