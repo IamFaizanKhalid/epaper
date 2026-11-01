@@ -151,15 +151,21 @@ data class NewspaperEdition(
     fun downloadArticleImages(
         directory: File,
         jangImageDownloader: JangImageDownloader? = null
+    ) = downloadArticleImages(directory, articles, jangImageDownloader)
+
+    fun downloadArticleImages(
+        directory: File,
+        articlesToDownload: List<NewspaperArticle>,
+        jangImageDownloader: JangImageDownloader? = null
     ) {
         if (!isJangEdition) return
         val imageDirectory = File(directory, "article-images")
-        if (articles.any { it.imageUrls.isNotEmpty() } &&
+        if (articlesToDownload.any { it.imageUrls.isNotEmpty() } &&
             !imageDirectory.exists() && !imageDirectory.mkdirs()
         ) {
             throw IllegalStateException("Could not create article image storage.")
         }
-        articles.forEach { article ->
+        articlesToDownload.forEach { article ->
             article.imageUrls.indices.forEach { index ->
                 val destination = articleImageFile(directory, article, index)
                     ?: throw IllegalStateException("Jang article image has no saved source URL.")

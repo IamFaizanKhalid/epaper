@@ -169,6 +169,9 @@ class MainActivity : Activity() {
     private var activeTextStory: TextStoryRequest? = null
     private var parsingJangStoryId: String? = null
     private val pendingTextStories = ArrayDeque<TextStoryRequest>()
+    private val pageContentPrefetchKeys = mutableSetOf<String>()
+    private val pendingPageContentPrefetches = ArrayDeque<PageContentPrefetch>()
+    private var activePageContentPrefetchKey: String? = null
     private val prefetchingImageIds = mutableSetOf<String>()
     private val pendingArticleImageIds = mutableSetOf<String>()
     private var pageDownloadsRemaining = 0
@@ -578,27 +581,37 @@ class MainActivity : Activity() {
             .map { it.targetId }
             .distinct()
             .toList()
-        val imageIds = (
-            edition.hotspots.asSequence()
-                .filter { it.type == NewspaperHotspotType.IMAGE }
-                .map { it.targetId }
-                .toList() +
-                if (Papers.forEdition(edition).supportsImageDetail) textStoryIds else emptyList()
-            ).distinct()
+        val imageIds = edition.hotspots.asSequence()
+            .filter { it.type == NewspaperHotspotType.IMAGE }
+            .map { it.targetId }
+            .distinct()
+            .toList()
+        val articleImageCount = if (Papers.forEdition(edition).supportsInlineArticleImages) {
+            edition.articles.asSequence()
+                .filter { it.id in textStoryIds }
+                .sumOf { it.imageUrls.size }
+        } else {
+            0
+        }
         val articlesById = edition.articles.associateBy { it.id }
-        val articleImageCount = edition.articles.sumOf { it.imageUrls.size }
         val totalItems = pages.size + textStoryIds.size + imageIds.size + articleImageCount
         if (totalItems == 0) return null
 
         val completedItems =
             pages.count { edition.hasPageImage(directory, it.id) } +
-                textStoryIds.count { it in articlesById } +
-                imageIds.count { edition.hasFullImage(directory, it) } +
-                edition.articles.sumOf { article ->
-                    article.imageUrls.indices.count {
-                        edition.hasArticleImage(directory, article, it)
+            textStoryIds.count { it in articlesById } +
+            imageIds.count { edition.hasFullImage(directory, it) } +
+            if (Papers.forEdition(edition).supportsInlineArticleImages) {
+                edition.articles.asSequence()
+                    .filter { it.id in textStoryIds }
+                    .sumOf { article ->
+                        article.imageUrls.indices.count {
+                            edition.hasArticleImage(directory, article, it)
+                        }
                     }
-                }
+            } else {
+                0
+            }
         if (completedItems == 0) return null
 
         val allPageScansProcessed = pages.all { it.id in edition.processedPageIds }
@@ -989,6 +1002,7 @@ class MainActivity : Activity() {
                         parsingJangStoryId = null
                         activeTextStory = null
                         saveStoryArticle(request, article)
+                        finishTextStoryRequest(request)
                         if (onDemandStoryId == request.id) {
                             onDemandStoryId = null
                             onDemandEdition = null
@@ -1021,6 +1035,7 @@ class MainActivity : Activity() {
                 parseStoryText(view, request.id) { article ->
                     activeTextStory = null
                     saveStoryArticle(request, article)
+                    finishTextStoryRequest(request)
                     if (onDemandStoryId == request.id) {
                         onDemandStoryId = null
                         onDemandEdition = null
@@ -1057,6 +1072,7 @@ class MainActivity : Activity() {
                 val request = activeTextStory ?: return
                 activeTextStory = null
                 parsingJangStoryId = null
+                finishTextStoryRequest(request)
                 if (onDemandStoryId == request.id) {
                     onDemandStoryId = null
                     onDemandEdition = null
@@ -2175,108 +2191,195 @@ class MainActivity : Activity() {
     }
 
     private fun prefetchPageStories(edition: NewspaperEdition, page: NewspaperPage) {
-        if (edition.date != dateFormat.format(Calendar.getInstance().time)) return
         val directory = editionDirectory(edition)
+        if (!canPrefetchPageContent(edition, directory)) return
         val pageHotspots = edition.hotspots.filter { it.pageId == page.id }
         if (pageHotspots.isEmpty()) return
-
-        pageHotspots.filter { it.type == NewspaperHotspotType.TEXT }
+        val key = "${edition.paperId.storageName}:${edition.date}:${page.id}"
+        if (!pageContentPrefetchKeys.add(key)) return
+        val textStoryIds = pageHotspots.filter { it.type == NewspaperHotspotType.TEXT }
             .map { it.targetId }
             .distinct()
-            .filterNot { id ->
-                edition.articles.any { it.id == id } ||
-                    activeTextStory?.id == id ||
-                    pendingTextStories.any { it.id == id }
-            }
-            .forEach { id ->
-                pendingTextStories.addLast(TextStoryRequest(edition, directory, id))
-            }
-        startNextTextStory()
-
-        val missingImages = pageHotspots.asSequence()
+        val imageIds = pageHotspots.asSequence()
             .filter { it.type == NewspaperHotspotType.IMAGE }
             .map { it.targetId }
             .distinct()
-            .filter { id ->
-                !edition.hasFullImage(directory, id) &&
-                    id !in prefetchingImageIds
-            }
             .toList()
-        if (missingImages.isEmpty()) return
-        prefetchingImageIds.addAll(missingImages)
+        pendingPageContentPrefetches.addLast(
+            PageContentPrefetch(edition, page, directory, textStoryIds, imageIds, key)
+        )
+        startNextPageContentPrefetch()
+    }
+
+    private fun startNextPageContentPrefetch() {
+        if (activePageContentPrefetchKey != null) return
+        if (pendingPageContentPrefetches.isEmpty()) return
+        val request = pendingPageContentPrefetches.removeFirst()
+        activePageContentPrefetchKey = request.key
+        if (!canPrefetchPageContent(request.edition, request.directory)) {
+            finishPageContentPrefetch(request.key)
+            return
+        }
+        prefetchPageText(
+            request.edition,
+            request.page,
+            request.directory,
+            request.textStoryIds,
+            request.imageIds,
+            0
+        )
+    }
+
+    private fun finishPageContentPrefetch(key: String) {
+        if (activePageContentPrefetchKey != key) return
+        activePageContentPrefetchKey = null
+        pageContentPrefetchKeys.remove(key)
+        startNextPageContentPrefetch()
+    }
+
+    private fun prefetchPageText(
+        edition: NewspaperEdition,
+        page: NewspaperPage,
+        directory: File,
+        textStoryIds: List<String>,
+        imageIds: List<String>,
+        index: Int
+    ) {
+        if (!canPrefetchPageContent(edition, directory)) {
+            finishPageContentPrefetch("${edition.paperId.storageName}:${edition.date}:${page.id}")
+            return
+        }
+        if (index >= textStoryIds.size) {
+            prefetchPageImages(edition, page, directory, imageIds)
+            return
+        }
+        val id = textStoryIds[index]
+        val metadata = File(directory, "edition.json")
+        val savedEdition = if (metadata.isFile) {
+            runCatching { NewspaperEdition.readMetadata(metadata) }.getOrElse { error ->
+                android.util.Log.e("MainActivity", "Could not read edition before prefetching text.", error)
+                edition
+            }
+        } else edition
+        val next = {
+            prefetchPageText(edition, page, directory, textStoryIds, imageIds, index + 1)
+        }
+        if (savedEdition.articles.any {
+                it.id == id &&
+                    !(Papers.forEdition(edition).refreshArticleWhenBylineMissing && it.byline.isBlank())
+            }
+        ) {
+            next()
+            return
+        }
+        enqueueTextStory(TextStoryRequest(edition, directory, id), next)
+    }
+
+    private fun prefetchPageImages(
+        edition: NewspaperEdition,
+        page: NewspaperPage,
+        directory: File,
+        pageImageIds: List<String>
+    ) {
+        if (!canPrefetchPageContent(edition, directory)) {
+            finishPageContentPrefetch("${edition.paperId.storageName}:${edition.date}:${page.id}")
+            return
+        }
+        val metadata = File(directory, "edition.json")
+        val savedEdition = if (metadata.isFile) {
+            runCatching { NewspaperEdition.readMetadata(metadata) }.getOrElse { error ->
+                android.util.Log.e("MainActivity", "Could not read edition before prefetching images.", error)
+                edition
+            }
+        } else edition
+        val imageIds = pageImageIds.distinct().filterNot {
+            savedEdition.hasFullImage(directory, it) || it in prefetchingImageIds
+        }
+        val pageStoryIds = savedEdition.hotspots.asSequence()
+            .filter { it.pageId == page.id && it.type == NewspaperHotspotType.TEXT }
+            .map { it.targetId }
+            .toSet()
+        val articleImages = if (Papers.forEdition(edition).supportsInlineArticleImages) {
+            savedEdition.articles.filter { article ->
+                article.id in pageStoryIds &&
+                    article.imageUrls.indices.any {
+                        !savedEdition.hasArticleImage(directory, article, it)
+                    }
+            }
+        } else {
+            emptyList()
+        }
+        if (imageIds.isEmpty() && articleImages.isEmpty()) {
+            finishPageContentPrefetch("${edition.paperId.storageName}:${edition.date}:${page.id}")
+            return
+        }
+        prefetchingImageIds.addAll(imageIds)
         refreshDownloadIndicator()
         downloadExecutor.execute {
-            missingImages.forEach { id ->
-                try {
-                    if (editionInProgress?.let {
-                            it.date == edition.date && it.paperId == edition.paperId
-                        } == true
-                    ) {
-                        awaitEditionDownloadResume(editionInProgress ?: edition)
-                    }
-                    downloadEditionFullImages(edition, directory, listOf(id))
+            try {
+                for (id in imageIds) {
+                    if (!canPrefetchPageContent(edition, directory)) break
+                    downloadEditionFullImages(savedEdition, directory, listOf(id))
+                    val latest = readEditionMetadata(directory, edition)
+                    val updated = latest.copy(
+                        fullImageIds = (latest.fullImageIds + id).distinct()
+                    )
+                    persistEdition(updated, directory)
                     runOnUiThread {
-                        try {
-                            val metadata = File(directory, "edition.json")
-                            val latest = if (metadata.isFile) NewspaperEdition.readMetadata(metadata) else edition
-                            val updated = latest.copy(
-                                fullImageIds = (latest.fullImageIds + id).distinct()
-                            )
-                            persistEdition(updated, directory)
-                            updateEditionReferences(updated)
-                            if (pendingArticleImageIds.remove(id) &&
-                                readerMode && viewingArticleImage &&
-                                selectedDateKey() == edition.date
-                            ) showArticleImage(updated, directory, id)
-                            if (onDemandImageId == id) {
-                                onDemandImageId = null
-                                storyLoadingDialog?.dismiss()
-                                storyLoadingDialog = null
-                                if (readerMode && viewingStoryContent &&
-                                    selectedDateKey() == edition.date
-                                ) {
-                                    showOfflineImage(updated, directory, id)
-                                }
-                            }
-                        } catch (error: Exception) {
-                            if (pendingArticleImageIds.remove(id)) {
-                                showMessage(error.message ?: "Could not save this story image.")
-                            }
-                            if (onDemandImageId == id) {
-                                onDemandImageId = null
-                                storyLoadingDialog?.dismiss()
-                                storyLoadingDialog = null
-                                showMessage(error.message ?: "Could not save this image.")
-                                returnToCurrentPaperPage()
-                            } else {
-                                android.util.Log.e("MainActivity", "Could not save prefetched image $id.", error)
-                            }
-                        } finally {
-                            prefetchingImageIds.remove(id)
-                            refreshDownloadIndicator()
-                        }
-                    }
-                } catch (error: Exception) {
-                    runOnUiThread {
-                        prefetchingImageIds.remove(id)
-                        refreshDownloadIndicator()
-                        if (pendingArticleImageIds.remove(id)) {
-                            showMessage(error.message ?: "Could not prefetch this story image.")
-                        }
+                        updateEditionReferences(updated)
+                        if (pendingArticleImageIds.remove(id) &&
+                            readerMode && viewingArticleImage &&
+                            selectedDateKey() == edition.date
+                        ) showArticleImage(updated, directory, id)
                         if (onDemandImageId == id) {
                             onDemandImageId = null
                             storyLoadingDialog?.dismiss()
                             storyLoadingDialog = null
-                            showMessage(error.message ?: "Could not download this image.")
-                            returnToCurrentPaperPage()
-                        } else {
-                            android.util.Log.e("MainActivity", "Could not prefetch image $id.", error)
+                            if (readerMode && viewingStoryContent &&
+                                selectedDateKey() == edition.date
+                            ) showOfflineImage(updated, directory, id)
                         }
                     }
+                }
+                if (!canPrefetchPageContent(edition, directory)) return@execute
+                if (articleImages.isNotEmpty()) {
+                    val latest = readEditionMetadata(directory, edition)
+                    latest.downloadArticleImages(
+                        directory,
+                        articleImages.mapNotNull { imageArticle ->
+                            latest.articles.firstOrNull { it.id == imageArticle.id }
+                        }
+                    ) { url, referer, destination ->
+                        downloadJangImageThroughWebView(url, referer, destination)
+                    }
+                }
+            } catch (error: Exception) {
+                android.util.Log.e(
+                    "MainActivity",
+                    "Could not preload content for ${edition.paperId.displayName} page ${page.id}.",
+                    error
+                )
+            } finally {
+                runOnUiThread {
+                    prefetchingImageIds.removeAll(imageIds.toSet())
+                    finishPageContentPrefetch(
+                        "${edition.paperId.storageName}:${edition.date}:${page.id}"
+                    )
+                    refreshDownloadIndicator()
                 }
             }
         }
     }
+
+    private fun readEditionMetadata(directory: File, fallback: NewspaperEdition): NewspaperEdition {
+        val metadata = File(directory, "edition.json")
+        return if (metadata.isFile) NewspaperEdition.readMetadata(metadata) else fallback
+    }
+
+    private fun canPrefetchPageContent(edition: NewspaperEdition, directory: File): Boolean =
+        editionInProgress?.let {
+            it.date == edition.date && it.paperId == edition.paperId
+        } != true && !File(directory, "complete").isFile
 
     private fun startNextTextStory() {
         if (activeTextStory != null || pendingTextStories.isEmpty()) return
@@ -2291,6 +2394,24 @@ class MainActivity : Activity() {
         refreshDownloadIndicator()
         val url = Papers.forEdition(request.edition).articleUrl(request.id)
         detailWebView.loadUrl(url)
+    }
+
+    private fun enqueueTextStory(request: TextStoryRequest, onComplete: () -> Unit) {
+        val existing = activeTextStory?.takeIf { it.matches(request) }
+            ?: pendingTextStories.firstOrNull { it.matches(request) }
+        if (existing != null) {
+            existing.completionCallbacks += onComplete
+            return
+        }
+        request.completionCallbacks += onComplete
+        pendingTextStories.addLast(request)
+        startNextTextStory()
+    }
+
+    private fun finishTextStoryRequest(request: TextStoryRequest) {
+        val callbacks = request.completionCallbacks.toList()
+        request.completionCallbacks.clear()
+        callbacks.forEach { it() }
     }
 
     private fun saveStoryArticle(request: TextStoryRequest, article: NewspaperArticle) {
@@ -2662,6 +2783,7 @@ class MainActivity : Activity() {
                     } else {
                         showMessage(error.message ?: "Could not prefetch story $id.")
                     }
+                    request?.let(::finishTextStoryRequest)
                     startNextTextStory()
                     refreshDownloadIndicator()
                 } else {
@@ -2748,6 +2870,7 @@ class MainActivity : Activity() {
                 val request = activeTextStory
                 activeTextStory = null
                 parsingJangStoryId = null
+                request?.let(::finishTextStoryRequest)
                 if (request != null && onDemandStoryId == request.id) {
                     onDemandStoryId = null
                     onDemandEdition = null
@@ -3215,9 +3338,14 @@ class MainActivity : Activity() {
         onDemandDirectory = directory
         showStoryLoadingDialog()
         val request = TextStoryRequest(edition, directory, id)
-        if (activeTextStory?.id != id) {
-            pendingTextStories.removeAll { it.id == id }
-            pendingTextStories.addFirst(request)
+        if (activeTextStory?.matches(request) != true) {
+            val queuedRequest = pendingTextStories.firstOrNull { it.matches(request) }
+            if (queuedRequest != null) {
+                pendingTextStories.remove(queuedRequest)
+                pendingTextStories.addFirst(queuedRequest)
+            } else {
+                pendingTextStories.addFirst(request)
+            }
             startNextTextStory()
         }
     }
@@ -3478,7 +3606,22 @@ private data class PageDownloadRequest(
 private data class TextStoryRequest(
     val edition: NewspaperEdition,
     val directory: File,
-    val id: String
+    val id: String,
+    val completionCallbacks: MutableList<() -> Unit> = mutableListOf()
+) {
+    fun matches(other: TextStoryRequest): Boolean =
+        edition.paperId == other.edition.paperId &&
+            edition.date == other.edition.date &&
+            id == other.id
+}
+
+private data class PageContentPrefetch(
+    val edition: NewspaperEdition,
+    val page: NewspaperPage,
+    val directory: File,
+    val textStoryIds: List<String>,
+    val imageIds: List<String>,
+    val key: String
 )
 
 private data class SavedStory(
