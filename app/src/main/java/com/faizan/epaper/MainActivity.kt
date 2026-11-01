@@ -576,51 +576,56 @@ class MainActivity : Activity() {
 
     private fun offlineCompletionPercentage(edition: NewspaperEdition, directory: File): Int? {
         val pages = edition.readingOrder
-        val textStoryIds = edition.hotspots.asSequence()
-            .filter { it.type == NewspaperHotspotType.TEXT }
-            .map { it.targetId }
-            .distinct()
-            .toList()
-        val imageIds = edition.hotspots.asSequence()
-            .filter { it.type == NewspaperHotspotType.IMAGE }
-            .map { it.targetId }
-            .distinct()
-            .toList()
-        val articleImageCount = if (Papers.forEdition(edition).supportsInlineArticleImages) {
-            edition.articles.asSequence()
-                .filter { it.id in textStoryIds }
-                .sumOf { it.imageUrls.size }
-        } else {
-            0
-        }
-        val articlesById = edition.articles.associateBy { it.id }
-        val totalItems = pages.size + textStoryIds.size + imageIds.size + articleImageCount
-        if (totalItems == 0) return null
+        if (pages.isEmpty()) return null
 
-        val completedItems =
-            pages.count { edition.hasPageImage(directory, it.id) } +
-            textStoryIds.count { it in articlesById } +
-            imageIds.count { edition.hasFullImage(directory, it) } +
-            if (Papers.forEdition(edition).supportsInlineArticleImages) {
-                edition.articles.asSequence()
-                    .filter { it.id in textStoryIds }
-                    .sumOf { article ->
-                        article.imageUrls.indices.count {
-                            edition.hasArticleImage(directory, article, it)
-                        }
+        val paper = Papers.forEdition(edition)
+        val articlesById = edition.articles.associateBy { it.id }
+        var completedPages = 0
+        var hasOfflineContent = false
+
+        val pageCompletion = pages.sumOf { page ->
+            val pageHotspots = edition.hotspots.filter { it.pageId == page.id }
+            val storyIds = pageHotspots.asSequence()
+                .filter { it.type == NewspaperHotspotType.TEXT }
+                .map { it.targetId }
+                .distinct()
+                .toList()
+            val imageIds = pageHotspots.asSequence()
+                .filter { it.type == NewspaperHotspotType.IMAGE }
+                .map { it.targetId }
+                .distinct()
+                .toList()
+            val articleImages = if (paper.supportsInlineArticleImages) {
+                storyIds.mapNotNull(articlesById::get)
+                    .flatMap { article ->
+                        article.imageUrls.indices.map { index -> article to index }
                     }
             } else {
-                0
+                emptyList()
             }
-        if (completedItems == 0) return null
+            val contentCount = storyIds.size + imageIds.size + articleImages.size
+            val totalPageItems = 1 + contentCount
+            val pageImageSaved = edition.hasPageImage(directory, page.id)
+            val pageScanned = page.id in edition.processedPageIds
+            val pageComplete = pageImageSaved && pageScanned
+            if (pageImageSaved) hasOfflineContent = true
+            if (pageComplete) completedPages++
 
-        val allPageScansProcessed = pages.all { it.id in edition.processedPageIds }
-        val allItemsComplete = completedItems == totalItems && allPageScansProcessed
+            val completedContent = storyIds.count { it in articlesById } +
+                imageIds.count { edition.hasFullImage(directory, it) } +
+                articleImages.count { (article, index) ->
+                    edition.hasArticleImage(directory, article, index)
+                }
+            completedContent.toDouble().plus(if (pageComplete) 1.0 else 0.0) /
+                totalPageItems
+        }
+        if (!hasOfflineContent) return null
+
         val completionMarker = File(directory, "complete").isFile
-        return if (allItemsComplete && completionMarker) {
+        return if (completedPages == pages.size && completionMarker) {
             100
         } else {
-            (completedItems * 100 / totalItems).coerceAtMost(99)
+            (pageCompletion * 100 / pages.size).toInt().coerceAtMost(99)
         }
     }
 
