@@ -6,6 +6,7 @@ import java.io.File
 import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import android.webkit.CookieManager
 
 data class NewspaperPage(val id: String, val title: String) {
     val imageFileName: String
@@ -68,10 +69,14 @@ data class NewspaperEdition(
             return pages.sortedWith(compareBy(::priority, ::pageNumber))
         }
 
-    fun downloadPageImage(directory: File, id: String) {
+    fun downloadPageImage(
+        directory: File,
+        id: String,
+        jangImageDownloader: ((URL, String, File) -> Unit)? = null
+    ) {
         require(pages.any { it.id == id }) { "Invalid newspaper page ID." }
         if (isJangEdition) {
-            downloadJangPageImage(directory, id)
+            downloadJangPageImage(directory, id, jangImageDownloader)
         } else {
             downloadImages(directory, listOf(id), "pages", { pageId -> "$pageId.jpg" }) { _, _ -> }
         }
@@ -98,9 +103,14 @@ data class NewspaperEdition(
     fun hasFullImage(directory: File, id: String): Boolean =
         fullImageFile(directory, id).isImageFile()
 
-    fun downloadFullImages(directory: File, ids: List<String>, onProgress: (Int, Int) -> Unit) {
+    fun downloadFullImages(
+        directory: File,
+        ids: List<String>,
+        onProgress: (Int, Int) -> Unit,
+        jangImageDownloader: ((URL, String, File) -> Unit)? = null
+    ) {
         if (isJangEdition) {
-            downloadJangImages(directory, ids, onProgress)
+            downloadJangImages(directory, ids, onProgress, jangImageDownloader)
             return
         }
         downloadImages(
@@ -167,7 +177,8 @@ data class NewspaperEdition(
     private fun downloadJangImages(
         directory: File,
         ids: List<String>,
-        onProgress: (Int, Int) -> Unit
+        onProgress: (Int, Int) -> Unit,
+        jangImageDownloader: ((URL, String, File) -> Unit)?
     ) {
         val imageDirectory = File(directory, "images")
         if (!imageDirectory.exists() && !imageDirectory.mkdirs()) {
@@ -189,33 +200,51 @@ data class NewspaperEdition(
             }
             val pageNumber = hotspot.pageId.substringAfterLast('_').toInt()
             val dateParts = date.split('_')
-            val jangDate = "${dateParts[1]}-${dateParts[0]}-${dateParts[2]}"
+            val jangDate = "${dateParts[0]}-${dateParts[1]}-${dateParts[2]}"
+            val staticDate = "${dateParts[1]}-${dateParts[0]}-${dateParts[2]}"
             require(imageUrl.matches(JANG_IMAGE_PATH_PATTERN)) {
                 "Jang returned an invalid image URL."
             }
-            val assetName = imagePath.substringAfterLast('/')
+            val imageFileName = imagePath.substringAfterLast('/')
             val url = URL(
-                "https://e.jang.com.pk/static_pages/$jangDate/lahore/small/$assetName"
+                "https://e.jang.com.pk/static_pages/$staticDate/lahore/small/$imageFileName"
             )
             val destination = File(imageDirectory, id)
             if (!destination.isImageFile()) {
-                downloadJangImage(url, jangDate, pageNumber, destination)
+                downloadJangImage(
+                    url,
+                    jangDate,
+                    pageNumber,
+                    destination,
+                    jangImageDownloader
+                )
             }
             onProgress(index + 1, ids.size)
         }
     }
 
     private fun downloadJangArticleImage(url: URL, articleId: String, destination: File) {
+        var lastFailure: Exception? = null
+        repeat(3) { attempt ->
+            try {
+                downloadJangArticleImageOnce(url, articleId, destination)
+                return
+            } catch (error: Exception) {
+                lastFailure = error
+                if (!isRetryableJangImageError(error) || attempt == 2) throw error
+                pauseBeforeJangImageRetry(attempt)
+            }
+        }
+        throw IllegalStateException("Could not download the Jang article image.", lastFailure)
+    }
+
+    private fun downloadJangArticleImageOnce(url: URL, articleId: String, destination: File) {
         val temporaryImage = File(destination.parentFile, "${destination.name}.tmp")
         val connection = (url.openConnection() as HttpURLConnection).apply {
             connectTimeout = 15_000
             readTimeout = 30_000
             instanceFollowRedirects = true
-            setRequestProperty(
-                "User-Agent",
-                "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0 Mobile Safari/537.36"
-            )
-            setRequestProperty("Referer", "https://e.jang.com.pk/detail/$articleId")
+            applyJangImageHeaders(url, "https://e.jang.com.pk/detail/$articleId")
         }
         try {
             connection.connect()
@@ -225,19 +254,20 @@ data class NewspaperEdition(
                 "Jang redirected an article image to an unexpected host."
             }
             if (connection.responseCode !in 200..299) {
-                throw IllegalStateException(
+                throw jangImageResponseError(
+                    url,
+                    connection,
                     "Jang returned HTTP ${connection.responseCode} for an article image."
                 )
             }
             val extension = url.path.substringAfterLast('.').lowercase()
             val contentType = connection.contentType?.substringBefore(';')?.trim()?.lowercase()
-            val expectedTypes = if (extension == "png") {
-                setOf("image/png", "image/x-png", "application/octet-stream")
-            } else {
-                setOf("image/jpeg", "image/jpg", "application/octet-stream")
-            }
-            if (contentType !in expectedTypes) {
-                throw IllegalStateException("Jang returned an unexpected article image type.")
+            if (!isJangImageContentType(contentType)) {
+                throw jangImageResponseError(
+                    url,
+                    connection,
+                    "Jang returned ${contentType ?: "no content type"} instead of an article image."
+                )
             }
             if (connection.contentLengthLong > MAX_IMAGE_BYTES) {
                 throw IllegalStateException("Jang article image is larger than expected.")
@@ -307,8 +337,36 @@ data class NewspaperEdition(
         url: URL,
         jangDate: String,
         pageNumber: Int,
-        destination: File
+        destination: File,
+        jangImageDownloader: ((URL, String, File) -> Unit)?
     ) {
+        if (jangImageDownloader != null) {
+            val extension = url.path.substringAfterLast('.').lowercase()
+            val temporaryImage = File(
+                destination.parentFile,
+                "${destination.name}.download.$extension"
+            )
+            try {
+                jangImageDownloader(
+                    url,
+                    "https://e.jang.com.pk/lahore/$jangDate/page$pageNumber",
+                    temporaryImage
+                )
+                require(temporaryImage.isImageFile()) {
+                    "Jang returned invalid image data for $url."
+                }
+                if (destination.exists() && !destination.delete()) {
+                    throw IllegalStateException("Could not replace the saved Jang image.")
+                }
+                if (!temporaryImage.renameTo(destination)) {
+                    throw IllegalStateException("Could not save the Jang image.")
+                }
+            } catch (error: Exception) {
+                temporaryImage.delete()
+                throw error
+            }
+            return
+        }
         var lastFailure: Exception? = null
         repeat(3) { attempt ->
             try {
@@ -316,17 +374,9 @@ data class NewspaperEdition(
                 return
             } catch (error: Exception) {
                 lastFailure = error
-                val retryable = error is java.io.IOException ||
-                    error.message == "Jang returned an unexpected image type." ||
-                    error.message == "Jang returned an invalid image." ||
-                    error.message?.startsWith("Jang returned HTTP 5") == true
+                val retryable = isRetryableJangImageError(error)
                 if (!retryable || attempt == 2) throw error
-                try {
-                    Thread.sleep(500L * (attempt + 1))
-                } catch (interrupted: InterruptedException) {
-                    Thread.currentThread().interrupt()
-                    throw IllegalStateException("Jang image download was interrupted.", interrupted)
-                }
+                pauseBeforeJangImageRetry(attempt)
             }
         }
         throw IllegalStateException("Could not download the Jang image.", lastFailure)
@@ -343,23 +393,25 @@ data class NewspaperEdition(
             connectTimeout = 15_000
             readTimeout = 30_000
             instanceFollowRedirects = true
-            setRequestProperty(
-                "User-Agent",
-                "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0 Mobile Safari/537.36"
-            )
-            setRequestProperty("Referer", "https://e.jang.com.pk/lahore/$jangDate/page$pageNumber")
+            applyJangImageHeaders(url, "https://e.jang.com.pk/lahore/$jangDate/page$pageNumber")
         }
         try {
             connection.connect()
             if (connection.responseCode !in 200..299) {
-                throw IllegalStateException("Jang returned HTTP ${connection.responseCode} for a page image.")
+                throw jangImageResponseError(
+                    url,
+                    connection,
+                    "Jang returned HTTP ${connection.responseCode} for an image."
+                )
             }
             val extension = url.path.substringAfterLast('.').lowercase()
             val contentType = connection.contentType?.substringBefore(';')?.trim()?.lowercase()
-            if (contentType?.startsWith("image/") != true &&
-                contentType != "application/octet-stream"
-            ) {
-                throw IllegalStateException("Jang returned an unexpected image type.")
+            if (!isJangImageContentType(contentType)) {
+                throw jangImageResponseError(
+                    url,
+                    connection,
+                    "Jang returned ${contentType ?: "no content type"} instead of an image."
+                )
             }
             if (connection.contentLengthLong > MAX_IMAGE_BYTES) {
                 throw IllegalStateException("Jang image is larger than expected.")
@@ -553,7 +605,11 @@ data class NewspaperEdition(
         }
     }
 
-    private fun downloadJangPageImage(directory: File, id: String) {
+    private fun downloadJangPageImage(
+        directory: File,
+        id: String,
+        jangImageDownloader: ((URL, String, File) -> Unit)?
+    ) {
         require(JANG_PAGE_PATTERN.matches(id) && id.startsWith("J${date}_")) {
             "Invalid Jang page ID."
         }
@@ -561,79 +617,63 @@ data class NewspaperEdition(
             throw IllegalStateException("Could not create image storage.")
         }
         val dateParts = date.split('_')
-        val jangDate = "${dateParts[1]}-${dateParts[0]}-${dateParts[2]}"
+        val jangDate = "${dateParts[0]}-${dateParts[1]}-${dateParts[2]}"
+        val staticDate = "${dateParts[1]}-${dateParts[0]}-${dateParts[2]}"
         val pageNumber = id.substringAfterLast('_').toInt()
         val referer = "https://e.jang.com.pk/lahore/$jangDate/page$pageNumber"
         var lastFailure: Exception? = null
         for (extension in listOf("jpg", "png")) {
             val url = URL(
-                "https://e.jang.com.pk/static_pages/$jangDate/lahore/mainpage/page$pageNumber.$extension"
+                "https://e.jang.com.pk/static_pages/$staticDate/lahore/mainpage/page$pageNumber.$extension"
             )
-            val destination = File(directory, "$id.$extension")
-            val temporaryImage = File(directory, "$id.$extension.tmp")
-            val connection = (url.openConnection() as HttpURLConnection).apply {
-                connectTimeout = 15_000
-                readTimeout = 30_000
-                instanceFollowRedirects = true
-                setRequestProperty(
-                    "User-Agent",
-                    "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0 Mobile Safari/537.36"
-                )
-                setRequestProperty("Referer", referer)
+            for (attempt in 0 until 3) {
+                try {
+                    downloadJangPageImageOnce(
+                        url,
+                        referer,
+                        directory,
+                        id,
+                        pageNumber,
+                        extension,
+                        jangImageDownloader
+                    )
+                    return
+                } catch (error: Exception) {
+                    lastFailure = error
+                    if (!isRetryableJangImageError(error) || attempt == 2) break
+                    pauseBeforeJangImageRetry(attempt)
+                }
             }
-            try {
-                connection.connect()
-                if (connection.responseCode !in 200..299) {
-                    throw IllegalStateException("Jang returned HTTP ${connection.responseCode} for page $pageNumber.")
-                }
-                val contentType = connection.contentType?.substringBefore(';')?.trim()
-                val expectedType = if (extension == "png") "image/png" else "image/jpeg"
-                if (contentType != expectedType) {
-                    throw IllegalStateException("Jang returned an unexpected image type for page $pageNumber.")
-                }
-                if (connection.contentLengthLong > MAX_IMAGE_BYTES) {
-                    throw IllegalStateException("Jang page $pageNumber is larger than expected.")
-                }
-                connection.inputStream.use { input ->
-                    FileOutputStream(temporaryImage).use { output ->
-                        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-                        var totalBytes = 0L
-                        val signature = ByteArray(if (extension == "png") 8 else 2)
-                        var signatureBytes = 0
-                        while (true) {
-                            val read = input.read(buffer)
-                            if (read < 0) break
-                            if (read == 0) continue
-                            val signatureLength = minOf(read, signature.size - signatureBytes)
-                            if (signatureLength > 0) {
-                                buffer.copyInto(
-                                    signature,
-                                    signatureBytes,
-                                    0,
-                                    signatureLength
-                                )
-                                signatureBytes += signatureLength
-                            }
-                            totalBytes += read
-                            if (totalBytes > MAX_IMAGE_BYTES) {
-                                throw IllegalStateException("Jang page $pageNumber is larger than expected.")
-                            }
-                            output.write(buffer, 0, read)
-                        }
-                        val validSignature = if (extension == "png") {
-                            signature.contentEquals(
-                                byteArrayOf(
-                                    0x89.toByte(), 0x50, 0x4e, 0x47,
-                                    0x0d, 0x0a, 0x1a, 0x0a
-                                )
-                            )
-                        } else {
-                            signature[0] == 0xff.toByte() && signature[1] == 0xd8.toByte()
-                        }
-                        if (!validSignature) {
-                            throw IllegalStateException("Jang returned an invalid image for page $pageNumber.")
-                        }
-                    }
+        }
+        val failureDetail = lastFailure?.message ?: "No response details were available."
+        throw IllegalStateException(
+            "Could not download Jang page $pageNumber as JPG or PNG: $failureDetail",
+            lastFailure
+        )
+    }
+
+    private fun downloadJangPageImageOnce(
+        url: URL,
+        referer: String,
+        directory: File,
+        id: String,
+        pageNumber: Int,
+        extension: String,
+        jangImageDownloader: ((URL, String, File) -> Unit)?
+    ) {
+        val destination = File(directory, "$id.$extension")
+        val temporaryImage = File(directory, "$id.download.tmp.$extension")
+        val connection = (url.openConnection() as HttpURLConnection).apply {
+            connectTimeout = 15_000
+            readTimeout = 30_000
+            instanceFollowRedirects = true
+            applyJangImageHeaders(url, referer)
+        }
+        try {
+            if (jangImageDownloader != null) {
+                jangImageDownloader(url, referer, temporaryImage)
+                require(temporaryImage.isImageFile()) {
+                    "Jang returned invalid image data for $url."
                 }
                 val otherFormat = File(directory, "$id.${if (extension == "jpg") "png" else "jpg"}")
                 if (otherFormat.exists() && !otherFormat.delete()) {
@@ -646,21 +686,157 @@ data class NewspaperEdition(
                     throw IllegalStateException("Could not save Jang page $pageNumber.")
                 }
                 return
-            } catch (error: Exception) {
-                temporaryImage.delete()
-                lastFailure = error
-            } finally {
-                connection.disconnect()
             }
+            connection.connect()
+            if (connection.responseCode !in 200..299) {
+                throw jangImageResponseError(
+                    url,
+                    connection,
+                    "Jang returned HTTP ${connection.responseCode} for an image."
+                )
+            }
+            val contentType = connection.contentType?.substringBefore(';')?.trim()?.lowercase()
+            if (!isJangImageContentType(contentType)) {
+                throw jangImageResponseError(
+                    url,
+                    connection,
+                    "Jang returned ${contentType ?: "no content type"} instead of an image."
+                )
+            }
+            if (connection.contentLengthLong > MAX_IMAGE_BYTES) {
+                throw IllegalStateException("Jang page $pageNumber is larger than expected.")
+            }
+            connection.inputStream.use { input ->
+                FileOutputStream(temporaryImage).use { output ->
+                    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                    val signature = ByteArray(if (extension == "png") 8 else 2)
+                    var signatureBytes = 0
+                    var totalBytes = 0L
+                    while (true) {
+                        val read = input.read(buffer)
+                        if (read < 0) break
+                        if (read == 0) continue
+                        val signatureLength = minOf(read, signature.size - signatureBytes)
+                        if (signatureLength > 0) {
+                            buffer.copyInto(signature, signatureBytes, 0, signatureLength)
+                            signatureBytes += signatureLength
+                        }
+                        totalBytes += read
+                        if (totalBytes > MAX_IMAGE_BYTES) {
+                            throw IllegalStateException("Jang page $pageNumber is larger than expected.")
+                        }
+                        output.write(buffer, 0, read)
+                    }
+                    val validSignature = if (extension == "png") {
+                        signature.contentEquals(
+                            byteArrayOf(
+                                0x89.toByte(), 0x50, 0x4e, 0x47,
+                                0x0d, 0x0a, 0x1a, 0x0a
+                            )
+                        )
+                    } else {
+                        signature[0] == 0xff.toByte() && signature[1] == 0xd8.toByte()
+                    }
+                    if (!validSignature) {
+                        throw IllegalStateException(
+                            "Jang returned invalid image data for page $pageNumber."
+                        )
+                    }
+                }
+            }
+            val otherFormat = File(directory, "$id.${if (extension == "jpg") "png" else "jpg"}")
+            if (otherFormat.exists() && !otherFormat.delete()) {
+                throw IllegalStateException("Could not replace Jang page $pageNumber.")
+            }
+            if (destination.exists() && !destination.delete()) {
+                throw IllegalStateException("Could not replace Jang page $pageNumber.")
+            }
+            if (!temporaryImage.renameTo(destination)) {
+                throw IllegalStateException("Could not save Jang page $pageNumber.")
+            }
+        } catch (error: Exception) {
+            temporaryImage.delete()
+            throw error
+        } finally {
+            connection.disconnect()
         }
-        throw IllegalStateException(
-            "Could not download Jang page $pageNumber as JPG or PNG.",
-            lastFailure
+    }
+
+    private fun HttpURLConnection.applyJangImageHeaders(url: URL, referer: String) {
+        setRequestProperty(
+            "User-Agent",
+            "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0 Mobile Safari/537.36"
         )
+        setRequestProperty("Referer", referer)
+        setRequestProperty("Accept", "*/*")
+        CookieManager.getInstance().getCookie(url.toString())
+            ?.takeIf { it.isNotBlank() }
+            ?.let { setRequestProperty("Cookie", it) }
+    }
+
+    private fun jangImageResponseError(
+        requestedUrl: URL,
+        connection: HttpURLConnection,
+        reason: String
+    ): IllegalStateException {
+        val responseBody = try {
+            val stream = if (connection.responseCode >= 400) {
+                connection.errorStream
+            } else {
+                connection.inputStream
+            }
+            stream?.use { input ->
+                val output = java.io.ByteArrayOutputStream()
+                val buffer = ByteArray(1024)
+                var totalBytes = 0
+                while (totalBytes < MAX_JANG_RESPONSE_BODY_BYTES) {
+                    val remaining = MAX_JANG_RESPONSE_BODY_BYTES - totalBytes
+                    val read = input.read(buffer, 0, minOf(buffer.size, remaining))
+                    if (read < 0) break
+                    if (read == 0) continue
+                    output.write(buffer, 0, read)
+                    totalBytes += read
+                }
+                val truncated = totalBytes == MAX_JANG_RESPONSE_BODY_BYTES && input.read() >= 0
+                String(output.toByteArray(), Charsets.UTF_8) +
+                    if (truncated) "\n[response body truncated]" else ""
+            } ?: "[response body unavailable]"
+        } catch (error: java.io.IOException) {
+            "[could not read response body: ${error.message ?: error.javaClass.simpleName}]"
+        }
+        return IllegalStateException(
+            "$reason\n" +
+                "Requested URL: $requestedUrl\n" +
+                "HTTP status: ${connection.responseCode}\n" +
+                "Final URL: ${connection.url}\n" +
+                "Content-Type: ${connection.contentType ?: "unknown"}\n" +
+                "Response body:\n$responseBody"
+        )
+    }
+
+    private fun isJangImageContentType(contentType: String?): Boolean =
+        contentType?.startsWith("image/") == true || contentType == "application/octet-stream"
+
+    private fun isRetryableJangImageError(error: Exception): Boolean {
+        if (error is java.io.IOException) return true
+        val message = error.message.orEmpty()
+        return "instead of an" in message ||
+            "invalid image" in message ||
+            Regex("Jang returned HTTP (403|408|429|5\\d{2})").containsMatchIn(message)
+    }
+
+    private fun pauseBeforeJangImageRetry(attempt: Int) {
+        try {
+            Thread.sleep(500L * (attempt + 1))
+        } catch (interrupted: InterruptedException) {
+            Thread.currentThread().interrupt()
+            throw IllegalStateException("Jang image download was interrupted.", interrupted)
+        }
     }
 
     companion object {
         private const val MAX_IMAGE_BYTES = 25L * 1024 * 1024
+        private const val MAX_JANG_RESPONSE_BODY_BYTES = 16 * 1024
         private val DATE_PATTERN = Regex("\\d{2}_\\d{2}_\\d{4}")
         private val PAGE_PATTERN = Regex("\\d{2}_\\d{2}_\\d{4}_\\d{3}")
         private val JANG_PAGE_PATTERN = Regex("J\\d{2}_\\d{2}_\\d{4}_\\d{3}")

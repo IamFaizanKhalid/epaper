@@ -7,6 +7,8 @@ import android.app.ProgressDialog
 import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
+import android.os.Looper
+import android.util.Base64
 import android.view.View
 import android.view.Gravity
 import android.widget.AdapterView
@@ -24,15 +26,36 @@ import android.widget.TextView
 import android.widget.Toast
 import org.json.JSONObject
 import org.json.JSONTokener
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
 import java.util.PriorityQueue
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 class MainActivity : Activity() {
+    private enum class JangImagePhase {
+        FETCHING,
+        VERIFYING_IMAGE
+    }
+
+    private class JangImageRequest(
+        val url: String,
+        val referer: String
+    ) {
+        val finished = CountDownLatch(1)
+        var phase = JangImagePhase.FETCHING
+        var verificationAttempts = 0
+        var transferAttempts = 0
+        val imageBuffer = ByteArrayOutputStream()
+        var imageData: ByteArray? = null
+        var error: String? = null
+    }
+
     private data class PaperHomeItem(
         val paper: Paper,
         val status: TextView,
@@ -43,6 +66,7 @@ class MainActivity : Activity() {
     private lateinit var inspectionWebView: WebView
     private lateinit var onDemandWebView: WebView
     private lateinit var jangWebView: WebView
+    private lateinit var jangImageWebView: WebView
     private lateinit var detailWebView: WebView
     private lateinit var pageLabel: TextView
     private lateinit var dateButton: Button
@@ -95,6 +119,8 @@ class MainActivity : Activity() {
     private var offlineDirectory: File? = null
     private var jangVerificationKey: String? = null
     private var jangVerificationGeneration = 0
+    private val jangImageTransferLock = Any()
+    private var activeJangImageRequest: JangImageRequest? = null
     private var pageScanInProgress = false
     private var storyScanInProgress = false
     private var onDemandStoryId: String? = null
@@ -544,6 +570,13 @@ class MainActivity : Activity() {
             importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
         }
         jangWebView.webViewClient = jangInspectionClient()
+        jangImageWebView = WebView(this).apply {
+            settings.javaScriptEnabled = true
+            settings.domStorageEnabled = true
+            visibility = View.INVISIBLE
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+        }
+        jangImageWebView.webViewClient = jangImageClient()
         detailWebView = WebView(this).apply {
             settings.javaScriptEnabled = true
             settings.domStorageEnabled = true
@@ -676,6 +709,13 @@ class MainActivity : Activity() {
         )
         webViewContainer.addView(
             jangWebView,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+        )
+        webViewContainer.addView(
+            jangImageWebView,
             FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT
@@ -880,6 +920,277 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun jangImageClient() = object : WebViewClient() {
+        override fun onPageFinished(view: WebView, url: String) {
+            val request = activeJangImageRequest ?: return
+            val uri = Uri.parse(url)
+            if (!uri.host.equals("e.jang.com.pk", ignoreCase = true)) return
+            if (url != request.url && uri.path?.startsWith("/cdn-cgi/") != true) return
+            request.phase = JangImagePhase.VERIFYING_IMAGE
+            inspectJangImageDocument(request)
+        }
+
+        override fun onReceivedError(
+            view: WebView,
+            request: WebResourceRequest,
+            error: android.webkit.WebResourceError
+        ) {
+            if (!request.isForMainFrame) return
+            val activeRequest = activeJangImageRequest ?: return
+            if (request.url.toString() != activeRequest.url &&
+                request.url.path?.startsWith("/cdn-cgi/") != true
+            ) return
+            finishJangImageRequest(
+                activeRequest,
+                error = "Could not load Jang image request: ${error.description} (${request.url})."
+            )
+        }
+    }
+
+    private fun inspectJangImageDocument(request: JangImageRequest) {
+        if (activeJangImageRequest !== request ||
+            request.phase != JangImagePhase.VERIFYING_IMAGE
+        ) return
+        val expectedUrl = JSONObject.quote(request.url)
+        val script = """
+            (() => {
+                const title = (document.title || '').toLowerCase();
+                const text = (document.body?.innerText || '').trim();
+                const lowerText = text.slice(0, 4000).toLowerCase();
+                const challenge = title.includes('moment, please') ||
+                    title.includes('just a moment') ||
+                    lowerText.includes('verify you are human') ||
+                    lowerText.includes('checking your browser') ||
+                    lowerText.includes('security verification') ||
+                    lowerText.includes('performing security verification') ||
+                    document.querySelector('#challenge-running, #challenge-stage');
+                const image = document.images[0];
+                return JSON.stringify({
+                    url: location.href,
+                    expected: location.href.split('#')[0] === $expectedUrl,
+                    challenge: Boolean(challenge),
+                    imageReady: Boolean(image && image.complete && image.naturalWidth > 0),
+                    message: text.slice(0, 1000)
+                });
+            })()
+        """.trimIndent()
+        jangImageWebView.evaluateJavascript(script) { result ->
+            if (activeJangImageRequest !== request) return@evaluateJavascript
+            try {
+                val json = JSONTokener(result).nextValue() as? String
+                    ?: throw IllegalStateException("Could not inspect Jang image response.")
+                val state = JSONObject(json)
+                if (state.optBoolean("challenge")) {
+                    if (request.verificationAttempts >= MAX_JANG_IMAGE_VERIFICATION_ATTEMPTS) {
+                        finishJangImageRequest(
+                            request,
+                            error = "Jang image verification timed out at ${state.optString("url")}."
+                        )
+                    } else {
+                        request.verificationAttempts++
+                        jangImageWebView.postDelayed(
+                            { inspectJangImageDocument(request) },
+                            JANG_IMAGE_VERIFICATION_RETRY_MILLIS
+                        )
+                    }
+                    return@evaluateJavascript
+                }
+                if (!state.optBoolean("expected") || !state.optBoolean("imageReady")) {
+                    finishJangImageRequest(
+                        request,
+                        error = "Jang did not return the requested image.\n" +
+                            "Requested URL: ${request.url}\n" +
+                            "Final URL: ${state.optString("url")}\n" +
+                            "Response page: ${state.optString("message")}"
+                    )
+                    return@evaluateJavascript
+                }
+                extractJangImageFromWebView(request)
+            } catch (error: Exception) {
+                finishJangImageRequest(
+                    request,
+                    error = error.message ?: "Could not inspect Jang image response."
+                )
+            }
+        }
+    }
+
+    private fun extractJangImageFromWebView(request: JangImageRequest) {
+        val script = """
+            (() => {
+                const image = document.images[0];
+                if (!image || !image.complete || image.naturalWidth <= 0) {
+                    return JSON.stringify({error: 'The verified Jang image is not ready.'});
+                }
+                try {
+                    const canvas = document.createElement('canvas');
+                    canvas.width = image.naturalWidth;
+                    canvas.height = image.naturalHeight;
+                    canvas.getContext('2d').drawImage(image, 0, 0);
+                    const type = image.currentSrc.toLowerCase().split('?')[0].endsWith('.png')
+                        ? 'image/png' : 'image/jpeg';
+                    window.__epaperImageTransferData =
+                        canvas.toDataURL(type, 1).split(',')[1];
+                    window.__epaperImageTransferOffset = 0;
+                } catch (error) {
+                    return JSON.stringify({error: String(error)});
+                }
+                return 'started';
+            })()
+        """.trimIndent()
+        jangImageWebView.evaluateJavascript(script) { result ->
+            if (activeJangImageRequest !== request) return@evaluateJavascript
+            try {
+                val value = JSONTokener(result).nextValue() as? String
+                    ?: throw IllegalStateException("Could not start the verified Jang image transfer.")
+                if (value != "started") {
+                    val payload = JSONObject(value)
+                    finishJangImageRequest(
+                        request,
+                        error = payload.optString("error", "Could not encode the verified Jang image.")
+                    )
+                    return@evaluateJavascript
+                }
+                readJangImageTransfer(request)
+            } catch (error: Exception) {
+                finishJangImageRequest(
+                    request,
+                    error = error.message ?: "Could not start the verified Jang image transfer."
+                )
+            }
+        }
+    }
+
+    private fun readJangImageTransfer(request: JangImageRequest) {
+        if (activeJangImageRequest !== request) return
+        val script = """
+            (() => {
+                const data = window.__epaperImageTransferData;
+                if (!data) return JSON.stringify({error: 'Verified image data is unavailable.'});
+                const start = window.__epaperImageTransferOffset || 0;
+                const end = Math.min(start + $JANG_IMAGE_TRANSFER_CHUNK_SIZE, data.length);
+                window.__epaperImageTransferOffset = end;
+                let chunk = data.slice(start, end);
+                if (end >= data.length) chunk = chunk.padEnd(Math.ceil(chunk.length / 4) * 4, '=');
+                return JSON.stringify({
+                    chunk: chunk,
+                    done: end >= data.length
+                });
+            })()
+        """.trimIndent()
+        jangImageWebView.evaluateJavascript(script) { result ->
+            if (activeJangImageRequest !== request) return@evaluateJavascript
+            try {
+                val json = JSONTokener(result).nextValue() as? String
+                    ?: throw IllegalStateException("Could not read the verified Jang image.")
+                val payload = JSONObject(json)
+                val error = payload.optString("error").takeIf { it.isNotBlank() && it != "null" }
+                if (error != null) {
+                    finishJangImageRequest(request, error = error)
+                    return@evaluateJavascript
+                }
+                val chunk = payload.optString("chunk")
+                if (chunk.isNotEmpty()) {
+                    request.imageBuffer.write(Base64.decode(chunk, Base64.DEFAULT))
+                    if (request.imageBuffer.size() > MAX_JANG_WEBVIEW_IMAGE_BYTES) {
+                        finishJangImageRequest(request, error = "Jang image is larger than expected.")
+                        return@evaluateJavascript
+                    }
+                }
+                if (payload.optBoolean("done")) {
+                    request.imageData = request.imageBuffer.toByteArray()
+                    finishJangImageRequest(request)
+                } else if (request.transferAttempts++ < MAX_JANG_IMAGE_TRANSFER_ATTEMPTS) {
+                    jangImageWebView.postDelayed(
+                        { readJangImageTransfer(request) },
+                        JANG_IMAGE_TRANSFER_POLL_MILLIS
+                    )
+                } else {
+                    finishJangImageRequest(
+                        request,
+                        error = "Timed out reading the verified Jang image data."
+                    )
+                }
+            } catch (error: Exception) {
+                finishJangImageRequest(
+                    request,
+                    error = error.message ?: "Could not read the verified Jang image."
+                )
+            }
+        }
+    }
+
+    private fun finishJangImageRequest(
+        request: JangImageRequest,
+        error: String? = null
+    ) {
+        if (activeJangImageRequest !== request) return
+        request.error = error
+        activeJangImageRequest = null
+        request.finished.countDown()
+    }
+
+    private fun downloadJangImageThroughWebView(
+        url: java.net.URL,
+        referer: String,
+        destination: File
+    ) {
+        require(url.protocol == "https" &&
+            url.host.equals("e.jang.com.pk", ignoreCase = true) &&
+            url.path.startsWith("/static_pages/")
+        ) { "Invalid Jang static image URL." }
+        check(Looper.myLooper() != Looper.getMainLooper()) {
+            "Jang image downloads must run off the main thread."
+        }
+        synchronized(jangImageTransferLock) {
+            val request = JangImageRequest(url.toString(), referer)
+            runOnUiThread {
+                if (shuttingDown || isDestroyed) {
+                    finishJangImageRequest(request, error = "Jang image download was cancelled.")
+                } else {
+                    activeJangImageRequest = request
+                    jangImageWebView.loadUrl(
+                        request.url,
+                        mapOf(
+                            "Referer" to request.referer,
+                            "Accept" to "*/*"
+                        )
+                    )
+                }
+            }
+            if (!request.finished.await(JANG_IMAGE_DOWNLOAD_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                runOnUiThread {
+                    finishJangImageRequest(request, error = "Jang image download timed out.")
+                    jangImageWebView.stopLoading()
+                }
+                throw IllegalStateException("Jang image download timed out for $url.")
+            }
+            request.error?.let { throw IllegalStateException(it) }
+            val imageBytes = request.imageData
+                ?: throw IllegalStateException("Jang returned no image data for $url.")
+            destination.outputStream().use { it.write(imageBytes) }
+        }
+    }
+
+    private fun downloadEditionPageImage(
+        edition: NewspaperEdition,
+        directory: File,
+        pageId: String
+    ) {
+        edition.downloadPageImage(directory, pageId) { url, referer, destination ->
+            downloadJangImageThroughWebView(url, referer, destination)
+        }
+    }
+
+    private fun downloadEditionFullImages(
+        edition: NewspaperEdition,
+        directory: File,
+        ids: List<String>
+    ) {
+        edition.downloadFullImages(directory, ids, { _, _ -> }) { url, referer, destination ->
+            downloadJangImageThroughWebView(url, referer, destination)
+        }
+    }
     private fun loadPage() {
         updatePageLabel()
         val edition = readerEdition() ?: return
@@ -926,6 +1237,10 @@ class MainActivity : Activity() {
     }
 
     private fun openEdition(edition: NewspaperEdition) {
+        openVerifiedEdition(edition)
+    }
+
+    private fun openVerifiedEdition(edition: NewspaperEdition) {
         availableEdition = edition
         readerMode = true
         homeScreen.visibility = View.GONE
@@ -1120,7 +1435,11 @@ class MainActivity : Activity() {
                     }
                 } ?: break
                 try {
-                    request.edition.downloadPageImage(request.directory, request.page.id)
+                    downloadEditionPageImage(
+                        request.edition,
+                        request.directory,
+                        request.page.id
+                    )
                     runOnUiThread {
                         val isCurrentEdition = editionInProgress === request.edition
                         if (isCurrentEdition) {
@@ -1312,7 +1631,7 @@ class MainActivity : Activity() {
         downloadExecutor.execute {
             missingImages.forEach { id ->
                 try {
-                    edition.downloadFullImages(directory, listOf(id)) { _, _ -> }
+                    downloadEditionFullImages(edition, directory, listOf(id))
                     runOnUiThread {
                         try {
                             val metadata = File(directory, "edition.json")
@@ -1491,7 +1810,7 @@ class MainActivity : Activity() {
         )
         downloadExecutor.execute {
             try {
-                downloadEdition.downloadFullImages(directory, imageIds) { _, _ -> }
+                downloadEditionFullImages(downloadEdition, directory, imageIds)
                 downloadEdition.downloadArticleImages(directory)
                 runOnUiThread {
                     if (editionInProgress !== edition) return@runOnUiThread
@@ -2032,7 +2351,7 @@ class MainActivity : Activity() {
         refreshDownloadIndicator()
         downloadExecutor.execute {
             try {
-                edition.downloadFullImages(directory, listOf(id)) { _, _ -> }
+                downloadEditionFullImages(edition, directory, listOf(id))
                 runOnUiThread {
                     try {
                         val metadata = File(directory, "edition.json")
@@ -2128,7 +2447,7 @@ class MainActivity : Activity() {
         refreshDownloadIndicator()
         downloadExecutor.execute {
             try {
-                edition.downloadFullImages(directory, listOf(id)) { _, _ -> }
+                downloadEditionFullImages(edition, directory, listOf(id))
                 runOnUiThread {
                     try {
                         val metadata = File(directory, "edition.json")
@@ -2203,6 +2522,10 @@ class MainActivity : Activity() {
 
     private fun showMessage(message: String) {
         if (shuttingDown || isFinishing || isDestroyed || Thread.currentThread().isInterrupted) return
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            runOnUiThread { showMessage(message) }
+            return
+        }
         Toast.makeText(this, message, Toast.LENGTH_LONG).show()
     }
 
@@ -2236,6 +2559,13 @@ class MainActivity : Activity() {
     private companion object {
         const val MAX_AVAILABILITY_ATTEMPTS = 20
         const val AVAILABILITY_RETRY_MILLIS = 1_500L
+        const val MAX_JANG_IMAGE_VERIFICATION_ATTEMPTS = 60
+        const val JANG_IMAGE_VERIFICATION_RETRY_MILLIS = 1_000L
+        const val MAX_JANG_IMAGE_TRANSFER_ATTEMPTS = 2_000
+        const val JANG_IMAGE_TRANSFER_POLL_MILLIS = 25L
+        const val JANG_IMAGE_TRANSFER_CHUNK_SIZE = 256 * 1024
+        const val JANG_IMAGE_DOWNLOAD_TIMEOUT_SECONDS = 120L
+        const val MAX_JANG_WEBVIEW_IMAGE_BYTES = 20 * 1024 * 1024
     }
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
@@ -2246,6 +2576,7 @@ class MainActivity : Activity() {
         webView.destroy()
         inspectionWebView.destroy()
         jangWebView.destroy()
+        jangImageWebView.destroy()
         detailWebView.destroy()
         availabilityWebViews.values.forEach(WebView::destroy)
         super.onDestroy()

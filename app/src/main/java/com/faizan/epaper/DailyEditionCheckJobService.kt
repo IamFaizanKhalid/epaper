@@ -529,7 +529,7 @@ abstract class NewspaperEditionCheckJobService : JobService() {
             var downloadFailed = false
             try {
                 if (imageIds.isNotEmpty()) {
-                    updated.downloadFullImages(directory, imageIds) { _, _ -> }
+                    updated.downloadFullImages(directory, imageIds, onProgress = { _, _ -> })
                 }
                 updated.downloadArticleImages(directory)
             } catch (error: Exception) {
