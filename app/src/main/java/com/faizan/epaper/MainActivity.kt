@@ -43,7 +43,8 @@ import java.util.concurrent.TimeUnit
 class MainActivity : Activity() {
     private enum class JangImagePhase {
         FETCHING,
-        VERIFYING_IMAGE
+        VERIFYING_IMAGE,
+        VERIFYING_PAGE
     }
 
     private class JangImageRequest(
@@ -53,6 +54,8 @@ class MainActivity : Activity() {
         val finished = CountDownLatch(1)
         var phase = JangImagePhase.FETCHING
         var verificationAttempts = 0
+        var redirectAttempts = 0
+        var pageImageAttempts = 0
         var transferAttempts = 0
         val imageBuffer = ByteArrayOutputStream()
         var imageData: ByteArray? = null
@@ -565,6 +568,7 @@ class MainActivity : Activity() {
 
         webView = WebView(this).apply {
             settings.javaScriptEnabled = true
+            settings.domStorageEnabled = true
             settings.setSupportZoom(true)
             settings.builtInZoomControls = true
             settings.displayZoomControls = false
@@ -628,6 +632,7 @@ class MainActivity : Activity() {
                     }
                     return request.url.scheme !in setOf("file", "data", "about")
                 }
+
             }
         }
         inspectionWebView = WebView(this).apply {
@@ -1013,6 +1018,7 @@ class MainActivity : Activity() {
                             text.includes('checking your browser') ||
                             text.includes('security verification') ||
                             text.includes('performing security verification') ||
+                            text.includes('request is being verified') ||
                             document.querySelector('#challenge-running, #challenge-stage');
                         return JSON.stringify({
                             challenge: Boolean(challenge),
@@ -1082,8 +1088,9 @@ class MainActivity : Activity() {
             val request = activeJangImageRequest ?: return
             val uri = Uri.parse(url)
             if (!uri.host.equals("e.jang.com.pk", ignoreCase = true)) return
-            if (url != request.url && uri.path?.startsWith("/cdn-cgi/") != true) return
-            request.phase = JangImagePhase.VERIFYING_IMAGE
+            if (request.phase != JangImagePhase.VERIFYING_PAGE) {
+                request.phase = JangImagePhase.VERIFYING_IMAGE
+            }
             inspectJangImageDocument(request)
         }
 
@@ -1094,20 +1101,15 @@ class MainActivity : Activity() {
         ) {
             if (!request.isForMainFrame) return
             val activeRequest = activeJangImageRequest ?: return
-            if (request.url.toString() != activeRequest.url &&
-                request.url.path?.startsWith("/cdn-cgi/") != true
-            ) return
             finishJangImageRequest(
                 activeRequest,
-                error = "Could not load Jang image request: ${error.description} (${request.url})."
+                error = "Could not load Jang verification request: ${error.description} (${request.url})."
             )
         }
     }
 
     private fun inspectJangImageDocument(request: JangImageRequest) {
-        if (activeJangImageRequest !== request ||
-            request.phase != JangImagePhase.VERIFYING_IMAGE
-        ) return
+        if (activeJangImageRequest !== request) return
         val expectedUrl = JSONObject.quote(request.url)
         val script = """
             (() => {
@@ -1120,13 +1122,17 @@ class MainActivity : Activity() {
                     lowerText.includes('checking your browser') ||
                     lowerText.includes('security verification') ||
                     lowerText.includes('performing security verification') ||
+                    lowerText.includes('request is being verified') ||
                     document.querySelector('#challenge-running, #challenge-stage');
                 const image = document.images[0];
+                const pageImage = document.querySelector('img[usemap]');
                 return JSON.stringify({
                     url: location.href,
                     expected: location.href.split('#')[0] === $expectedUrl,
                     challenge: Boolean(challenge),
                     imageReady: Boolean(image && image.complete && image.naturalWidth > 0),
+                    pageImageReady: Boolean(pageImage && pageImage.complete &&
+                        pageImage.naturalWidth > 0),
                     message: text.slice(0, 1000)
                 });
             })()
@@ -1152,6 +1158,33 @@ class MainActivity : Activity() {
                     }
                     return@evaluateJavascript
                 }
+                if (request.phase == JangImagePhase.VERIFYING_PAGE) {
+                    if (state.optBoolean("pageImageReady")) {
+                        extractJangImageFromWebView(request, usePageScanImage = true)
+                        return@evaluateJavascript
+                    }
+                    if (request.pageImageAttempts++ < MAX_JANG_PAGE_IMAGE_WAIT_ATTEMPTS) {
+                        jangImageWebView.postDelayed(
+                            { inspectJangImageDocument(request) },
+                            JANG_VERIFIED_PAGE_WAIT_MILLIS
+                        )
+                    } else {
+                        request.phase = JangImagePhase.FETCHING
+                        jangImageWebView.loadUrl(
+                            request.url,
+                            mapOf("Referer" to request.referer, "Accept" to "*/*")
+                        )
+                    }
+                    return@evaluateJavascript
+                }
+                if (!state.optBoolean("expected") && !state.optBoolean("challenge") &&
+                    request.redirectAttempts < MAX_JANG_IMAGE_REDIRECT_RETRIES
+                ) {
+                    request.redirectAttempts++
+                    request.phase = JangImagePhase.VERIFYING_PAGE
+                    jangImageWebView.loadUrl(request.referer)
+                    return@evaluateJavascript
+                }
                 if (!state.optBoolean("expected") || !state.optBoolean("imageReady")) {
                     finishJangImageRequest(
                         request,
@@ -1172,10 +1205,18 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun extractJangImageFromWebView(request: JangImageRequest) {
+    private fun extractJangImageFromWebView(
+        request: JangImageRequest,
+        usePageScanImage: Boolean = false
+    ) {
+        val imageSelector = if (usePageScanImage) {
+            "document.querySelector('img[usemap]')"
+        } else {
+            "document.images[0]"
+        }
         val script = """
             (() => {
-                const image = document.images[0];
+                const image = $imageSelector;
                 if (!image || !image.complete || image.naturalWidth <= 0) {
                     return JSON.stringify({error: 'The verified Jang image is not ready.'});
                 }
@@ -1184,8 +1225,7 @@ class MainActivity : Activity() {
                     canvas.width = image.naturalWidth;
                     canvas.height = image.naturalHeight;
                     canvas.getContext('2d').drawImage(image, 0, 0);
-                    const type = image.currentSrc.toLowerCase().split('?')[0].endsWith('.png')
-                        ? 'image/png' : 'image/jpeg';
+                    const type = ${if (usePageScanImage) "'image/jpeg'" else "image.currentSrc.toLowerCase().split('?')[0].endsWith('.png') ? 'image/png' : 'image/jpeg'"};
                     window.__epaperImageTransferData =
                         canvas.toDataURL(type, 1).split(',')[1];
                     window.__epaperImageTransferOffset = 0;
@@ -1294,7 +1334,8 @@ class MainActivity : Activity() {
     ) {
         require(url.protocol == "https" &&
             url.host.equals("e.jang.com.pk", ignoreCase = true) &&
-            url.path.startsWith("/static_pages/")
+            (url.path.startsWith("/static_pages/") ||
+                url.path.startsWith("/assets/uploads/"))
         ) { "Invalid Jang static image URL." }
         check(Looper.myLooper() != Looper.getMainLooper()) {
             "Jang image downloads must run off the main thread."
@@ -2187,7 +2228,9 @@ class MainActivity : Activity() {
         downloadExecutor.execute {
             try {
                 downloadEditionFullImages(downloadEdition, directory, imageIds)
-                downloadEdition.downloadArticleImages(directory)
+                downloadEdition.downloadArticleImages(directory) { url, referer, destination ->
+                    downloadJangImageThroughWebView(url, referer, destination)
+                }
                 runOnUiThread {
                     if (editionInProgress !== edition) return@runOnUiThread
                     storyScanComplete = true
@@ -2979,7 +3022,10 @@ class MainActivity : Activity() {
         const val MAX_AVAILABILITY_ATTEMPTS = 20
         const val AVAILABILITY_RETRY_MILLIS = 1_500L
         const val MAX_JANG_IMAGE_VERIFICATION_ATTEMPTS = 60
+        const val MAX_JANG_IMAGE_REDIRECT_RETRIES = 3
         const val JANG_IMAGE_VERIFICATION_RETRY_MILLIS = 1_000L
+        const val JANG_VERIFIED_PAGE_WAIT_MILLIS = 1_500L
+        const val MAX_JANG_PAGE_IMAGE_WAIT_ATTEMPTS = 15
         const val MAX_JANG_IMAGE_TRANSFER_ATTEMPTS = 2_000
         const val JANG_IMAGE_TRANSFER_POLL_MILLIS = 25L
         const val JANG_IMAGE_TRANSFER_CHUNK_SIZE = 256 * 1024

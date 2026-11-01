@@ -4,6 +4,9 @@ import org.json.JSONArray
 import org.json.JSONObject
 import android.app.job.JobService
 import java.io.File
+import java.net.URL
+
+typealias JangImageDownloader = (URL, String, File) -> Unit
 
 enum class NewspaperId(val storageName: String, val displayName: String) {
     DAWN("dawn", "Dawn"),
@@ -53,12 +56,13 @@ interface Paper {
     fun downloadEdition(
         edition: NewspaperEdition,
         directory: File,
+        jangImageDownloader: JangImageDownloader? = null,
         onProgress: (Int, Int) -> Unit
     ) {
         val pages = edition.readingOrder
         pages.forEachIndexed { index, page ->
             if (!edition.hasPageImage(directory, page.id)) {
-                edition.downloadPageImage(directory, page.id)
+                edition.downloadPageImage(directory, page.id, jangImageDownloader)
             }
             onProgress(index + 1, pages.size)
         }
@@ -287,7 +291,9 @@ private class JangLahorePaper : Paper {
             const pageText = (document.body?.innerText || '').toLowerCase();
             if (document.title.toLowerCase().includes('moment, please') ||
                 pageText.includes('verify you are human') ||
-                pageText.includes('security verification')) {
+                pageText.includes('security verification') ||
+                pageText.includes('request is being verified') ||
+                document.querySelector('#challenge-running, #challenge-stage')) {
                 return JSON.stringify({error: 'VERIFYING'});
             }
             const requested = '${date.replace('_', '-')}';
@@ -320,7 +326,9 @@ private class JangLahorePaper : Paper {
             const text = (document.body?.innerText || '').slice(0, 4000).toLowerCase();
             if (title.includes('moment, please') || title.includes('just a moment') ||
                 text.includes('verify you are human') || text.includes('checking your browser') ||
-                text.includes('security verification') || document.querySelector('#challenge-running, #challenge-stage')) {
+                text.includes('security verification') ||
+                text.includes('request is being verified') ||
+                document.querySelector('#challenge-running, #challenge-stage')) {
                 return JSON.stringify({verifying: true});
             }
             const content = document.querySelector('.detail-content');
@@ -380,6 +388,7 @@ private class JangLahorePaper : Paper {
               if (title.includes('moment, please') || title.includes('just a moment') ||
                   text.includes('verify you are human') || text.includes('checking your browser') ||
                   text.includes('security verification') ||
+                  text.includes('request is being verified') ||
                   document.querySelector('#challenge-running, #challenge-stage')) {
                 return JSON.stringify({verifying: true});
               }

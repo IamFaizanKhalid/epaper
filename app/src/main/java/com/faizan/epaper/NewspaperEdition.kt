@@ -72,7 +72,7 @@ data class NewspaperEdition(
     fun downloadPageImage(
         directory: File,
         id: String,
-        jangImageDownloader: ((URL, String, File) -> Unit)? = null
+        jangImageDownloader: JangImageDownloader? = null
     ) {
         require(pages.any { it.id == id }) { "Invalid newspaper page ID." }
         if (isJangEdition) {
@@ -107,7 +107,7 @@ data class NewspaperEdition(
         directory: File,
         ids: List<String>,
         onProgress: (Int, Int) -> Unit,
-        jangImageDownloader: ((URL, String, File) -> Unit)? = null
+        jangImageDownloader: JangImageDownloader? = null
     ) {
         if (isJangEdition) {
             downloadJangImages(directory, ids, onProgress, jangImageDownloader)
@@ -138,8 +138,17 @@ data class NewspaperEdition(
             }
         }
 
-    fun downloadArticleImages(directory: File) {
+    fun downloadArticleImages(
+        directory: File,
+        jangImageDownloader: JangImageDownloader? = null
+    ) {
         if (!isJangEdition) return
+        val imageDirectory = File(directory, "article-images")
+        if (articles.any { it.imageUrls.isNotEmpty() } &&
+            !imageDirectory.exists() && !imageDirectory.mkdirs()
+        ) {
+            throw IllegalStateException("Could not create article image storage.")
+        }
         articles.forEach { article ->
             article.imageUrls.indices.forEach { index ->
                 val destination = articleImageFile(directory, article, index)
@@ -148,7 +157,8 @@ data class NewspaperEdition(
                     downloadJangArticleImage(
                         validatedJangArticleImageUrl(article.imageUrls[index]),
                         article.id,
-                        destination
+                        destination,
+                        jangImageDownloader
                     )
                 }
             }
@@ -223,7 +233,35 @@ data class NewspaperEdition(
         }
     }
 
-    private fun downloadJangArticleImage(url: URL, articleId: String, destination: File) {
+    private fun downloadJangArticleImage(
+        url: URL,
+        articleId: String,
+        destination: File,
+        jangImageDownloader: JangImageDownloader?
+    ) {
+        if (jangImageDownloader != null) {
+            val temporaryImage = File(destination.parentFile, "${destination.name}.download")
+            try {
+                jangImageDownloader(
+                    url,
+                    "https://e.jang.com.pk/detail/$articleId",
+                    temporaryImage
+                )
+                require(temporaryImage.isImageFile()) {
+                    "Jang returned invalid article image data for $url."
+                }
+                if (destination.exists() && !destination.delete()) {
+                    throw IllegalStateException("Could not replace the saved Jang article image.")
+                }
+                if (!temporaryImage.renameTo(destination)) {
+                    throw IllegalStateException("Could not save the Jang article image.")
+                }
+            } catch (error: Exception) {
+                temporaryImage.delete()
+                throw error
+            }
+            return
+        }
         var lastFailure: Exception? = null
         repeat(3) { attempt ->
             try {
@@ -338,7 +376,7 @@ data class NewspaperEdition(
         jangDate: String,
         pageNumber: Int,
         destination: File,
-        jangImageDownloader: ((URL, String, File) -> Unit)?
+        jangImageDownloader: JangImageDownloader?
     ) {
         if (jangImageDownloader != null) {
             val extension = url.path.substringAfterLast('.').lowercase()
@@ -608,7 +646,7 @@ data class NewspaperEdition(
     private fun downloadJangPageImage(
         directory: File,
         id: String,
-        jangImageDownloader: ((URL, String, File) -> Unit)?
+        jangImageDownloader: JangImageDownloader?
     ) {
         require(JANG_PAGE_PATTERN.matches(id) && id.startsWith("J${date}_")) {
             "Invalid Jang page ID."
