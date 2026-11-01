@@ -22,9 +22,11 @@ import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ProgressBar
+import android.widget.ScrollView
 import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
+import org.json.JSONArray
 import org.json.JSONObject
 import org.json.JSONTokener
 import java.io.ByteArrayOutputStream
@@ -76,6 +78,11 @@ class MainActivity : Activity() {
     private lateinit var webViewContainer: FrameLayout
     private lateinit var pageSpinner: Spinner
     private lateinit var paperList: LinearLayout
+    private lateinit var savedStoriesList: LinearLayout
+    private lateinit var papersButton: Button
+    private lateinit var previousPageButton: Button
+    private lateinit var nextPageButton: Button
+    private lateinit var saveStoryButton: Button
     private val paperViewer: PaperViewer = WebPaperViewer()
     private val papers = Papers.all
     private val paperHomeItems = linkedMapOf<NewspaperId, PaperHomeItem>()
@@ -96,6 +103,7 @@ class MainActivity : Activity() {
     private var pageNumber = 1
     private var readerMode = false
     private var viewingStoryContent = false
+    private var viewingSavedStory = false
     private var articleTextViewerActive = false
     private var articleTextScale = 1f
     private lateinit var articleScaleGestureDetector: ScaleGestureDetector
@@ -143,6 +151,7 @@ class MainActivity : Activity() {
     private var storyScanComplete = false
     private var pageDownloadFailed = false
     private val dateFormat = SimpleDateFormat("dd_MM_yyyy", Locale.US)
+    private val savedStories = mutableListOf<SavedStory>()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -153,6 +162,7 @@ class MainActivity : Activity() {
         articleTextScale = getSharedPreferences(PREFERENCES, MODE_PRIVATE)
             .getFloat(ARTICLE_TEXT_SCALE_KEY, DEFAULT_ARTICLE_TEXT_SCALE)
             .coerceIn(MIN_ARTICLE_TEXT_SCALE, MAX_ARTICLE_TEXT_SCALE)
+        loadSavedStories()
         createReaderView()
         installArticleScaleGestureDetector()
         createPaperAvailabilityWebViews()
@@ -422,6 +432,10 @@ class MainActivity : Activity() {
             setBackgroundColor(homeBackgroundColor())
         }
         dateButton = button("") { chooseDate() }
+        homeScreen.addView(dateButton)
+        val homeContent = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
         val title = TextView(this).apply {
             text = "Newspapers"
             textSize = 20f
@@ -434,6 +448,15 @@ class MainActivity : Activity() {
             setPadding(0, dp(4), 0, dp(6))
         }
         paperList = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        val savedStoriesTitle = TextView(this).apply {
+            text = "Saved Stories"
+            textSize = 20f
+            setTextColor(primaryTextColor())
+            setPadding(0, dp(18), 0, dp(4))
+        }
+        savedStoriesList = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
         }
         papers.forEach { paper ->
@@ -478,9 +501,22 @@ class MainActivity : Activity() {
             paperHomeItems[paper.id] = PaperHomeItem(paper, status, downloadIndicator)
         }
 
-        homeScreen.addView(dateButton)
-        homeScreen.addView(title)
-        homeScreen.addView(paperList)
+        homeContent.addView(title)
+        homeContent.addView(paperList)
+        homeContent.addView(savedStoriesTitle)
+        homeContent.addView(savedStoriesList)
+        homeScreen.addView(
+            ScrollView(this).apply {
+                isFillViewport = true
+                addView(homeContent)
+            },
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                0,
+                1f
+            )
+        )
+        updateSavedStoriesList()
         readerScreen = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(surfaceColor())
@@ -488,12 +524,14 @@ class MainActivity : Activity() {
         val pageControls = LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
         }
-        pageControls.addView(button("Papers") { showHome() })
-        pageControls.addView(button("Prev") {
+        papersButton = button("Papers") { onReaderBackButton() }
+        pageControls.addView(papersButton)
+        previousPageButton = button("Prev") {
             val pages = readerEdition()?.readingOrder.orEmpty()
             val index = pages.indexOfFirst { it.id.endsWith("_${pageNumber.toString().padStart(3, '0')}") }
             if (index > 0) openReaderPage(pages[index - 1])
-        })
+        }
+        pageControls.addView(previousPageButton)
         pageSpinner = Spinner(this)
         pageAdapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, mutableListOf())
         pageAdapter?.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
@@ -514,11 +552,14 @@ class MainActivity : Activity() {
             }
         }
         pageControls.addView(pageSpinner, LinearLayout.LayoutParams(0, dp(48), 1f))
-        pageControls.addView(button("Next") {
+        nextPageButton = button("Next") {
             val pages = readerEdition()?.readingOrder.orEmpty()
             val index = pages.indexOfFirst { it.id.endsWith("_${pageNumber.toString().padStart(3, '0')}") }
             if (index >= 0 && index < pages.lastIndex) openReaderPage(pages[index + 1])
-        })
+        }
+        pageControls.addView(nextPageButton)
+        saveStoryButton = button("Save") { saveCurrentStory() }
+        pageControls.addView(saveStoryButton)
         readerScreen.addView(pageLabel)
         readerScreen.addView(pageControls)
 
@@ -788,6 +829,7 @@ class MainActivity : Activity() {
             LinearLayout.LayoutParams.MATCH_PARENT
         ))
         setContentView(root)
+        setArticleTextViewerMode(false)
         pageLabel.text = ""
         updateDateButton()
         updatePageLabel()
@@ -827,6 +869,23 @@ class MainActivity : Activity() {
         webView.settings.setSupportZoom(!enabled)
         webView.settings.builtInZoomControls = !enabled
         webView.settings.displayZoomControls = false
+        papersButton.text = if (enabled) "Back" else "Papers"
+        pageLabel.visibility = if (enabled) View.GONE else View.VISIBLE
+        previousPageButton.visibility = if (enabled) View.GONE else View.VISIBLE
+        pageSpinner.visibility = if (enabled) View.GONE else View.VISIBLE
+        nextPageButton.visibility = if (enabled) View.GONE else View.VISIBLE
+        saveStoryButton.visibility = if (enabled) View.VISIBLE else View.GONE
+        refreshSaveStoryButton()
+    }
+
+    private fun onReaderBackButton() {
+        if (!articleTextViewerActive) {
+            showHome()
+        } else if (viewingSavedStory) {
+            showHome()
+        } else {
+            returnToCurrentPaperPage()
+        }
     }
 
     private fun renderArticleHtml(
@@ -1353,6 +1412,9 @@ class MainActivity : Activity() {
 
     private fun showHome() {
         cancelOnDemandPageRequest()
+        viewingSavedStory = false
+        viewingStoryContent = false
+        setArticleTextViewerMode(false)
         readerMode = false
         homeScreen.visibility = View.VISIBLE
         readerScreen.visibility = View.GONE
@@ -1360,6 +1422,7 @@ class MainActivity : Activity() {
     }
 
     private fun openEdition(edition: NewspaperEdition) {
+        viewingSavedStory = false
         openVerifiedEdition(edition)
     }
 
@@ -1869,6 +1932,182 @@ class MainActivity : Activity() {
         ) availableEdition = edition
     }
 
+    private fun loadSavedStories() {
+        val savedJson = getSharedPreferences(PREFERENCES, MODE_PRIVATE)
+            .getString(SAVED_STORIES_KEY, null) ?: return
+        try {
+            val parsedStories = JSONArray(savedJson)
+            val loaded = (0 until parsedStories.length()).map { index ->
+                val value = parsedStories.getJSONObject(index)
+                val articleValue = value.getJSONObject("article")
+                val paragraphs = articleValue.getJSONArray("paragraphs")
+                val imageUrls = articleValue.getJSONArray("imageUrls")
+                val article = NewspaperArticle(
+                    id = articleValue.getString("id"),
+                    title = articleValue.getString("title"),
+                    byline = articleValue.optString("byline"),
+                    paragraphs = (0 until paragraphs.length()).map(paragraphs::getString),
+                    imageUrls = (0 until imageUrls.length()).map(imageUrls::getString)
+                )
+                SavedStory(
+                    paperId = NewspaperId.entries.firstOrNull {
+                        it.storageName == value.getString("paperId")
+                    } ?: throw IllegalArgumentException("Saved story has an unknown newspaper."),
+                    date = value.getString("date"),
+                    article = article
+                )
+            }
+            savedStories.clear()
+            savedStories.addAll(loaded.distinctBy(SavedStory::key))
+        } catch (error: Exception) {
+            showMessage(error.message ?: "Could not load saved stories.")
+        }
+    }
+
+    private fun persistSavedStories() {
+        val payload = JSONArray().apply {
+            savedStories.forEach { saved ->
+                put(JSONObject().apply {
+                    put("paperId", saved.paperId.storageName)
+                    put("date", saved.date)
+                    put("article", JSONObject().apply {
+                        put("id", saved.article.id)
+                        put("title", saved.article.title)
+                        put("byline", saved.article.byline)
+                        put("paragraphs", JSONArray(saved.article.paragraphs))
+                        put("imageUrls", JSONArray(saved.article.imageUrls))
+                    })
+                })
+            }
+        }
+        getSharedPreferences(PREFERENCES, MODE_PRIVATE).edit()
+            .putString(SAVED_STORIES_KEY, payload.toString())
+            .apply()
+        updateSavedStoriesList()
+        refreshSaveStoryButton()
+    }
+
+    private fun updateSavedStoriesList() {
+        if (!::savedStoriesList.isInitialized) return
+        savedStoriesList.removeAllViews()
+        if (savedStories.isEmpty()) {
+            savedStoriesList.addView(TextView(this).apply {
+                text = "No saved stories yet."
+                textSize = 14f
+                setTextColor(secondaryTextColor())
+                setPadding(0, dp(4), 0, dp(12))
+            })
+            return
+        }
+        savedStories.forEach { saved ->
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(12), dp(8), dp(4), dp(8))
+                setBackgroundColor(surfaceColor())
+            }
+            val label = TextView(this).apply {
+                text = "${saved.article.title}\n${saved.paperId.displayName} · ${formatDate(saved.date)}"
+                textSize = 15f
+                setTextColor(primaryTextColor())
+                setPadding(0, 0, dp(8), 0)
+                setOnClickListener { openSavedStory(saved) }
+            }
+            row.addView(
+                label,
+                LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            )
+            row.addView(button("Remove") {
+                savedStories.removeAll { it.key == saved.key }
+                persistSavedStories()
+            })
+            row.setOnClickListener { openSavedStory(saved) }
+            savedStoriesList.addView(row)
+        }
+    }
+
+    private fun saveCurrentStory() {
+        val edition = offlineEdition ?: return
+        val articleId = displayedArticleId ?: return
+        val article = edition.articles.firstOrNull { it.id == articleId } ?: run {
+            showMessage("Story details are not ready to save.")
+            return
+        }
+        val saved = SavedStory(edition.paperId, edition.date, article)
+        val existingIndex = savedStories.indexOfFirst { it.key == saved.key }
+        if (existingIndex >= 0) {
+            savedStories.removeAt(existingIndex)
+            showMessage("Story removed from saved stories.")
+        } else {
+            savedStories.add(0, saved)
+            showMessage("Story saved.")
+        }
+        persistSavedStories()
+    }
+
+    private fun refreshSaveStoryButton() {
+        if (!::saveStoryButton.isInitialized) return
+        val edition = offlineEdition
+        val articleId = displayedArticleId
+        val isSaved = edition != null && articleId != null &&
+            savedStories.any {
+                it.paperId == edition.paperId &&
+                    it.date == edition.date &&
+                    it.article.id == articleId
+            }
+        saveStoryButton.text = if (isSaved) "Saved" else "Save"
+    }
+
+    private fun openSavedStory(saved: SavedStory) {
+        val paper = Papers[saved.paperId]
+        val directory = paper.editionDirectory(File(filesDir, "editions"), saved.date)
+        val metadata = File(directory, "edition.json")
+        val storedEdition = if (metadata.isFile) {
+            runCatching { NewspaperEdition.readMetadata(metadata) }
+                .getOrElse { error ->
+                    showMessage(error.message ?: "Could not open the saved story.")
+                    return
+                }
+        } else {
+            NewspaperEdition(
+                date = saved.date,
+                latestDate = saved.date,
+                pages = emptyList(),
+                isJangEdition = saved.paperId == NewspaperId.JANG_LAHORE,
+                paperId = saved.paperId
+            )
+        }
+        if (storedEdition.paperId != saved.paperId || storedEdition.date != saved.date) {
+            showMessage("Saved story edition details do not match.")
+            return
+        }
+        val edition = storedEdition.copy(
+            articles = storedEdition.articles.filterNot { it.id == saved.article.id } +
+                saved.article
+        )
+        selectedDate.time = dateFormat.parse(saved.date) ?: selectedDate.time
+        updateDateButton()
+        availableEdition = edition
+        offlineEdition = edition
+        offlineDirectory = directory
+        readerMode = true
+        viewingStoryContent = true
+        viewingSavedStory = true
+        viewingArticleImage = false
+        displayedArticleId = saved.article.id
+        homeScreen.visibility = View.GONE
+        readerScreen.visibility = View.VISIBLE
+        webView.visibility = View.VISIBLE
+        setArticleTextViewerMode(true)
+        webView.loadDataWithBaseURL(
+            paper.offlineOrigin,
+            renderArticleHtml(edition, saved.article, directory),
+            "text/html",
+            "UTF-8",
+            null
+        )
+    }
+
     private fun collectOnDemandPageHotspots(edition: NewspaperEdition, page: NewspaperPage) {
         val fetcher = Papers.forEdition(edition)
         val source = if (fetcher.requiresPageVerification) jangWebView else onDemandWebView
@@ -2256,6 +2495,7 @@ class MainActivity : Activity() {
             return
         }
         viewingStoryContent = false
+        viewingSavedStory = false
         val pageHotspots = edition.hotspots.filter { it.pageId == page.id }
         val html = paperViewer.renderPage(
             page,
@@ -2325,6 +2565,7 @@ class MainActivity : Activity() {
             }
             "text" -> {
                 setArticleTextViewerMode(true)
+                viewingSavedStory = false
                 val article = edition.articles.firstOrNull { it.id == id }
                 if (article == null ||
                     (paper.refreshArticleWhenBylineMissing && article.byline.isBlank())
@@ -2348,6 +2589,7 @@ class MainActivity : Activity() {
             }
             "article" -> {
                 setArticleTextViewerMode(true)
+                viewingSavedStory = false
                 val article = edition.articles.firstOrNull { it.id == id } ?: return
                 if (paper.refreshArticleWhenBylineMissing && article.byline.isBlank()) {
                     viewingStoryContent = true
@@ -2717,6 +2959,7 @@ class MainActivity : Activity() {
 
     private companion object {
         const val PREFERENCES = "epaper_reader"
+        const val SAVED_STORIES_KEY = "saved_stories"
         const val ARTICLE_TEXT_SCALE_KEY = "article_text_scale"
         const val STATE_SELECTED_DATE = "selected_date"
         const val STATE_PAGE_NUMBER = "page_number"
@@ -2754,7 +2997,9 @@ class MainActivity : Activity() {
     @Deprecated("Use the system back dispatcher in newer Android versions.")
     override fun onBackPressed() {
         if (readerMode) {
-            if (viewingStoryContent && viewingArticleImage) {
+            if (viewingSavedStory) {
+                showHome()
+            } else if (viewingStoryContent && viewingArticleImage) {
                 val edition = offlineEdition
                 val directory = offlineDirectory
                 val article = edition?.articles?.firstOrNull { it.id == displayedArticleId }
@@ -2795,3 +3040,12 @@ private data class TextStoryRequest(
     val directory: File,
     val id: String
 )
+
+private data class SavedStory(
+    val paperId: NewspaperId,
+    val date: String,
+    val article: NewspaperArticle
+) {
+    val key: String
+        get() = "${paperId.storageName}:$date:${article.id}"
+}
