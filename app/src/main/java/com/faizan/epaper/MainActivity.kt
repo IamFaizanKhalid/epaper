@@ -1381,6 +1381,7 @@ class MainActivity : Activity() {
                     )
                 }
                 updateDateButton()
+                refreshDownloadIndicator()
                 pageAdapter?.clear()
                 availabilityWebViews.values.forEach(WebView::stopLoading)
                 availabilityCheckDates.clear()
@@ -2932,6 +2933,12 @@ class MainActivity : Activity() {
 
     private fun refreshDownloadIndicator() {
         val date = selectedDateKey()
+        if (!isToday(date)) {
+            paperHomeItems.values.forEach {
+                it.downloadIndicator.visibility = View.GONE
+            }
+            return
+        }
         val inProgressPagePaperId = synchronized(pageDownloadLock) {
             pageDownloadInProgressPaperId
         }
