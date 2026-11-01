@@ -437,7 +437,15 @@ abstract class NewspaperEditionCheckJobService : JobService() {
                 }
                 if (request.phase == JangImagePhase.VERIFYING_PAGE) {
                     if (state.optBoolean("pageImageReady")) {
-                        prepareJangImageTransfer(request, usePageScanImage = true)
+                        if (Uri.parse(request.url).path?.contains("/mainpage/page") == true) {
+                            prepareJangImageTransfer(request, usePageScanImage = true)
+                        } else {
+                            request.phase = JangImagePhase.FETCHING
+                            webView?.loadUrl(
+                                request.url,
+                                mapOf("Referer" to request.referer, "Accept" to "*/*")
+                            )
+                        }
                         return@evaluateJavascript
                     }
                     if (request.pageImageAttempts++ < MAX_JANG_PAGE_IMAGE_WAIT_ATTEMPTS) {

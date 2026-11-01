@@ -1246,7 +1246,15 @@ class MainActivity : Activity() {
                 }
                 if (request.phase == JangImagePhase.VERIFYING_PAGE) {
                     if (state.optBoolean("pageImageReady")) {
-                        extractJangImageFromWebView(request, usePageScanImage = true)
+                        if (Uri.parse(request.url).path?.contains("/mainpage/page") == true) {
+                            extractJangImageFromWebView(request, usePageScanImage = true)
+                        } else {
+                            request.phase = JangImagePhase.FETCHING
+                            jangImageWebView.loadUrl(
+                                request.url,
+                                mapOf("Referer" to request.referer, "Accept" to "*/*")
+                            )
+                        }
                         return@evaluateJavascript
                     }
                     if (request.pageImageAttempts++ < MAX_JANG_PAGE_IMAGE_WAIT_ATTEMPTS) {

@@ -100,8 +100,15 @@ data class NewspaperEdition(
     fun fullImageFile(directory: File, id: String): File =
         File(File(directory, "images"), if (isJangEdition) id else "$id.jpg")
 
-    fun hasFullImage(directory: File, id: String): Boolean =
-        fullImageFile(directory, id).isImageFile()
+    fun hasFullImage(directory: File, id: String): Boolean {
+        val imageFile = fullImageFile(directory, id)
+        if (!imageFile.isImageFile()) return false
+        if (!isJangEdition) return true
+        val hotspot = hotspots.firstOrNull {
+            it.targetId == id && it.type == NewspaperHotspotType.IMAGE
+        } ?: return false
+        return !isJangImagePageScanCopy(directory, imageFile, hotspot.pageId)
+    }
 
     fun downloadFullImages(
         directory: File,
@@ -211,7 +218,7 @@ data class NewspaperEdition(
             val pageNumber = hotspot.pageId.substringAfterLast('_').toInt()
             val dateParts = date.split('_')
             val jangDate = "${dateParts[0]}-${dateParts[1]}-${dateParts[2]}"
-            val staticDate = "${dateParts[1]}-${dateParts[0]}-${dateParts[2]}"
+            val staticDate = "${dateParts[1]}-${dateParts[0].toInt()}-${dateParts[2]}"
             require(imageUrl.matches(JANG_IMAGE_PATH_PATTERN)) {
                 "Jang returned an invalid image URL."
             }
@@ -220,7 +227,10 @@ data class NewspaperEdition(
                 "https://e.jang.com.pk/static_pages/$staticDate/lahore/small/$imageFileName"
             )
             val destination = File(imageDirectory, id)
-            if (!destination.isImageFile()) {
+            if (!hasFullImage(directory, id)) {
+                if (destination.exists() && !destination.delete()) {
+                    throw IllegalStateException("Could not remove the invalid Jang image $id.")
+                }
                 downloadJangImage(
                     url,
                     jangDate,
@@ -228,8 +238,43 @@ data class NewspaperEdition(
                     destination,
                     jangImageDownloader
                 )
+                if (isJangImagePageScanCopy(directory, destination, hotspot.pageId)) {
+                    if (!destination.delete()) {
+                        throw IllegalStateException("Could not remove the page scan saved as image $id.")
+                    }
+                    throw IllegalStateException("Jang returned the page scan instead of image $id.")
+                }
             }
             onProgress(index + 1, ids.size)
+        }
+    }
+
+    private fun isJangImagePageScanCopy(directory: File, imageFile: File, pageId: String): Boolean {
+        val pageImages = listOf(
+            File(directory, "$pageId.jpg"),
+            File(directory, "$pageId.png")
+        )
+        return pageImages.any { pageImage ->
+            filesHaveSameContents(pageImage, imageFile)
+        }
+    }
+
+    private fun filesHaveSameContents(first: File, second: File): Boolean {
+        if (!first.isFile || !second.isFile || first.length() != second.length()) return false
+        first.inputStream().buffered().use { firstInput ->
+            second.inputStream().buffered().use { secondInput ->
+                val firstBuffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                val secondBuffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                while (true) {
+                    val firstRead = firstInput.read(firstBuffer)
+                    val secondRead = secondInput.read(secondBuffer)
+                    if (firstRead != secondRead) return false
+                    if (firstRead < 0) return true
+                    for (index in 0 until firstRead) {
+                        if (firstBuffer[index] != secondBuffer[index]) return false
+                    }
+                }
+            }
         }
     }
 
@@ -656,7 +701,7 @@ data class NewspaperEdition(
         }
         val dateParts = date.split('_')
         val jangDate = "${dateParts[0]}-${dateParts[1]}-${dateParts[2]}"
-        val staticDate = "${dateParts[1]}-${dateParts[0]}-${dateParts[2]}"
+        val staticDate = "${dateParts[1]}-${dateParts[0].toInt()}-${dateParts[2]}"
         val pageNumber = id.substringAfterLast('_').toInt()
         val referer = "https://e.jang.com.pk/lahore/$jangDate/page$pageNumber"
         var lastFailure: Exception? = null
