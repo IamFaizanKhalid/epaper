@@ -141,9 +141,12 @@ data class NewspaperEdition(
     fun hasArticleImages(directory: File): Boolean =
         articles.all { article ->
             article.imageUrls.indices.all { index ->
-                articleImageFile(directory, article, index)?.isImageFile() ?: true
+                hasArticleImage(directory, article, index)
             }
         }
+
+    fun hasArticleImage(directory: File, article: NewspaperArticle, index: Int): Boolean =
+        articleImageFile(directory, article, index)?.isImageFile() ?: true
 
     fun downloadArticleImages(
         directory: File,

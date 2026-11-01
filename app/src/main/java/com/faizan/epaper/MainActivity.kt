@@ -6,6 +6,7 @@ import android.app.DatePickerDialog
 import android.app.ProgressDialog
 import android.graphics.Color
 import android.net.Uri
+import android.os.Handler
 import android.os.Bundle
 import android.os.Looper
 import android.util.Base64
@@ -20,6 +21,7 @@ import android.webkit.WebViewClient
 import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.FrameLayout
+import android.widget.ImageButton
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.ScrollView
@@ -65,7 +67,15 @@ class MainActivity : Activity() {
     private data class PaperHomeItem(
         val paper: Paper,
         val status: TextView,
-        val downloadIndicator: ProgressBar
+        val offlinePercentage: TextView,
+        val downloadIndicator: ProgressBar,
+        val downloadAction: ImageButton
+    )
+
+    private data class OfflineEditionCache(
+        val lastModified: Long,
+        val fileLength: Long,
+        val edition: NewspaperEdition
     )
 
     private lateinit var webView: WebView
@@ -89,12 +99,17 @@ class MainActivity : Activity() {
     private val paperViewer: PaperViewer = WebPaperViewer()
     private val papers = Papers.all
     private val paperHomeItems = linkedMapOf<NewspaperId, PaperHomeItem>()
+    private val offlineEditionCache =
+        mutableMapOf<Pair<NewspaperId, String>, OfflineEditionCache>()
     private val availabilityWebViews = linkedMapOf<NewspaperId, WebView>()
     private val availabilityCheckDates = mutableMapOf<NewspaperId, String>()
     private val availabilityAttempts = mutableMapOf<NewspaperId, Int>()
     private val papersToOpenWhenAvailable = mutableSetOf<NewspaperId>()
     private val downloadExecutor = Executors.newFixedThreadPool(2)
     private val pageDownloadLock = Any()
+    private val editionDownloadMonitor = Any()
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var editionResumeLatch = CountDownLatch(0)
     private val pageDownloadQueue = PriorityQueue<PageDownloadRequest>(
         compareBy<PageDownloadRequest> { it.priority }.thenBy { it.sequence }
     )
@@ -122,7 +137,11 @@ class MainActivity : Activity() {
     private var darkTheme = false
     private var pageAdapter: ArrayAdapter<String>? = null
     private var updatingPagePicker = false
+    @Volatile
     private var editionInProgress: NewspaperEdition? = null
+    @Volatile
+    private var editionDownloadPaused = false
+    private var editionScanWaitingForResume = false
     private var activeEditionDirectory: File? = null
     private var editionPageIndex = 0
     private var textStoryIds: List<String> = emptyList()
@@ -157,6 +176,15 @@ class MainActivity : Activity() {
     private var pageDownloadFailed = false
     private val dateFormat = SimpleDateFormat("dd_MM_yyyy", Locale.US)
     private val savedStories = mutableListOf<SavedStory>()
+    private val refreshHomeProgress = object : Runnable {
+        override fun run() {
+            if (shuttingDown) return
+            if (::homeScreen.isInitialized && homeScreen.visibility == View.VISIBLE) {
+                refreshDownloadIndicator()
+                mainHandler.postDelayed(this, HOME_PROGRESS_REFRESH_MILLIS)
+            }
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -189,6 +217,17 @@ class MainActivity : Activity() {
         } else null
         if (restoredEdition != null) openEdition(restoredEdition)
         else checkPaperAvailabilities()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        mainHandler.removeCallbacks(refreshHomeProgress)
+        mainHandler.post(refreshHomeProgress)
+    }
+
+    override fun onPause() {
+        mainHandler.removeCallbacks(refreshHomeProgress)
+        super.onPause()
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
@@ -395,6 +434,7 @@ class MainActivity : Activity() {
                             jangImageAreasVersion = previous.jangImageAreasVersion
                         )
                         edition.saveMetadata(directory)
+                        offlineEditionCache.remove(paper.id to date)
                         availabilityCheckDates.remove(paper.id)
                         availabilityAttempts.remove(paper.id)
                         val shouldOpen = papersToOpenWhenAvailable.remove(paper.id) &&
@@ -466,6 +506,9 @@ class MainActivity : Activity() {
         pageSpinner.visibility = View.VISIBLE
         nextPageButton.visibility = View.VISIBLE
         refreshSaveStoryButton()
+        refreshDownloadIndicator()
+        mainHandler.removeCallbacks(refreshHomeProgress)
+        mainHandler.post(refreshHomeProgress)
     }
 
     private fun setPaperStatus(paper: Paper, text: String, color: Int) {
@@ -474,6 +517,151 @@ class MainActivity : Activity() {
                     this.text = displayText
                     setTextColor(color)
                 }
+    }
+
+    private fun refreshOfflineProgress() {
+        val date = selectedDateKey()
+        paperHomeItems.values.forEach { item ->
+            val directory = item.paper.editionDirectory(File(filesDir, "editions"), date)
+            val metadata = File(directory, "edition.json")
+            val cacheKey = item.paper.id to date
+            val savedEdition = if (!metadata.isFile) {
+                offlineEditionCache.remove(cacheKey)
+                availableEdition?.takeIf {
+                    it.paperId == item.paper.id && it.date == date
+                }
+            } else {
+                val cached = offlineEditionCache[cacheKey]
+                if (cached != null &&
+                    cached.lastModified == metadata.lastModified() &&
+                    cached.fileLength == metadata.length()
+                ) {
+                    cached.edition
+                } else try {
+                    NewspaperEdition.readMetadata(metadata).also { edition ->
+                        require(edition.paperId == item.paper.id && edition.date == date) {
+                            "Saved ${item.paper.id.displayName} edition metadata is invalid."
+                        }
+                        offlineEditionCache[cacheKey] = OfflineEditionCache(
+                            metadata.lastModified(),
+                            metadata.length(),
+                            edition
+                        )
+                    }
+                } catch (error: Exception) {
+                    offlineEditionCache.remove(cacheKey)
+                    android.util.Log.e(
+                        "MainActivity",
+                        "Could not read ${item.paper.id.displayName}'s offline progress.",
+                        error
+                    )
+                    null
+                }
+            }
+            val percentage = savedEdition?.let { offlineCompletionPercentage(it, directory) }
+            item.offlinePercentage.apply {
+                if (percentage == null) {
+                    text = ""
+                    visibility = View.GONE
+                } else {
+                    text = "$percentage%"
+                    visibility = View.VISIBLE
+                }
+            }
+        }
+    }
+
+    private fun offlineCompletionPercentage(edition: NewspaperEdition, directory: File): Int? {
+        val pages = edition.readingOrder
+        val textStoryIds = edition.hotspots.asSequence()
+            .filter { it.type == NewspaperHotspotType.TEXT }
+            .map { it.targetId }
+            .distinct()
+            .toList()
+        val imageIds = (
+            edition.hotspots.asSequence()
+                .filter { it.type == NewspaperHotspotType.IMAGE }
+                .map { it.targetId }
+                .toList() +
+                if (Papers.forEdition(edition).supportsImageDetail) textStoryIds else emptyList()
+            ).distinct()
+        val articlesById = edition.articles.associateBy { it.id }
+        val articleImageCount = edition.articles.sumOf { it.imageUrls.size }
+        val totalItems = pages.size + textStoryIds.size + imageIds.size + articleImageCount
+        if (totalItems == 0) return null
+
+        val completedItems =
+            pages.count { edition.hasPageImage(directory, it.id) } +
+                textStoryIds.count { it in articlesById } +
+                imageIds.count { edition.hasFullImage(directory, it) } +
+                edition.articles.sumOf { article ->
+                    article.imageUrls.indices.count {
+                        edition.hasArticleImage(directory, article, it)
+                    }
+                }
+        if (completedItems == 0) return null
+
+        val allPageScansProcessed = pages.all { it.id in edition.processedPageIds }
+        val allItemsComplete = completedItems == totalItems && allPageScansProcessed
+        val completionMarker = File(directory, "complete").isFile
+        return if (allItemsComplete && completionMarker) {
+            100
+        } else {
+            (completedItems * 100 / totalItems).coerceAtMost(99)
+        }
+    }
+
+    private fun toggleEditionDownload(paperId: NewspaperId) {
+        val edition = editionInProgress ?: return
+        if (edition.paperId != paperId || edition.date != selectedDateKey() ||
+            !isToday(edition.date)
+        ) return
+        if (editionDownloadPaused) {
+            synchronized(editionDownloadMonitor) {
+                editionDownloadPaused = false
+                editionResumeLatch.countDown()
+            }
+            synchronized(pageDownloadLock) {
+                startPageDownloadWorkerLocked()
+            }
+            if (editionScanWaitingForResume) {
+                editionScanWaitingForResume = false
+                loadNextEditionPage()
+            }
+            startNextTextStory()
+        } else {
+            synchronized(editionDownloadMonitor) {
+                editionResumeLatch = CountDownLatch(1)
+                editionDownloadPaused = true
+            }
+        }
+        refreshDownloadIndicator()
+    }
+
+    private fun clearEditionDownloadPause() {
+        synchronized(editionDownloadMonitor) {
+            editionDownloadPaused = false
+            editionResumeLatch.countDown()
+        }
+        editionScanWaitingForResume = false
+    }
+
+    private fun awaitEditionDownloadResume(edition: NewspaperEdition) {
+        while (true) {
+            val latch = synchronized(editionDownloadMonitor) {
+                if (editionDownloadPaused && editionInProgress === edition) {
+                    editionResumeLatch
+                } else {
+                    null
+                }
+            } ?: return
+            try {
+                latch.await()
+            } catch (error: InterruptedException) {
+                Thread.currentThread().interrupt()
+                throw IllegalStateException("Edition download was interrupted.", error)
+            }
+        }
     }
 
     private fun checkPaperAvailabilities() {
@@ -542,6 +730,13 @@ class MainActivity : Activity() {
                 textSize = 14f
                 setTextColor(secondaryTextColor())
             }
+            val offlinePercentage = TextView(this).apply {
+                textSize = 16f
+                gravity = Gravity.CENTER
+                minWidth = dp(48)
+                setTextColor(primaryTextColor())
+                visibility = View.GONE
+            }
             val downloadIndicator = ProgressBar(
                 this,
                 null,
@@ -550,6 +745,12 @@ class MainActivity : Activity() {
                 visibility = View.GONE
                 isIndeterminate = true
             }
+            val downloadAction = ImageButton(this).apply {
+                visibility = View.GONE
+                contentDescription = "Pause edition download"
+                setBackgroundColor(Color.TRANSPARENT)
+                setOnClickListener { toggleEditionDownload(paper.id) }
+            }
             info.addView(name)
             info.addView(status)
             row.addView(
@@ -557,8 +758,19 @@ class MainActivity : Activity() {
                 LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
             )
             row.addView(downloadIndicator, LinearLayout.LayoutParams(dp(32), dp(32)))
+            row.addView(downloadAction, LinearLayout.LayoutParams(dp(40), dp(40)))
+            row.addView(
+                offlinePercentage,
+                LinearLayout.LayoutParams(dp(52), LinearLayout.LayoutParams.WRAP_CONTENT)
+            )
             paperList.addView(row)
-            paperHomeItems[paper.id] = PaperHomeItem(paper, status, downloadIndicator)
+            paperHomeItems[paper.id] = PaperHomeItem(
+                paper,
+                status,
+                offlinePercentage,
+                downloadIndicator,
+                downloadAction
+            )
         }
 
         homeContent.addView(title)
@@ -924,6 +1136,7 @@ class MainActivity : Activity() {
         pageLabel.text = ""
         updateDateButton()
         updatePageLabel()
+        refreshOfflineProgress()
     }
 
     private fun installArticleScaleGestureDetector() {
@@ -1561,6 +1774,9 @@ class MainActivity : Activity() {
         homeScreen.visibility = View.VISIBLE
         readerScreen.visibility = View.GONE
         webView.visibility = View.GONE
+        refreshDownloadIndicator()
+        mainHandler.removeCallbacks(refreshHomeProgress)
+        mainHandler.post(refreshHomeProgress)
     }
 
     private fun openEdition(edition: NewspaperEdition) {
@@ -1671,6 +1887,7 @@ class MainActivity : Activity() {
             queuedPageIds.clear()
         }
         editionInProgress = edition
+        clearEditionDownloadPause()
         activeEditionDirectory = directory
         val completionMarker = File(directory, "complete")
         if (completionMarker.exists() && !completionMarker.delete()) {
@@ -1753,15 +1970,27 @@ class MainActivity : Activity() {
         downloadExecutor.execute {
             while (true) {
                 val request = synchronized(pageDownloadLock) {
-                    pageDownloadQueue.poll()?.also {
-                        queuedPageIds.remove(it.page.id)
-                        pageDownloadInProgressId = it.page.id
-                        pageDownloadInProgressPaperId = it.edition.paperId
-                    } ?: run {
+                    val nextRequest = pageDownloadQueue.peek()
+                    if (nextRequest != null &&
+                        editionDownloadPaused &&
+                        editionInProgress?.let {
+                            it.date == nextRequest.edition.date &&
+                                it.paperId == nextRequest.edition.paperId
+                        } == true
+                    ) {
                         pageDownloadWorkerRunning = false
-                        pageDownloadInProgressId = null
-                        pageDownloadInProgressPaperId = null
                         null
+                    } else {
+                        pageDownloadQueue.poll()?.also {
+                            queuedPageIds.remove(it.page.id)
+                            pageDownloadInProgressId = it.page.id
+                            pageDownloadInProgressPaperId = it.edition.paperId
+                        } ?: run {
+                            pageDownloadWorkerRunning = false
+                            pageDownloadInProgressId = null
+                            pageDownloadInProgressPaperId = null
+                            null
+                        }
                     }
                 } ?: break
                 try {
@@ -1796,6 +2025,7 @@ class MainActivity : Activity() {
                                 request.directory
                             )
                         }
+                        refreshDownloadIndicator()
                         if (isCurrentEdition) {
                             maybeCompleteEdition(request.edition)
                         }
@@ -1814,6 +2044,7 @@ class MainActivity : Activity() {
                             showPageLoadFailure(request.page, error.message)
                             showMessage(error.message ?: "Could not download ${request.page.title}.")
                         }
+                        refreshDownloadIndicator()
                     }
                 } finally {
                     synchronized(pageDownloadLock) {
@@ -1831,6 +2062,12 @@ class MainActivity : Activity() {
 
     private fun loadNextEditionPage() {
         val edition = editionInProgress ?: return
+        if (editionDownloadPaused) {
+            editionScanWaitingForResume = true
+            refreshDownloadIndicator()
+            return
+        }
+        editionScanWaitingForResume = false
         if (archivingStories) {
             val storyId = textStoryIds.getOrNull(storyIndex)
             if (storyId == null) {
@@ -1971,6 +2208,12 @@ class MainActivity : Activity() {
         downloadExecutor.execute {
             missingImages.forEach { id ->
                 try {
+                    if (editionInProgress?.let {
+                            it.date == edition.date && it.paperId == edition.paperId
+                        } == true
+                    ) {
+                        awaitEditionDownloadResume(editionInProgress ?: edition)
+                    }
                     downloadEditionFullImages(edition, directory, listOf(id))
                     runOnUiThread {
                         try {
@@ -2037,6 +2280,12 @@ class MainActivity : Activity() {
 
     private fun startNextTextStory() {
         if (activeTextStory != null || pendingTextStories.isEmpty()) return
+        val nextRequest = pendingTextStories.first()
+        if (editionDownloadPaused && editionInProgress?.let {
+                it.date == nextRequest.edition.date &&
+                    it.paperId == nextRequest.edition.paperId
+            } == true
+        ) return
         val request = pendingTextStories.removeFirst()
         activeTextStory = request
         refreshDownloadIndicator()
@@ -2328,7 +2577,12 @@ class MainActivity : Activity() {
         )
         downloadExecutor.execute {
             try {
-                downloadEditionFullImages(downloadEdition, directory, imageIds)
+                imageIds.forEach { id ->
+                    awaitEditionDownloadResume(edition)
+                    downloadEditionFullImages(downloadEdition, directory, listOf(id))
+                    runOnUiThread { refreshDownloadIndicator() }
+                }
+                awaitEditionDownloadResume(edition)
                 downloadEdition.downloadArticleImages(directory) { url, referer, destination ->
                     downloadJangImageThroughWebView(url, referer, destination)
                 }
@@ -2528,6 +2782,7 @@ class MainActivity : Activity() {
                 availableEdition = savedEdition
                 offlineEdition = savedEdition
             }
+            clearEditionDownloadPause()
             editionInProgress = null
             activeEditionDirectory = null
             archivingStories = false
@@ -2546,6 +2801,7 @@ class MainActivity : Activity() {
 
     private fun failEditionDownload(message: String) {
         val failedEdition = editionInProgress
+        clearEditionDownloadPause()
         editionInProgress = null
         activeEditionDirectory = null
         archivingStories = false
@@ -2568,6 +2824,12 @@ class MainActivity : Activity() {
             processedPageIds = processedPageIds
         )
         progress.saveMetadata(directory)
+        offlineEditionCache[progress.paperId to progress.date] = OfflineEditionCache(
+            File(directory, "edition.json").lastModified(),
+            File(directory, "edition.json").length(),
+            progress
+        )
+        refreshOfflineProgress()
         val anotherPaperIsActive = readerMode && offlineEdition?.paperId != progress.paperId
         if (!anotherPaperIsActive) availableEdition = progress
         if (offlineEdition?.let {
@@ -3025,6 +3287,7 @@ class MainActivity : Activity() {
         val marker = File(targetDirectory, "complete")
         val complete = marker.isFile
         edition.saveMetadata(targetDirectory)
+        offlineEditionCache.remove(edition.paperId to edition.date)
         if (!complete && marker.exists() && !marker.delete()) {
             throw IllegalStateException("Could not update the edition details.")
         }
@@ -3076,10 +3339,12 @@ class MainActivity : Activity() {
     }
 
     private fun refreshDownloadIndicator() {
+        refreshOfflineProgress()
         val date = selectedDateKey()
         if (!isToday(date)) {
             paperHomeItems.values.forEach {
                 it.downloadIndicator.visibility = View.GONE
+                it.downloadAction.visibility = View.GONE
             }
             return
         }
@@ -3099,12 +3364,31 @@ class MainActivity : Activity() {
             } == true || pendingTextStories.any {
                 it.edition.paperId == paperId && it.edition.date == date
             }
-            val editionDownloadActive = editionInProgress?.let {
+            val activeEdition = editionInProgress
+            val editionDownloadActive = activeEdition?.let {
                 it.paperId == paperId && it.date == date
             } == true
             item.downloadIndicator.visibility = if (
                 pageDownloadActive || storyDownloadActive || editionDownloadActive
             ) View.VISIBLE else View.GONE
+            val canControlEditionDownload = editionDownloadActive &&
+                activeEdition?.paperId == paperId
+            item.downloadAction.apply {
+                visibility = if (canControlEditionDownload) View.VISIBLE else View.GONE
+                setImageResource(
+                    if (editionDownloadPaused) {
+                        android.R.drawable.ic_media_play
+                    } else {
+                        android.R.drawable.ic_media_pause
+                    }
+                )
+                setColorFilter(primaryTextColor())
+                contentDescription = if (editionDownloadPaused) {
+                    "Resume ${item.paper.id.displayName} download"
+                } else {
+                    "Pause ${item.paper.id.displayName} download"
+                }
+            }
         }
     }
 
@@ -3120,6 +3404,7 @@ class MainActivity : Activity() {
         const val MIN_ARTICLE_TEXT_SCALE = 0.75f
         const val MAX_ARTICLE_TEXT_SCALE = 2.25f
         const val MAX_DATE_WINDOW_DAYS = 30
+        const val HOME_PROGRESS_REFRESH_MILLIS = 1_500L
         const val MAX_AVAILABILITY_ATTEMPTS = 60
         const val AVAILABILITY_RETRY_MILLIS = 1_500L
         const val MAX_JANG_IMAGE_VERIFICATION_ATTEMPTS = 60
@@ -3138,6 +3423,7 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         shuttingDown = true
+        mainHandler.removeCallbacks(refreshHomeProgress)
         downloadExecutor.shutdownNow()
         webView.destroy()
         inspectionWebView.destroy()
