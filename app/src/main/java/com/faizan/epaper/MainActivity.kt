@@ -9,6 +9,7 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.Looper
 import android.util.Base64
+import android.view.ScaleGestureDetector
 import android.view.View
 import android.view.Gravity
 import android.widget.AdapterView
@@ -95,6 +96,9 @@ class MainActivity : Activity() {
     private var pageNumber = 1
     private var readerMode = false
     private var viewingStoryContent = false
+    private var articleTextViewerActive = false
+    private var articleTextScale = 1f
+    private lateinit var articleScaleGestureDetector: ScaleGestureDetector
     private var displayedPageId: String? = null
     private var displayedEditionDate: String? = null
     private var displayedArticleId: String? = null
@@ -141,7 +145,11 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        articleTextScale = getSharedPreferences(PREFERENCES, MODE_PRIVATE)
+            .getFloat(ARTICLE_TEXT_SCALE_KEY, DEFAULT_ARTICLE_TEXT_SCALE)
+            .coerceIn(MIN_ARTICLE_TEXT_SCALE, MAX_ARTICLE_TEXT_SCALE)
         createReaderView()
+        installArticleScaleGestureDetector()
         createPaperAvailabilityWebViews()
         DailyEditionCheckScheduler.schedule(this)
         NotificationPermission.requestIfNeeded(this)
@@ -434,7 +442,6 @@ class MainActivity : Activity() {
         homeScreen.addView(dateButton)
         homeScreen.addView(title)
         homeScreen.addView(paperList)
-
         readerScreen = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.WHITE)
@@ -610,10 +617,9 @@ class MainActivity : Activity() {
                             ) {
                                 webView.loadDataWithBaseURL(
                                     Papers.forEdition(request.edition).offlineOrigin,
-                                    paperViewer.renderArticle(
+                                    renderArticleHtml(
                                         request.edition,
                                         article,
-                                        Papers[request.edition.paperId],
                                         request.directory
                                     ),
                                     "text/html",
@@ -643,10 +649,9 @@ class MainActivity : Activity() {
                         ) {
                             webView.loadDataWithBaseURL(
                                 Papers.forEdition(request.edition).offlineOrigin,
-                                paperViewer.renderArticle(
+                                renderArticleHtml(
                                     request.edition,
                                     article,
-                                    Papers[request.edition.paperId],
                                     request.directory
                                 ),
                                 "text/html",
@@ -749,6 +754,57 @@ class MainActivity : Activity() {
         updatePageLabel()
     }
 
+    private fun installArticleScaleGestureDetector() {
+        articleScaleGestureDetector = ScaleGestureDetector(
+            this,
+            object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+                override fun onScale(detector: ScaleGestureDetector): Boolean {
+                    if (!articleTextViewerActive) return false
+                    val updatedScale = (articleTextScale * detector.scaleFactor)
+                        .coerceIn(MIN_ARTICLE_TEXT_SCALE, MAX_ARTICLE_TEXT_SCALE)
+                    if (updatedScale == articleTextScale) return true
+                    articleTextScale = updatedScale
+                    getSharedPreferences(PREFERENCES, MODE_PRIVATE)
+                        .edit()
+                        .putFloat(ARTICLE_TEXT_SCALE_KEY, articleTextScale)
+                        .apply()
+                    val scale = String.format(Locale.US, "%.3f", articleTextScale)
+                    webView.evaluateJavascript(
+                        "document.documentElement.style.setProperty('--article-font-scale', '$scale')",
+                        null
+                    )
+                    return true
+                }
+            }
+        )
+        webView.setOnTouchListener { _, event ->
+            if (articleTextViewerActive) articleScaleGestureDetector.onTouchEvent(event)
+            false
+        }
+    }
+
+    private fun setArticleTextViewerMode(enabled: Boolean) {
+        articleTextViewerActive = enabled
+        webView.settings.setSupportZoom(!enabled)
+        webView.settings.builtInZoomControls = !enabled
+        webView.settings.displayZoomControls = false
+    }
+
+    private fun renderArticleHtml(
+        edition: NewspaperEdition,
+        article: NewspaperArticle,
+        directory: File?
+    ): String {
+        setArticleTextViewerMode(true)
+        return paperViewer.renderArticle(
+            edition,
+            article,
+            Papers.forEdition(edition),
+            directory,
+            articleTextScale
+        )
+    }
+
     private fun inspectionClient() = object : WebViewClient() {
         override fun onPageFinished(view: WebView, url: String) {
             val uri = Uri.parse(url)
@@ -793,7 +849,7 @@ class MainActivity : Activity() {
                 !paper.isPageUrl(url, edition.date, page.id)
             ) return
             view.postDelayed({
-                if (onDemandPage == requestedPage) {
+                if (isSameOnDemandPage(onDemandPage, requestedPage)) {
                     collectOnDemandPageHotspots(edition, page)
                 }
             }, 250)
@@ -841,7 +897,7 @@ class MainActivity : Activity() {
             attempt: Int = 0,
             onReady: () -> Unit
         ) {
-            if (requestedPage != null && onDemandPage != requestedPage) return
+            if (requestedPage != null && !isSameOnDemandPage(onDemandPage, requestedPage)) return
             val key = expectedUrl
             if (attempt == 0 && jangVerificationKey != key) {
                 jangVerificationKey = key
@@ -868,7 +924,9 @@ class MainActivity : Activity() {
             """.trimIndent()
             jangWebView.evaluateJavascript(script) { result ->
                 if (generation != jangVerificationGeneration) return@evaluateJavascript
-                if (requestedPage != null && onDemandPage != requestedPage) return@evaluateJavascript
+                if (requestedPage != null &&
+                    !isSameOnDemandPage(onDemandPage, requestedPage)
+                ) return@evaluateJavascript
                 try {
                     val json = JSONTokener(result).nextValue() as? String
                         ?: throw IllegalStateException("Could not check Jang's verification page.")
@@ -1567,11 +1625,11 @@ class MainActivity : Activity() {
 
     private fun ensurePageHotspots(edition: NewspaperEdition, page: NewspaperPage) {
         val requestedPage = edition to page
-        if (onDemandPage != null && onDemandPage != requestedPage) {
+        if (onDemandPage != null && !isSameOnDemandPage(onDemandPage, requestedPage)) {
             cancelOnDemandPageRequest()
         }
         if (page.id in edition.processedPageIds) return
-        if (onDemandPage == requestedPage) return
+        if (isSameOnDemandPage(onDemandPage, requestedPage)) return
         onDemandPage = requestedPage
         if (Papers.forEdition(edition).requiresPageVerification) {
             jangWebView.loadUrl(
@@ -1583,6 +1641,16 @@ class MainActivity : Activity() {
                 mapOf("Referer" to "https://epaper.dawn.com/")
             )
         }
+    }
+
+    private fun isSameOnDemandPage(
+        active: Pair<NewspaperEdition, NewspaperPage>?,
+        requested: Pair<NewspaperEdition, NewspaperPage>
+    ): Boolean {
+        val current = active ?: return false
+        return current.first.paperId == requested.first.paperId &&
+            current.first.date == requested.first.date &&
+            current.second.id == requested.second.id
     }
 
     private fun cancelOnDemandPageRequest() {
@@ -1740,7 +1808,9 @@ class MainActivity : Activity() {
         val source = if (fetcher.requiresPageVerification) jangWebView else onDemandWebView
         source.evaluateJavascript(fetcher.hotspotExtractionScript(edition.date, page.id)) { result ->
             try {
-                if (onDemandPage != (edition to page)) return@evaluateJavascript
+                if (!isSameOnDemandPage(onDemandPage, edition to page)) {
+                    return@evaluateJavascript
+                }
                 val json = JSONTokener(result).nextValue() as? String
                     ?: throw IllegalStateException("Could not read story areas from page ${page.id}.")
                 val hotspots = fetcher.parseHotspots(json, edition, page)
@@ -2098,6 +2168,7 @@ class MainActivity : Activity() {
             showMessage("This page image is missing from the offline edition.")
             return
         }
+        setArticleTextViewerMode(false)
         val samePaperPage = displayedEditionDate == edition.date &&
             displayedPageId == page.id && !viewingStoryContent
         offlineEdition = edition
@@ -2113,6 +2184,7 @@ class MainActivity : Activity() {
         updatePagePicker(edition)
         updatePageLabel()
         if (samePaperPage) {
+            ensurePageHotspots(edition, page)
             updateRenderedHotspots()
             prefetchPageStories(edition, page)
             return
@@ -2135,6 +2207,7 @@ class MainActivity : Activity() {
             "UTF-8",
             null
         )
+        ensurePageHotspots(edition, page)
     }
 
     private fun updateRenderedHotspots() {
@@ -2185,6 +2258,7 @@ class MainActivity : Activity() {
                 openOfflinePage(edition, page, directory)
             }
             "text" -> {
+                setArticleTextViewerMode(true)
                 val article = edition.articles.firstOrNull { it.id == id }
                 if (article == null ||
                     (paper.refreshArticleWhenBylineMissing && article.byline.isBlank())
@@ -2200,18 +2274,14 @@ class MainActivity : Activity() {
                 displayedArticleId = article.id
                 webView.loadDataWithBaseURL(
                     Papers.forEdition(edition).offlineOrigin,
-                    paperViewer.renderArticle(
-                        edition,
-                        article,
-                        Papers.forEdition(edition),
-                        directory
-                    ),
+                    renderArticleHtml(edition, article, directory),
                     "text/html",
                     "UTF-8",
                     null
                 )
             }
             "article" -> {
+                setArticleTextViewerMode(true)
                 val article = edition.articles.firstOrNull { it.id == id } ?: return
                 if (paper.refreshArticleWhenBylineMissing && article.byline.isBlank()) {
                     viewingStoryContent = true
@@ -2225,12 +2295,7 @@ class MainActivity : Activity() {
                 displayedArticleId = article.id
                 webView.loadDataWithBaseURL(
                     Papers.forEdition(edition).offlineOrigin,
-                    paperViewer.renderArticle(
-                        edition,
-                        article,
-                        Papers.forEdition(edition),
-                        directory
-                    ),
+                    renderArticleHtml(edition, article, directory),
                     "text/html",
                     "UTF-8",
                     null
@@ -2242,6 +2307,7 @@ class MainActivity : Activity() {
                         it.targetId == id && it.type == NewspaperHotspotType.TEXT
                     }
                 ) return
+                setArticleTextViewerMode(false)
                 viewingStoryContent = true
                 viewingArticleImage = true
                 displayedArticleId = id
@@ -2253,6 +2319,7 @@ class MainActivity : Activity() {
             }
 
             "image" -> {
+                setArticleTextViewerMode(false)
                 viewingStoryContent = true
                 viewingArticleImage = false
                 if (!edition.hasFullImage(directory, id)) {
@@ -2272,6 +2339,7 @@ class MainActivity : Activity() {
         directory: File
     ) {
         val imageTarget = paper.inlineArticleImageTarget(article.id, imageIndex) ?: return
+        setArticleTextViewerMode(false)
         viewingStoryContent = true
         viewingArticleImage = true
         displayedArticleId = article.id
@@ -2283,7 +2351,7 @@ class MainActivity : Activity() {
             <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
             <style>html,body{margin:0;width:100%;height:100%;background:#111;color:#fff;font:16px sans-serif}
             header{height:48px;display:flex;align-items:center;padding:0 12px}
-            a{color:#fff}img{display:block;width:100%;height:calc(100% - 48px);margin:0 auto;object-fit:contain}
+            a{color:#fff}img{display:block;width:100%;height:calc(100% - 48px);margin:0 auto;object-fit:contain;background:#fff}
             #error{padding:24px;text-align:center}</style></head>
             <body><header><a href="${paper.offlineOrigin}article/${article.id}">Back to story text</a></header>
             <img src="${htmlEscape(displayedImageUrl)}" alt="${htmlEscape(article.title)}"
@@ -2306,12 +2374,13 @@ class MainActivity : Activity() {
         val baseUrl = Uri.fromFile(directory).toString().trimEnd('/') + "/"
         val imageFile = edition.fullImageFile(directory, id)
         val paper = Papers.forEdition(edition)
+        setArticleTextViewerMode(false)
         viewingStoryContent = true
         val html = """
             <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
             <style>html,body{margin:0;width:100%;height:100%;background:#111;color:#fff;font:16px sans-serif}
             header{height:48px;display:flex;align-items:center;padding:0 12px}
-            a{color:#fff}img{display:block;width:100%;height:calc(100% - 48px);margin:0 auto;object-fit:contain}
+            a{color:#fff}img{display:block;width:100%;height:calc(100% - 48px);margin:0 auto;object-fit:contain;background:#fff}
             #error{padding:24px;text-align:center}</style></head>
             <body><header><a href="${paper.offlineOrigin}page/$sourcePage">Back to paper</a></header>
             <img src="images/${htmlEscape(imageFile.name)}" alt="Full-size newspaper image"
@@ -2323,6 +2392,7 @@ class MainActivity : Activity() {
 
     private fun showArticleImage(edition: NewspaperEdition, directory: File, id: String) {
         val baseUrl = Uri.fromFile(directory).toString().trimEnd('/') + "/"
+        setArticleTextViewerMode(false)
         viewingStoryContent = true
         viewingArticleImage = true
         displayedArticleId = id
@@ -2330,7 +2400,7 @@ class MainActivity : Activity() {
             <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
             <style>html,body{margin:0;width:100%;height:100%;background:#111;color:#fff;font:16px sans-serif}
             header{height:48px;display:flex;align-items:center;padding:0 12px}
-            a{color:#fff}img{display:block;width:100%;height:calc(100% - 48px);margin:0 auto;object-fit:contain}
+            a{color:#fff}img{display:block;width:100%;height:calc(100% - 48px);margin:0 auto;object-fit:contain;background:#fff}
             #error{padding:24px;text-align:center}</style></head>
             <body><header><a href="${Papers.forEdition(edition).offlineOrigin}article/$id">Back to story text</a></header>
             <img src="images/$id.jpg" alt="${htmlEscape(edition.articles.firstOrNull { it.id == id }?.title ?: "Story image")}"
@@ -2557,6 +2627,11 @@ class MainActivity : Activity() {
     }
 
     private companion object {
+        const val PREFERENCES = "epaper_reader"
+        const val ARTICLE_TEXT_SCALE_KEY = "article_text_scale"
+        const val DEFAULT_ARTICLE_TEXT_SCALE = 1f
+        const val MIN_ARTICLE_TEXT_SCALE = 0.75f
+        const val MAX_ARTICLE_TEXT_SCALE = 2.25f
         const val MAX_AVAILABILITY_ATTEMPTS = 20
         const val AVAILABILITY_RETRY_MILLIS = 1_500L
         const val MAX_JANG_IMAGE_VERIFICATION_ATTEMPTS = 60
@@ -2594,12 +2669,7 @@ class MainActivity : Activity() {
                     val newspaper = Papers.forEdition(edition)
                     webView.loadDataWithBaseURL(
                         newspaper.offlineOrigin,
-                        paperViewer.renderArticle(
-                            edition,
-                            article,
-                            newspaper,
-                            directory
-                        ),
+                        renderArticleHtml(edition, article, directory),
                         "text/html",
                         "UTF-8",
                         null

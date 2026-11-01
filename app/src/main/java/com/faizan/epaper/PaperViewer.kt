@@ -14,7 +14,8 @@ interface PaperViewer {
         edition: NewspaperEdition,
         article: NewspaperArticle,
         paper: Paper,
-        directory: java.io.File?
+        directory: java.io.File?,
+        textScale: Float = 1f
     ): String
 }
 
@@ -48,8 +49,8 @@ class WebPaperViewer : PaperViewer {
             <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1,minimum-scale=1,maximum-scale=5,user-scalable=yes">
             <style>body{margin:0;background:#222;text-align:center}
             a,img{-webkit-tap-highlight-color:transparent;outline:none;-webkit-user-select:none;user-select:none}
-            #paper-container{position:relative;width:100%}
-            #page{display:block;width:100%;height:auto;margin:auto;-webkit-user-drag:none}
+            #paper-container{position:relative;width:100%;background:#fff}
+            #page{display:block;width:100%;height:auto;margin:auto;background:#fff;-webkit-user-drag:none}
             #hotspots{position:absolute;inset:0}
             #hotspots a{position:absolute;display:block;color:transparent;outline:none}
             .hotspot-highlight{position:absolute;z-index:2;pointer-events:none;
@@ -121,7 +122,8 @@ class WebPaperViewer : PaperViewer {
         edition: NewspaperEdition,
         article: NewspaperArticle,
         paper: Paper,
-        directory: java.io.File?
+        directory: java.io.File?,
+        textScale: Float
     ): String {
         val paragraphs = article.paragraphs.joinToString("") {
             "<p>${escape(it)}</p>"
@@ -156,18 +158,17 @@ class WebPaperViewer : PaperViewer {
         } else {
             ""
         }
-        val articleTypography = if (paper.articleTextDirection == "rtl") {
-            "font:22px/2.1 ${paper.articleFontFamily};"
-        } else {
-            "font:18px/1.65 ${paper.articleFontFamily};"
-        }
         val headingLineHeight = if (paper.articleTextDirection == "rtl") "1.8" else "1.2"
         return """
             <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
             <style>$fontFace
-            body{max-width:760px;margin:24px auto;padding:0 20px;$articleTypography color:#222;
+            :root{--article-font-scale:$textScale}
+            body{max-width:760px;margin:24px auto;padding:0 20px;
+            font-family:${paper.articleFontFamily};font-size:calc(${if (paper.articleTextDirection == "rtl") 22 else 18}px * var(--article-font-scale));
+            line-height:${if (paper.articleTextDirection == "rtl") "2.1" else "1.65"};color:#222;
             direction:${paper.articleTextDirection};text-align:start}
-            h1{font-size:30px;line-height:$headingLineHeight}.byline{color:#666;font-size:.85em;margin:12px 0 24px}
+            h1{font-size:${if (paper.articleTextDirection == "rtl") "1.36em" else "1.67em"};line-height:$headingLineHeight}
+            .byline{color:#666;font-size:.85em;margin:12px 0 24px}
             p{margin:0 0 1em}img{display:block;max-width:100%;height:auto;margin:20px auto}
             .image-button{display:inline-block;margin:8px 0 18px;padding:10px 16px;
             border-radius:4px;background:#244d70;color:#fff;text-decoration:none;font:14px Arial,sans-serif}
