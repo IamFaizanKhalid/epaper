@@ -106,6 +106,7 @@ class MainActivity : Activity() {
     private var paperPageReady = false
     private var shuttingDown = false
     private var availableEdition: NewspaperEdition? = null
+    private var darkTheme = false
     private var pageAdapter: ArrayAdapter<String>? = null
     private var updatingPagePicker = false
     private var editionInProgress: NewspaperEdition? = null
@@ -145,6 +146,10 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        darkTheme = resources.getBoolean(R.bool.is_dark_theme)
+        selectedDate.timeInMillis = savedInstanceState?.getLong(STATE_SELECTED_DATE)
+            ?: selectedDate.timeInMillis
+        pageNumber = savedInstanceState?.getInt(STATE_PAGE_NUMBER) ?: pageNumber
         articleTextScale = getSharedPreferences(PREFERENCES, MODE_PRIVATE)
             .getFloat(ARTICLE_TEXT_SCALE_KEY, DEFAULT_ARTICLE_TEXT_SCALE)
             .coerceIn(MIN_ARTICLE_TEXT_SCALE, MAX_ARTICLE_TEXT_SCALE)
@@ -153,7 +158,30 @@ class MainActivity : Activity() {
         createPaperAvailabilityWebViews()
         DailyEditionCheckScheduler.schedule(this)
         NotificationPermission.requestIfNeeded(this)
-        checkPaperAvailabilities()
+        val savedPaperId = savedInstanceState?.getString(STATE_PAPER_ID)
+            ?.let { value -> NewspaperId.entries.firstOrNull { it.storageName == value } }
+        val shouldRestoreReader = savedInstanceState?.getBoolean(STATE_READER_MODE) == true
+        val restoredEdition = if (shouldRestoreReader && savedPaperId != null) {
+            val paper = Papers[savedPaperId]
+            val metadata = File(
+                paper.editionDirectory(File(filesDir, "editions"), selectedDateKey()),
+                "edition.json"
+            )
+            if (metadata.isFile) runCatching { NewspaperEdition.readMetadata(metadata) }
+                .getOrNull()
+                ?.takeIf { it.paperId == savedPaperId && it.date == selectedDateKey() }
+            else null
+        } else null
+        if (restoredEdition != null) openEdition(restoredEdition)
+        else checkPaperAvailabilities()
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putLong(STATE_SELECTED_DATE, selectedDate.timeInMillis)
+        outState.putInt(STATE_PAGE_NUMBER, pageNumber)
+        outState.putBoolean(STATE_READER_MODE, readerMode)
+        outState.putString(STATE_PAPER_ID, readerEdition()?.paperId?.storageName)
+        super.onSaveInstanceState(outState)
     }
 
     private fun showStoryLoadingDialog() {
@@ -226,6 +254,7 @@ class MainActivity : Activity() {
 
     private fun checkPaperAvailability(paper: Paper, openWhenAvailable: Boolean = false) {
                 val requestedDate = selectedDateKey()
+                val isToday = isToday(requestedDate)
                 val directory = paper.editionDirectory(File(filesDir, "editions"), requestedDate)
                 val metadata = File(directory, "edition.json")
                 if (metadata.isFile) {
@@ -234,7 +263,7 @@ class MainActivity : Activity() {
                         require(edition.paperId == paper.id) {
                             "Saved ${paper.id.displayName} edition metadata is invalid."
                         }
-                        if (requestedDate == selectedDateKey()) {
+                        if (isToday && requestedDate == selectedDateKey()) {
                             availableEdition = edition
                             setPaperStatus(paper, "Available", Color.rgb(30, 125, 70))
                         }
@@ -255,7 +284,7 @@ class MainActivity : Activity() {
                     setPaperStatus(paper, "Checking availability…", Color.DKGRAY)
                     return
                 }
-                if (!NewspaperAvailability.checksAreAllowed(requestedDate)) {
+                if (isToday && !NewspaperAvailability.checksAreAllowed(requestedDate)) {
                     papersToOpenWhenAvailable.remove(paper.id)
                     setPaperStatus(paper, "Not available", Color.GRAY)
                     if (openWhenAvailable) {
@@ -266,7 +295,7 @@ class MainActivity : Activity() {
                 availabilityCheckDates[paper.id] = requestedDate
                 availabilityAttempts[paper.id] = 0
                 if (openWhenAvailable) papersToOpenWhenAvailable += paper.id
-                setPaperStatus(paper, "Checking availability…", Color.DKGRAY)
+                if (isToday) setPaperStatus(paper, "Checking availability…", Color.DKGRAY)
                 val browser = availabilityWebViews[paper.id]
                     ?: throw IllegalStateException("No availability browser is registered for ${paper.id}.")
                 browser.loadUrl(paper.availabilityUrl(requestedDate))
@@ -296,7 +325,13 @@ class MainActivity : Activity() {
                             "NOT_AVAILABLE" -> {
                                 availabilityCheckDates.remove(paper.id)
                                 papersToOpenWhenAvailable.remove(paper.id)
-                                setPaperStatus(paper, "Not available", Color.GRAY)
+                                if (isToday(date)) {
+                                    setPaperStatus(paper, "Not available", Color.GRAY)
+                                } else {
+                                    showMessage(
+                                        "Could not load ${paper.id.displayName} for ${formatDate(date)}."
+                                    )
+                                }
                                 return@evaluateJavascript
                             }
                             "" -> Unit
@@ -328,7 +363,9 @@ class MainActivity : Activity() {
                         edition.saveMetadata(directory)
                         availabilityCheckDates.remove(paper.id)
                         availabilityAttempts.remove(paper.id)
-                        setPaperStatus(paper, "Available", Color.rgb(30, 125, 70))
+                        if (isToday(date)) {
+                            setPaperStatus(paper, "Available", Color.rgb(30, 125, 70))
+                        }
                         if (date == selectedDateKey()) {
                             availableEdition = edition
                             updatePagePicker(edition)
@@ -362,36 +399,38 @@ class MainActivity : Activity() {
     }
 
     private fun setPaperStatus(paper: Paper, text: String, color: Int) {
+                val displayText = if (isToday(selectedDateKey())) text else ""
                 paperHomeItems[paper.id]?.status?.apply {
-                    this.text = text
+                    this.text = displayText
                     setTextColor(color)
                 }
     }
 
     private fun checkPaperAvailabilities() {
+        if (!isToday(selectedDateKey())) return
         papers.forEach { paper -> checkPaperAvailability(paper) }
     }
 
     private fun createReaderView() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.WHITE)
+            setBackgroundColor(surfaceColor())
         }
         homeScreen = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(12), dp(8), dp(12), dp(8))
-            setBackgroundColor(Color.rgb(245, 245, 245))
+            setBackgroundColor(homeBackgroundColor())
         }
         dateButton = button("") { chooseDate() }
         val title = TextView(this).apply {
             text = "Newspapers"
             textSize = 20f
-            setTextColor(Color.rgb(34, 50, 70))
+            setTextColor(primaryTextColor())
             setPadding(0, dp(10), 0, dp(4))
         }
         pageLabel = TextView(this).apply {
             textSize = 14f
-            setTextColor(Color.DKGRAY)
+            setTextColor(secondaryTextColor())
             setPadding(0, dp(4), 0, dp(6))
         }
         paperList = LinearLayout(this).apply {
@@ -402,7 +441,7 @@ class MainActivity : Activity() {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
                 setPadding(dp(12), dp(10), dp(12), dp(10))
-                setBackgroundColor(Color.WHITE)
+                setBackgroundColor(surfaceColor())
                 isClickable = true
                 isFocusable = true
                 setOnClickListener { openPaper(paper) }
@@ -413,12 +452,12 @@ class MainActivity : Activity() {
             val name = TextView(this).apply {
                 text = paper.id.displayName
                 textSize = 18f
-                setTextColor(Color.rgb(34, 50, 70))
+                setTextColor(primaryTextColor())
             }
             val status = TextView(this).apply {
                 text = "Checking availability…"
                 textSize = 14f
-                setTextColor(Color.DKGRAY)
+                setTextColor(secondaryTextColor())
             }
             val downloadIndicator = ProgressBar(
                 this,
@@ -444,7 +483,7 @@ class MainActivity : Activity() {
         homeScreen.addView(paperList)
         readerScreen = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.WHITE)
+            setBackgroundColor(surfaceColor())
         }
         val pageControls = LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
@@ -801,7 +840,8 @@ class MainActivity : Activity() {
             article,
             Papers.forEdition(edition),
             directory,
-            articleTextScale
+            articleTextScale,
+            darkTheme
         )
     }
 
@@ -1259,6 +1299,14 @@ class MainActivity : Activity() {
     }
 
     private fun chooseDate() {
+        val today = Calendar.getInstance()
+        val earliestDate = (today.clone() as Calendar).apply {
+            add(Calendar.DAY_OF_YEAR, -(MAX_DATE_WINDOW_DAYS - 1))
+            set(Calendar.HOUR_OF_DAY, 0)
+            set(Calendar.MINUTE, 0)
+            set(Calendar.SECOND, 0)
+            set(Calendar.MILLISECOND, 0)
+        }
         DatePickerDialog(
             this,
             { _, year, month, day ->
@@ -1266,20 +1314,37 @@ class MainActivity : Activity() {
                 pageNumber = 1
                 showHome()
                 availableEdition = null
-                papers.forEach { setPaperStatus(it, "Checking availability…", Color.DKGRAY) }
+                papers.forEach {
+                    setPaperStatus(
+                        it,
+                        if (isToday(selectedDateKey())) "Checking availability…" else "",
+                        Color.DKGRAY
+                    )
+                }
                 updateDateButton()
                 pageAdapter?.clear()
                 availabilityWebViews.values.forEach(WebView::stopLoading)
                 availabilityCheckDates.clear()
                 availabilityAttempts.clear()
                 papersToOpenWhenAvailable.clear()
-                checkPaperAvailabilities()
+                if (isToday(selectedDateKey())) checkPaperAvailabilities()
             },
             selectedDate.get(Calendar.YEAR),
             selectedDate.get(Calendar.MONTH),
             selectedDate.get(Calendar.DAY_OF_MONTH)
-        ).show()
+        ).apply {
+            datePicker.minDate = earliestDate.timeInMillis
+            datePicker.maxDate = today.timeInMillis
+        }.show()
     }
+
+    private fun isToday(date: String): Boolean =
+        date == dateFormat.format(Calendar.getInstance().time)
+
+    private fun formatDate(date: String): String =
+        SimpleDateFormat("dd_MM_yyyy", Locale.US).parse(date)?.let {
+            SimpleDateFormat("d MMM yyyy", Locale.getDefault()).format(it)
+        } ?: date
 
     private fun updateDateButton() {
         dateButton.text = SimpleDateFormat("EEE, d MMM yyyy", Locale.getDefault())
@@ -1377,7 +1442,8 @@ class MainActivity : Activity() {
         val details = message?.takeIf { it.isNotBlank() } ?: "The page image could not be downloaded."
         val html = """
             <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-            <style>body{font:18px sans-serif;padding:24px;color:#333}
+            <style>body{font:18px sans-serif;padding:24px;
+            color:${pageErrorColors().first};background:${pageErrorColors().second}}
             a{display:inline-block;margin-top:16px;padding:10px 16px;background:#244d70;
             color:#fff;text-decoration:none;border-radius:4px}</style></head>
             <body><h2>Could not load ${htmlEscape(page.title)}</h2>
@@ -2351,12 +2417,15 @@ class MainActivity : Activity() {
             <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
             <style>html,body{margin:0;width:100%;height:100%;background:#111;color:#fff;font:16px sans-serif}
             header{height:48px;display:flex;align-items:center;padding:0 12px}
-            a{color:#fff}img{display:block;width:100%;height:calc(100% - 48px);margin:0 auto;object-fit:contain;background:#fff}
+            a{color:#fff}main{height:calc(100% - 48px);display:flex;align-items:center;
+            justify-content:center;overflow:hidden;background:#111}
+            img{display:block;width:auto;height:auto;max-width:100%;max-height:100%;
+            object-fit:contain;background:#fff}
             #error{padding:24px;text-align:center}</style></head>
             <body><header><a href="${paper.offlineOrigin}article/${article.id}">Back to story text</a></header>
-            <img src="${htmlEscape(displayedImageUrl)}" alt="${htmlEscape(article.title)}"
+            <main><img src="${htmlEscape(displayedImageUrl)}" alt="${htmlEscape(article.title)}"
                 onerror="this.hidden=true;document.getElementById('error').hidden=false">
-            <div id="error" hidden>Image could not be displayed.</div></body></html>
+            <div id="error" hidden>Image could not be displayed.</div></main></body></html>
         """.trimIndent()
         webView.loadDataWithBaseURL(
             imageTarget,
@@ -2380,12 +2449,15 @@ class MainActivity : Activity() {
             <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
             <style>html,body{margin:0;width:100%;height:100%;background:#111;color:#fff;font:16px sans-serif}
             header{height:48px;display:flex;align-items:center;padding:0 12px}
-            a{color:#fff}img{display:block;width:100%;height:calc(100% - 48px);margin:0 auto;object-fit:contain;background:#fff}
+            a{color:#fff}main{height:calc(100% - 48px);display:flex;align-items:center;
+            justify-content:center;overflow:hidden;background:#111}
+            img{display:block;width:auto;height:auto;max-width:100%;max-height:100%;
+            object-fit:contain;background:#fff}
             #error{padding:24px;text-align:center}</style></head>
             <body><header><a href="${paper.offlineOrigin}page/$sourcePage">Back to paper</a></header>
-            <img src="images/${htmlEscape(imageFile.name)}" alt="Full-size newspaper image"
+            <main><img src="images/${htmlEscape(imageFile.name)}" alt="Full-size newspaper image"
                 onerror="this.hidden=true;document.getElementById('error').hidden=false">
-            <div id="error" hidden>Image could not be displayed.</div></body></html>
+            <div id="error" hidden>Image could not be displayed.</div></main></body></html>
         """.trimIndent()
         webView.loadDataWithBaseURL(baseUrl, html, "text/html", "UTF-8", null)
     }
@@ -2400,12 +2472,15 @@ class MainActivity : Activity() {
             <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
             <style>html,body{margin:0;width:100%;height:100%;background:#111;color:#fff;font:16px sans-serif}
             header{height:48px;display:flex;align-items:center;padding:0 12px}
-            a{color:#fff}img{display:block;width:100%;height:calc(100% - 48px);margin:0 auto;object-fit:contain;background:#fff}
+            a{color:#fff}main{height:calc(100% - 48px);display:flex;align-items:center;
+            justify-content:center;overflow:hidden;background:#111}
+            img{display:block;width:auto;height:auto;max-width:100%;max-height:100%;
+            object-fit:contain;background:#fff}
             #error{padding:24px;text-align:center}</style></head>
             <body><header><a href="${Papers.forEdition(edition).offlineOrigin}article/$id">Back to story text</a></header>
-            <img src="images/$id.jpg" alt="${htmlEscape(edition.articles.firstOrNull { it.id == id }?.title ?: "Story image")}"
+            <main><img src="images/$id.jpg" alt="${htmlEscape(edition.articles.firstOrNull { it.id == id }?.title ?: "Story image")}"
                 onerror="this.hidden=true;document.getElementById('error').hidden=false">
-            <div id="error" hidden>Image could not be displayed.</div></body></html>
+            <div id="error" hidden>Image could not be displayed.</div></main></body></html>
         """.trimIndent()
         webView.loadDataWithBaseURL(baseUrl, html, "text/html", "UTF-8", null)
     }
@@ -2590,6 +2665,20 @@ class MainActivity : Activity() {
             setOnClickListener { onClick() }
         }
 
+    private fun surfaceColor(): Int = if (darkTheme) Color.rgb(30, 30, 30) else Color.WHITE
+
+    private fun homeBackgroundColor(): Int =
+        if (darkTheme) Color.rgb(18, 18, 18) else Color.rgb(245, 245, 245)
+
+    private fun primaryTextColor(): Int =
+        if (darkTheme) Color.rgb(238, 238, 238) else Color.rgb(34, 50, 70)
+
+    private fun secondaryTextColor(): Int =
+        if (darkTheme) Color.rgb(189, 189, 189) else Color.DKGRAY
+
+    private fun pageErrorColors(): Pair<String, String> =
+        if (darkTheme) "#eee" to "#222" else "#333" to "#fff"
+
     private fun showMessage(message: String) {
         if (shuttingDown || isFinishing || isDestroyed || Thread.currentThread().isInterrupted) return
         if (Looper.myLooper() != Looper.getMainLooper()) {
@@ -2629,9 +2718,14 @@ class MainActivity : Activity() {
     private companion object {
         const val PREFERENCES = "epaper_reader"
         const val ARTICLE_TEXT_SCALE_KEY = "article_text_scale"
+        const val STATE_SELECTED_DATE = "selected_date"
+        const val STATE_PAGE_NUMBER = "page_number"
+        const val STATE_READER_MODE = "reader_mode"
+        const val STATE_PAPER_ID = "paper_id"
         const val DEFAULT_ARTICLE_TEXT_SCALE = 1f
         const val MIN_ARTICLE_TEXT_SCALE = 0.75f
         const val MAX_ARTICLE_TEXT_SCALE = 2.25f
+        const val MAX_DATE_WINDOW_DAYS = 30
         const val MAX_AVAILABILITY_ATTEMPTS = 20
         const val AVAILABILITY_RETRY_MILLIS = 1_500L
         const val MAX_JANG_IMAGE_VERIFICATION_ATTEMPTS = 60

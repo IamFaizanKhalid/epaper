@@ -15,7 +15,8 @@ interface PaperViewer {
         article: NewspaperArticle,
         paper: Paper,
         directory: java.io.File?,
-        textScale: Float = 1f
+        textScale: Float = 1f,
+        darkTheme: Boolean = false
     ): String
 }
 
@@ -49,7 +50,7 @@ class WebPaperViewer : PaperViewer {
             <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1,minimum-scale=1,maximum-scale=5,user-scalable=yes">
             <style>body{margin:0;background:#222;text-align:center}
             a,img{-webkit-tap-highlight-color:transparent;outline:none;-webkit-user-select:none;user-select:none}
-            #paper-container{position:relative;width:100%;background:#fff}
+            #paper-container{position:relative;width:100%}
             #page{display:block;width:100%;height:auto;margin:auto;background:#fff;-webkit-user-drag:none}
             #hotspots{position:absolute;inset:0}
             #hotspots a{position:absolute;display:block;color:transparent;outline:none}
@@ -123,7 +124,8 @@ class WebPaperViewer : PaperViewer {
         article: NewspaperArticle,
         paper: Paper,
         directory: java.io.File?,
-        textScale: Float
+        textScale: Float,
+        darkTheme: Boolean
     ): String {
         val paragraphs = article.paragraphs.joinToString("") {
             "<p>${escape(it)}</p>"
@@ -163,12 +165,15 @@ class WebPaperViewer : PaperViewer {
             <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
             <style>$fontFace
             :root{--article-font-scale:$textScale}
+            html,body{background:${if (darkTheme) "#121212" else "#fff"}}
             body{max-width:760px;margin:24px auto;padding:0 20px;
             font-family:${paper.articleFontFamily};font-size:calc(${if (paper.articleTextDirection == "rtl") 22 else 18}px * var(--article-font-scale));
-            line-height:${if (paper.articleTextDirection == "rtl") "2.1" else "1.65"};color:#222;
+            line-height:${if (paper.articleTextDirection == "rtl") "2.1" else "1.65"};
+            background:${if (darkTheme) "#121212" else "#fff"};
+            color:${if (darkTheme) "#f1f1f1" else "#222"};
             direction:${paper.articleTextDirection};text-align:start}
             h1{font-size:${if (paper.articleTextDirection == "rtl") "1.36em" else "1.67em"};line-height:$headingLineHeight}
-            .byline{color:#666;font-size:.85em;margin:12px 0 24px}
+            .byline{color:${if (darkTheme) "#aaa" else "#666"};font-size:.85em;margin:12px 0 24px}
             p{margin:0 0 1em}img{display:block;max-width:100%;height:auto;margin:20px auto}
             .image-button{display:inline-block;margin:8px 0 18px;padding:10px 16px;
             border-radius:4px;background:#244d70;color:#fff;text-decoration:none;font:14px Arial,sans-serif}
