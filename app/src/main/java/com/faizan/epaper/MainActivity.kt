@@ -106,6 +106,7 @@ class MainActivity : Activity() {
     private val availabilityCheckDates = mutableMapOf<NewspaperId, String>()
     private val availabilityAttempts = mutableMapOf<NewspaperId, Int>()
     private val foregroundAvailabilityChecks = mutableSetOf<Pair<NewspaperId, String>>()
+    private val foregroundEditionDownloadAttempts = mutableSetOf<Pair<NewspaperId, String>>()
     private val unavailableEditions = mutableSetOf<Pair<NewspaperId, String>>()
     private val papersToOpenWhenAvailable = mutableSetOf<NewspaperId>()
     private val downloadExecutor = Executors.newFixedThreadPool(2)
@@ -124,6 +125,9 @@ class MainActivity : Activity() {
     private var pageNumber = 1
     private var readerMode = false
     private var showingJangVerificationPage = false
+    private var showingJangStoryVerificationPage = false
+    private var jangStoryVerificationRequest: TextStoryRequest? = null
+    private var jangStoryVerificationAwaiting = false
     private var jangVerificationDate: String? = null
     private var jangVerificationTargetUrl: String? = null
     private var jangVerificationReloadScheduled = false
@@ -621,7 +625,6 @@ class MainActivity : Activity() {
         refreshPaperStatus(
             item,
             isChecking = text == "Checking availability…",
-            isAvailable = text == "Available",
             unavailableColor = color
         )
         refreshDownloadIndicator()
@@ -668,6 +671,9 @@ class MainActivity : Activity() {
                 }
             }
             val percentage = savedEdition?.let { offlineCompletionPercentage(it, directory) }
+            if (today && savedEdition != null) {
+                startCurrentEditionDownloadIfNeeded(savedEdition)
+            }
             if (!today) {
                 item.status.apply {
                     text = when {
@@ -694,7 +700,6 @@ class MainActivity : Activity() {
     private fun refreshPaperStatus(
         item: PaperHomeItem,
         isChecking: Boolean = false,
-        isAvailable: Boolean = false,
         unavailableColor: Int = secondaryTextColor()
     ) {
         val date = selectedDateKey()
@@ -702,19 +707,36 @@ class MainActivity : Activity() {
         val isLoading = isChecking || availabilityCheckDates[item.paper.id] == date ||
             item.downloadIndicator.visibility == View.VISIBLE
         val directory = item.paper.editionDirectory(File(filesDir, "editions"), date)
-        val hasEdition = isAvailable || File(directory, "edition.json").isFile ||
-            availableEdition?.let { it.paperId == item.paper.id && it.date == date } == true
+        val savedEdition = availableEdition?.takeIf {
+            it.paperId == item.paper.id && it.date == date
+        } ?: File(directory, "edition.json").takeIf(File::isFile)?.let { metadata ->
+            runCatching { NewspaperEdition.readMetadata(metadata) }
+                .getOrNull()
+                ?.takeIf { it.paperId == item.paper.id && it.date == date }
+        }
+        val isComplete = savedEdition?.let {
+            offlineCompletionPercentage(it, directory) == 100
+        } == true
         item.status.apply {
-            text = if (isLoading) "" else if (hasEdition) "✓" else "Not available yet"
-            textSize = if (hasEdition) 20f else 13f
+            text = if (isLoading) "" else if (isComplete) "✓" else "Not available yet"
+            textSize = if (isComplete) 20f else 13f
             setTextColor(
-                if (hasEdition) Color.rgb(30, 125, 70)
+                if (isComplete) Color.rgb(30, 125, 70)
                 else if (unavailableColor == Color.RED) Color.RED
                 else secondaryTextColor()
             )
-            contentDescription = if (hasEdition) "Edition available" else "Not available yet"
+            contentDescription = if (isComplete) "Download complete" else "Not available yet"
             visibility = if (isLoading) View.GONE else View.VISIBLE
         }
+    }
+
+    private fun startCurrentEditionDownloadIfNeeded(edition: NewspaperEdition) {
+        if (!isToday(edition.date)) return
+        val directory = editionDirectory(edition)
+        if (File(directory, "complete").isFile) return
+        val key = edition.paperId to edition.date
+        if (!foregroundEditionDownloadAttempts.add(key)) return
+        downloadEdition(edition)
     }
 
     private fun offlineCompletionPercentage(edition: NewspaperEdition, directory: File): Int? {
@@ -733,6 +755,7 @@ class MainActivity : Activity() {
                 .map { it.targetId }
                 .distinct()
                 .toList()
+            val detailImageIds = if (paper.supportsImageDetail) storyIds else emptyList()
             val imageIds = pageHotspots.asSequence()
                 .filter { it.type == NewspaperHotspotType.IMAGE }
                 .map { it.targetId }
@@ -746,7 +769,8 @@ class MainActivity : Activity() {
             } else {
                 emptyList()
             }
-            val contentCount = storyIds.size + imageIds.size + articleImages.size
+            val contentCount = storyIds.size + detailImageIds.size +
+                imageIds.size + articleImages.size
             val totalPageItems = 1 + contentCount
             val pageImageSaved = edition.hasPageImage(directory, page.id)
             val pageScanned = page.id in edition.processedPageIds
@@ -755,6 +779,7 @@ class MainActivity : Activity() {
             if (pageComplete) completedPages++
 
             val completedContent = storyIds.count { it in articlesById } +
+                detailImageIds.count { edition.hasFullImage(directory, it) } +
                 imageIds.count { edition.hasFullImage(directory, it) } +
                 articleImages.count { (article, index) ->
                     edition.hasArticleImage(directory, article, index)
@@ -765,11 +790,37 @@ class MainActivity : Activity() {
         if (!hasOfflineContent) return null
 
         val completionMarker = File(directory, "complete").isFile
-        return if (completedPages == pages.size && completionMarker) {
+        return if (completedPages == pages.size &&
+            isOfflineEditionContentComplete(edition, directory) &&
+            completionMarker
+        ) {
             100
         } else {
             (pageCompletion * 100 / pages.size).toInt().coerceAtMost(99)
         }
+    }
+
+    private fun isOfflineEditionContentComplete(
+        edition: NewspaperEdition,
+        directory: File
+    ): Boolean {
+        val paper = Papers.forEdition(edition)
+        val articlesById = edition.articles.associateBy { it.id }
+        val textStoryIds = edition.hotspots.asSequence()
+            .filter { it.type == NewspaperHotspotType.TEXT }
+            .map { it.targetId }
+            .distinct()
+        val fullImageIds = edition.hotspots.asSequence()
+            .filter { it.type == NewspaperHotspotType.IMAGE }
+            .map { it.targetId }
+            .plus(if (paper.supportsImageDetail) textStoryIds else emptySequence())
+            .distinct()
+        return edition.readingOrder.all { page ->
+            edition.hasPageImage(directory, page.id) &&
+                page.id in edition.processedPageIds
+        } && textStoryIds.all(articlesById::containsKey) &&
+            fullImageIds.all { edition.hasFullImage(directory, it) } &&
+            edition.hasArticleImages(directory)
     }
 
     private fun toggleEditionDownload(paperId: NewspaperId) {
@@ -1152,6 +1203,22 @@ class MainActivity : Activity() {
                 }
 
                 override fun onPageFinished(view: WebView, url: String) {
+                    if (showingJangStoryVerificationPage) {
+                        val request = jangStoryVerificationRequest ?: return
+                        val uri = Uri.parse(url)
+                        if (!uri.host.equals("e.jang.com.pk", ignoreCase = true) ||
+                            (uri.path != "/" && uri.path != "/detail/${request.id}")
+                        ) return
+                        if (!jangStoryVerificationAwaiting) {
+                            jangStoryVerificationAwaiting = true
+                            awaitJangStoryPage(view, request) {
+                                parseJangStoryText(view, request.id) { article ->
+                                    completeJangStoryRequest(request, article)
+                                }
+                            }
+                        }
+                        return
+                    }
                     if (showingJangVerificationPage) {
                         val date = jangVerificationDate ?: return
                         val paper = Papers[NewspaperId.JANG_LAHORE]
@@ -1210,6 +1277,15 @@ class MainActivity : Activity() {
                     request: WebResourceRequest,
                     error: android.webkit.WebResourceError
                 ) {
+                    if (showingJangStoryVerificationPage && request.isForMainFrame) {
+                        jangStoryVerificationRequest?.let {
+                            failJangStoryRequest(
+                                it,
+                                "Could not load Jang's story for verification: ${error.description}"
+                            )
+                        }
+                        return
+                    }
                     if (showingJangVerificationPage && request.isForMainFrame) {
                         val date = jangVerificationDate ?: return
                         failPaperAvailability(
@@ -1268,40 +1344,15 @@ class MainActivity : Activity() {
                 val request = activeTextStory ?: return
                 val uri = Uri.parse(url)
                 if (Papers.forEdition(request.edition).requiresPageVerification) {
-                    if (uri.host != "e.jang.com.pk" ||
-                        uri.path != "/detail/${request.id}" ||
+                    if (!uri.host.equals("e.jang.com.pk", ignoreCase = true) ||
+                        (uri.path != "/detail/${request.id}" && uri.path != "/") ||
                         parsingJangStoryId == request.id
                     ) return
                     parsingJangStoryId = request.id
-                    parseJangStoryText(view, request.id) { article ->
-                        parsingJangStoryId = null
-                        activeTextStory = null
-                        saveStoryArticle(request, article)
-                        finishTextStoryRequest(request)
-                        if (onDemandStoryId == request.id) {
-                            onDemandStoryId = null
-                            onDemandEdition = null
-                            onDemandDirectory = null
-                            storyLoadingDialog?.dismiss()
-                            storyLoadingDialog = null
-                            if (readerMode && selectedDateKey() == request.edition.date &&
-                                viewingStoryContent
-                            ) {
-                                webView.loadDataWithBaseURL(
-                                    Papers.forEdition(request.edition).offlineOrigin,
-                                    renderArticleHtml(
-                                        request.edition,
-                                        article,
-                                        request.directory
-                                    ),
-                                    "text/html",
-                                    "UTF-8",
-                                    null
-                                )
-                            }
+                    awaitJangStoryPage(view, request) {
+                        parseJangStoryText(view, request.id) { article ->
+                            completeJangStoryRequest(request, article)
                         }
-                        startNextTextStory()
-                        refreshDownloadIndicator()
                     }
                     return
                 }
@@ -2206,11 +2257,18 @@ class MainActivity : Activity() {
             return
         }
         editionPageIndex = 0
-        textStoryIds = emptyList()
-        fullImageIds = emptyList()
-        collectedHotspots = emptyList()
-        collectedArticles = emptyList()
-        processedPageIds = emptyList()
+        textStoryIds = edition.hotspots.asSequence()
+            .filter { it.type == NewspaperHotspotType.TEXT }
+            .map { it.targetId }
+            .distinct()
+            .toList()
+        fullImageIds = edition.fullImageIds
+        collectedHotspots = edition.hotspots
+        collectedArticles = edition.articles
+        processedPageIds = edition.processedPageIds
+        editionPageIndex = edition.readingOrder.indexOfFirst {
+            it.id !in processedPageIds
+        }.takeIf { it >= 0 } ?: edition.readingOrder.size
         storyIndex = 0
         archivingStories = false
         processingContentId = null
@@ -3014,6 +3072,10 @@ class MainActivity : Activity() {
 
     private fun downloadLinkedContent(edition: NewspaperEdition) {
         persistProgress(edition)
+        if (Papers.forEdition(edition).requiresPageVerification) {
+            downloadJangLinkedContent(edition)
+            return
+        }
         archivingStories = textStoryIds.isNotEmpty()
         storyScanInProgress = archivingStories
         storyIndex = 0
@@ -3021,6 +3083,30 @@ class MainActivity : Activity() {
             loadNextEditionPage()
         } else {
             downloadLinkedImages(edition)
+        }
+    }
+
+    private fun downloadJangLinkedContent(edition: NewspaperEdition) {
+        val directory = activeEditionDirectory ?: run {
+            failEditionDownload("Edition storage is unavailable.")
+            return
+        }
+        val savedEdition = readEditionMetadata(directory, edition)
+        val storiesToDownload = textStoryIds.distinct().filterNot { storyId ->
+            savedEdition.articles.any { it.id == storyId }
+        }
+        if (storiesToDownload.isEmpty()) {
+            downloadLinkedImages(edition)
+            return
+        }
+
+        var storiesRemaining = storiesToDownload.size
+        storiesToDownload.forEach { storyId ->
+            enqueueTextStory(TextStoryRequest(edition, directory, storyId)) {
+                if (editionInProgress !== edition) return@enqueueTextStory
+                storiesRemaining--
+                if (storiesRemaining == 0) downloadLinkedImages(edition)
+            }
         }
     }
 
@@ -3235,6 +3321,197 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun awaitJangStoryPage(
+        view: WebView,
+        request: TextStoryRequest,
+        attempt: Int = 0,
+        onReady: () -> Unit
+    ) {
+        if (activeTextStory !== request) return
+        val paper = Papers.forEdition(request.edition)
+        val expectedUrl = paper.articleUrl(request.id)
+        val expectedPath = Uri.parse(expectedUrl).path
+        val script = """
+            (() => {
+                const title = document.title.toLowerCase();
+                const text = (document.body?.innerText || '').slice(0, 4000).toLowerCase();
+                const challenge = title.includes('moment, please') ||
+                    title.includes('just a moment') ||
+                    text.includes('verify you are human') ||
+                    text.includes('checking your browser') ||
+                    text.includes('security verification') ||
+                    text.includes('performing security verification') ||
+                    text.includes('request is being verified') ||
+                    document.querySelector('#challenge-running, #challenge-stage');
+                return JSON.stringify({
+                    challenge: Boolean(challenge),
+                    expected: location.pathname === '$expectedPath'
+                });
+            })()
+        """.trimIndent()
+        view.evaluateJavascript(script) { result ->
+            if (activeTextStory !== request) return@evaluateJavascript
+            try {
+                val json = JSONTokener(result).nextValue() as? String
+                    ?: throw IllegalStateException("Could not check Jang's story page.")
+                val state = JSONObject(json)
+                val challenge = state.optBoolean("challenge")
+                val expected = state.optBoolean("expected")
+                if (!challenge && expected) {
+                    onReady()
+                    return@evaluateJavascript
+                }
+                if (challenge && view === detailWebView &&
+                    attempt >= JANG_STORY_INTERACTIVE_VERIFICATION_AFTER_ATTEMPTS
+                ) {
+                    showJangStoryVerificationPage(request)
+                    return@evaluateJavascript
+                }
+                if (attempt >= MAX_JANG_STORY_VERIFICATION_ATTEMPTS) {
+                    android.util.Log.e("MainActivity", "Jang story verification timed out.")
+                    failJangStoryRequest(
+                        request,
+                        "Jang's story verification did not finish in time."
+                    )
+                    return@evaluateJavascript
+                }
+                val reloadExpectedUrl = !challenge && !expected &&
+                    Uri.parse(view.url.orEmpty()).path == "/"
+                view.postDelayed({
+                    if (activeTextStory !== request) return@postDelayed
+                    if (reloadExpectedUrl) view.loadUrl(expectedUrl)
+                    view.postDelayed({
+                        awaitJangStoryPage(view, request, attempt + 1, onReady)
+                    }, 1_000)
+                }, 1_000)
+            } catch (error: Exception) {
+                failJangStoryRequest(
+                    request,
+                    error.message ?: "Could not finish Jang story verification."
+                )
+            }
+        }
+    }
+
+    private fun showJangStoryVerificationPage(request: TextStoryRequest) {
+        if (showingJangStoryVerificationPage || activeTextStory !== request) return
+        showingJangStoryVerificationPage = true
+        jangStoryVerificationRequest = request
+        jangStoryVerificationAwaiting = false
+        detailWebView.stopLoading()
+        homeScreen.visibility = View.GONE
+        readerScreen.visibility = View.VISIBLE
+        webView.visibility = View.VISIBLE
+        pageLabel.text = "Verifying Jang story…"
+        previousPageButton.visibility = View.GONE
+        pagePickerButton.visibility = View.GONE
+        nextPageButton.visibility = View.GONE
+        saveStoryButton.visibility = View.GONE
+        pageActionRow.visibility = View.GONE
+        webView.loadUrl(Papers.forEdition(request.edition).articleUrl(request.id))
+    }
+
+    private fun closeJangStoryVerificationPage() {
+        if (!showingJangStoryVerificationPage) return
+        showingJangStoryVerificationPage = false
+        jangStoryVerificationRequest = null
+        jangStoryVerificationAwaiting = false
+        webView.stopLoading()
+        webView.visibility = if (readerMode) View.VISIBLE else View.GONE
+        readerScreen.visibility = if (readerMode) View.VISIBLE else View.GONE
+        homeScreen.visibility = if (readerMode) View.GONE else View.VISIBLE
+        previousPageButton.visibility = View.VISIBLE
+        pagePickerButton.visibility = View.VISIBLE
+        nextPageButton.visibility = View.VISIBLE
+        pageActionRow.visibility = View.VISIBLE
+        refreshSaveStoryButton()
+        if (readerMode) updatePageLabel() else pageLabel.text = ""
+        refreshDownloadIndicator()
+        if (!readerMode) {
+            mainHandler.removeCallbacks(refreshHomeProgress)
+            mainHandler.post(refreshHomeProgress)
+        }
+    }
+
+    private fun completeJangStoryRequest(
+        request: TextStoryRequest,
+        article: NewspaperArticle
+    ) {
+        if (activeTextStory !== request) return
+        val wasVerification = showingJangStoryVerificationPage &&
+            jangStoryVerificationRequest === request
+        val wasOnDemand = onDemandStoryId == request.id
+        parsingJangStoryId = null
+        activeTextStory = null
+        saveStoryArticle(request, article)
+        finishTextStoryRequest(request)
+        if (wasVerification) closeJangStoryVerificationPage()
+        if (wasOnDemand) {
+            onDemandStoryId = null
+            onDemandEdition = null
+            onDemandDirectory = null
+            storyLoadingDialog?.dismiss()
+            storyLoadingDialog = null
+            if (readerMode && selectedDateKey() == request.edition.date &&
+                viewingStoryContent
+            ) {
+                webView.loadDataWithBaseURL(
+                    Papers.forEdition(request.edition).offlineOrigin,
+                    renderArticleHtml(request.edition, article, request.directory),
+                    "text/html",
+                    "UTF-8",
+                    null
+                )
+            }
+        } else if (wasVerification && readerMode) {
+            returnToCurrentPaperPage()
+        }
+        startNextTextStory()
+        refreshDownloadIndicator()
+    }
+
+    private fun failJangStoryRequest(request: TextStoryRequest, message: String) {
+        if (activeTextStory !== request) return
+        val isEditionDownload = editionInProgress?.let {
+            it.paperId == request.edition.paperId && it.date == request.edition.date
+        } == true
+        if (showingJangStoryVerificationPage &&
+            jangStoryVerificationRequest === request
+        ) closeJangStoryVerificationPage()
+        activeTextStory = null
+        parsingJangStoryId = null
+        if (isEditionDownload) {
+            pendingTextStories.removeAll {
+                it.edition.paperId == request.edition.paperId &&
+                    it.edition.date == request.edition.date
+            }
+            request.completionCallbacks.clear()
+            if (onDemandStoryId == request.id) {
+                onDemandStoryId = null
+                onDemandEdition = null
+                onDemandDirectory = null
+                storyLoadingDialog?.dismiss()
+                storyLoadingDialog = null
+            }
+            failEditionDownload(message)
+            return
+        }
+        finishTextStoryRequest(request)
+        if (onDemandStoryId == request.id) {
+            onDemandStoryId = null
+            onDemandEdition = null
+            onDemandDirectory = null
+            storyLoadingDialog?.dismiss()
+            storyLoadingDialog = null
+            showMessage(message)
+            if (readerMode) returnToCurrentPaperPage()
+        } else {
+            showMessage(message)
+        }
+        startNextTextStory()
+        refreshDownloadIndicator()
+    }
+
     private fun completeEditionDownload(edition: NewspaperEdition) {
         try {
             val directory = activeEditionDirectory
@@ -3245,6 +3522,11 @@ class MainActivity : Activity() {
                 articles = collectedArticles,
                 processedPageIds = processedPageIds
             )
+            if (!isOfflineEditionContentComplete(savedEdition, directory)) {
+                throw IllegalStateException(
+                    "Some pages, stories, or images are still missing from the offline edition."
+                )
+            }
             savedEdition.removeLegacyArchives(directory)
             savedEdition.saveMetadata(directory)
             File(directory, "complete").writeText("ok", Charsets.UTF_8)
@@ -3920,6 +4202,8 @@ class MainActivity : Activity() {
         const val HOME_PROGRESS_REFRESH_MILLIS = 1_500L
         const val MAX_AVAILABILITY_ATTEMPTS = 60
         const val AVAILABILITY_RETRY_MILLIS = 1_500L
+        const val JANG_STORY_INTERACTIVE_VERIFICATION_AFTER_ATTEMPTS = 3
+        const val MAX_JANG_STORY_VERIFICATION_ATTEMPTS = 60
         const val MAX_JANG_IMAGE_VERIFICATION_ATTEMPTS = 60
         const val MAX_JANG_IMAGE_REDIRECT_RETRIES = 3
         const val JANG_IMAGE_VERIFICATION_RETRY_MILLIS = 1_000L
@@ -3949,6 +4233,12 @@ class MainActivity : Activity() {
 
     @Deprecated("Use the system back dispatcher in newer Android versions.")
     override fun onBackPressed() {
+        if (showingJangStoryVerificationPage) {
+            jangStoryVerificationRequest?.let {
+                failJangStoryRequest(it, "Jang story verification was canceled.")
+            }
+            return
+        }
         if (readerMode) {
             if (viewingSavedStory) {
                 showHome()

@@ -242,6 +242,7 @@ private class DawnPaper : Paper {
 private class JangLahorePaper : Paper {
     override val id = NewspaperId.JANG_LAHORE
     override val supportsImageDetail = false
+    override val supportsForegroundEditionPrefetch = true
     override val offlineOrigin = "https://offline.jang/"
     override val supportsInlineArticleImages = true
     override val requiresPageVerification = true
