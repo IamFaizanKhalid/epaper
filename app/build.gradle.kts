@@ -4,7 +4,7 @@ plugins {
 }
 
 android {
-    namespace = "com.faizan.epaper"
+    namespace = "com.iamfaizankhalid.epaper"
     compileSdk = 34
 
     compileOptions {
@@ -17,7 +17,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "com.faizan.epaper"
+        applicationId = "com.iamfaizankhalid.epaper"
         minSdk = 26
         targetSdk = 34
         versionCode = 1

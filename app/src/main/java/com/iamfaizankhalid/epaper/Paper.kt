@@ -1,4 +1,4 @@
-package com.faizan.epaper
+package com.iamfaizankhalid.epaper
 
 import org.json.JSONArray
 import org.json.JSONObject
@@ -196,7 +196,14 @@ private class DawnPaper : Paper {
     }
 
     override fun hotspotExtractionScript(date: String, pageId: String): String = """
-        JSON.stringify(Array.from(document.querySelectorAll('area[href]')).flatMap(area => {
+        (() => {
+          const image = document.querySelector('img[usemap]');
+          const rect = image?.getBoundingClientRect();
+          const coordinateWidth = Math.round(rect?.width || image?.width ||
+              image?.naturalWidth || 660);
+          const coordinateHeight = Math.round(rect?.height || image?.height ||
+              image?.naturalHeight || 1033);
+          return JSON.stringify(Array.from(document.querySelectorAll('area[href]')).flatMap(area => {
             const href = area.getAttribute('href') || '';
             const text = href.match(/StoryText=([0-9_]+)/i);
             const image = href.match(/StoryImage=([0-9_]+)/i);
@@ -207,8 +214,10 @@ private class DawnPaper : Paper {
                 .map(Number).filter(Number.isFinite);
             return [{targetId: match[1], type: text ? 'TEXT' : 'IMAGE',
                 label: area.alt || area.title || '', shape: area.shape || 'rect',
-                coordinates: coordinates}];
-        }))
+                coordinates: coordinates, coordinateWidth: coordinateWidth,
+                coordinateHeight: coordinateHeight}];
+          }));
+        })()
     """.trimIndent()
 
     override fun parseHotspots(
@@ -229,7 +238,9 @@ private class DawnPaper : Paper {
                 NewspaperHotspotType.valueOf(entry.getString("type")),
                 entry.optString("label"),
                 entry.optString("shape", "rect"),
-                coordinates.toIntList()
+                coordinates.toIntList(),
+                coordinateWidth = entry.optInt("coordinateWidth", 660),
+                coordinateHeight = entry.optInt("coordinateHeight", 1033)
             )
         }
     }

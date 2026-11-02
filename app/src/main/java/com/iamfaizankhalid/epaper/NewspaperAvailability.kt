@@ -1,4 +1,4 @@
-package com.faizan.epaper
+package com.iamfaizankhalid.epaper
 
 import java.util.Calendar
 import java.text.SimpleDateFormat

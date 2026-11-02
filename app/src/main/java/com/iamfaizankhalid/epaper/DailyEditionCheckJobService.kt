@@ -1,4 +1,4 @@
-package com.faizan.epaper
+package com.iamfaizankhalid.epaper
 
 import android.app.Activity
 import android.app.Notification

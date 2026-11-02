@@ -1,4 +1,4 @@
-package com.faizan.epaper
+package com.iamfaizankhalid.epaper
 
 interface PaperViewer {
     fun renderLoadingPage(page: NewspaperPage): String
@@ -40,6 +40,8 @@ class WebPaperViewer : PaperViewer {
                 put(org.json.JSONObject().apply {
                     put("shape", hotspot.shape)
                     put("coordinates", org.json.JSONArray(hotspot.coordinates))
+                    put("coordinateWidth", hotspot.coordinateWidth)
+                    put("coordinateHeight", hotspot.coordinateHeight)
                     put("route", if (hotspot.type == NewspaperHotspotType.TEXT) "text" else "image")
                     put("targetId", hotspot.targetId)
                     put("label", hotspot.label)
@@ -65,32 +67,36 @@ class WebPaperViewer : PaperViewer {
             if(!img.naturalWidth||!img.naturalHeight)return;
             items.forEach(item=>{const coords=item.coordinates;
             const shape=item.shape.toLowerCase();
+            const coordinateWidth=Number(item.coordinateWidth)||img.naturalWidth;
+            const coordinateHeight=Number(item.coordinateHeight)||img.naturalHeight;
             const link=document.createElement('a');
             link.href='${paper.offlineOrigin}'+item.route+'/'+encodeURIComponent(item.targetId);
             link.setAttribute('aria-label',item.label||'Open story');
             if(shape==='circle'&&coords.length>=3){
             const x=coords[0],y=coords[1],r=coords[2];
-            link.style.left=(100*(x-r)/img.naturalWidth)+'%';
-            link.style.top=(100*(y-r)/img.naturalHeight)+'%';
-            link.style.width=(200*r/img.naturalWidth)+'%';
-            link.style.height=(200*r/img.naturalHeight)+'%';
+            link.style.left=(100*(x-r)/coordinateWidth)+'%';
+            link.style.top=(100*(y-r)/coordinateHeight)+'%';
+            link.style.width=(200*r/coordinateWidth)+'%';
+            link.style.height=(200*r/coordinateHeight)+'%';
             link.style.borderRadius='50%';
             }else if(shape==='rect'&&coords.length>=4){
             const left=Math.min(coords[0],coords[2]),right=Math.max(coords[0],coords[2]);
             const top=Math.min(coords[1],coords[3]),bottom=Math.max(coords[1],coords[3]);
-            link.style.left=(100*left/img.naturalWidth)+'%';
-            link.style.top=(100*top/img.naturalHeight)+'%';
-            link.style.width=(100*(right-left)/img.naturalWidth)+'%';
-            link.style.height=(100*(bottom-top)/img.naturalHeight)+'%';
+            link.style.left=(100*left/coordinateWidth)+'%';
+            link.style.top=(100*top/coordinateHeight)+'%';
+            link.style.width=(100*(right-left)/coordinateWidth)+'%';
+            link.style.height=(100*(bottom-top)/coordinateHeight)+'%';
             }else if(coords.length>=6){
             const points=[];
             for(let i=0;i+1<coords.length;i+=2)
-            points.push((100*coords[i]/img.naturalWidth)+'% '+(100*coords[i+1]/img.naturalHeight)+'%');
+            points.push((100*coords[i]/coordinateWidth)+'% '+(100*coords[i+1]/coordinateHeight)+'%');
             link.style.inset='0';
             link.style.clipPath='polygon('+points.join(',')+')';
             }else{return}
             link.dataset.shape=shape;
             link.dataset.coordinates=coords.join(',');
+            link.dataset.coordinateWidth=String(coordinateWidth);
+            link.dataset.coordinateHeight=String(coordinateHeight);
             layer.appendChild(link);
             })};
             function renderHotspots(){window.updatePageHotspots($hotspotData)};
@@ -105,7 +111,9 @@ class WebPaperViewer : PaperViewer {
             else{const xs=coords.filter((_,i)=>i%2===0),ys=coords.filter((_,i)=>i%2===1);
             left=Math.min(...xs);top=Math.min(...ys);right=Math.max(...xs);bottom=Math.max(...ys)}
             const mark=document.createElement('div');mark.className='hotspot-highlight';
-            const sx=img.clientWidth/img.naturalWidth,sy=img.clientHeight/img.naturalHeight;
+            const coordinateWidth=Number(link.dataset.coordinateWidth)||img.naturalWidth;
+            const coordinateHeight=Number(link.dataset.coordinateHeight)||img.naturalHeight;
+            const sx=img.clientWidth/coordinateWidth,sy=img.clientHeight/coordinateHeight;
             mark.style.left=(left*sx)+'px';mark.style.top=(top*sy)+'px';
             mark.style.width=((right-left)*sx)+'px';mark.style.height=((bottom-top)*sy)+'px';
             if(shape==='circle')mark.style.borderRadius='50%';

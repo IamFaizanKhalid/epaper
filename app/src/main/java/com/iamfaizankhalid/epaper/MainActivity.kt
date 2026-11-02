@@ -1,4 +1,4 @@
-package com.faizan.epaper
+package com.iamfaizankhalid.epaper
 
 import android.app.Activity
 import android.app.AlertDialog
@@ -783,19 +783,46 @@ class MainActivity : Activity() {
                 .getOrNull()
                 ?.takeIf { it.paperId == item.paper.id && it.date == date }
         }
-        val isComplete = savedEdition?.let {
-            offlineCompletionPercentage(it, directory) == 100
-        } == true
+        val offlinePercentage = savedEdition?.let {
+            offlineCompletionPercentage(it, directory)
+        }
+        val isComplete = offlinePercentage == 100
+        val showDownloadPercentage = isLoading &&
+            item.downloadIndicator.visibility == View.VISIBLE &&
+            savedEdition != null && !isComplete
+        val displayedPercentage = offlinePercentage ?: 0
         item.status.apply {
-            text = if (isLoading) "" else if (isComplete) "✓" else "Not available yet"
-            textSize = if (isComplete) 20f else 13f
+            text = when {
+                showDownloadPercentage -> "$displayedPercentage%"
+                isLoading -> ""
+                isComplete -> "✓"
+                else -> "Not available yet"
+            }
+            textSize = when {
+                isComplete -> 20f
+                showDownloadPercentage -> 14f
+                else -> 13f
+            }
             setTextColor(
-                if (isComplete) Color.rgb(30, 125, 70)
-                else if (unavailableColor == Color.RED) Color.RED
-                else secondaryTextColor()
+                when {
+                    isComplete -> Color.rgb(30, 125, 70)
+                    showDownloadPercentage -> secondaryTextColor()
+                    unavailableColor == Color.RED -> Color.RED
+                    else -> secondaryTextColor()
+                }
             )
-            contentDescription = if (isComplete) "Download complete" else "Not available yet"
-            visibility = if (isLoading) View.GONE else View.VISIBLE
+            contentDescription = when {
+                showDownloadPercentage ->
+                    "$displayedPercentage% downloaded for offline reading"
+                isComplete -> "Download complete"
+                isLoading -> null
+                else -> "Not available yet"
+            }
+            visibility = if (showDownloadPercentage || !isLoading) {
+                View.VISIBLE
+            } else {
+                View.GONE
+            }
         }
     }
 
@@ -1127,11 +1154,11 @@ class MainActivity : Activity() {
                 LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
             )
             row.addView(downloadIndicator, LinearLayout.LayoutParams(dp(36), dp(36)))
-            row.addView(downloadAction, LinearLayout.LayoutParams(dp(40), dp(40)))
             row.addView(status, LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ))
+            row.addView(downloadAction, LinearLayout.LayoutParams(dp(40), dp(40)))
             val rowParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT

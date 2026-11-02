@@ -1,4 +1,4 @@
-package com.faizan.epaper
+package com.iamfaizankhalid.epaper
 
 import org.json.JSONArray
 import org.json.JSONObject
@@ -25,7 +25,9 @@ data class NewspaperHotspot(
     val label: String,
     val shape: String,
     val coordinates: List<Int>,
-    val imageUrl: String? = null
+    val imageUrl: String? = null,
+    val coordinateWidth: Int = 0,
+    val coordinateHeight: Int = 0
 )
 
 data class NewspaperArticle(
@@ -583,6 +585,8 @@ data class NewspaperEdition(
                         put("label", hotspot.label)
                         put("shape", hotspot.shape)
                         put("coordinates", JSONArray(hotspot.coordinates))
+                        put("coordinateWidth", hotspot.coordinateWidth)
+                        put("coordinateHeight", hotspot.coordinateHeight)
                         hotspot.imageUrl?.let { put("imageUrl", it) }
                     })
                 }
@@ -941,6 +945,8 @@ data class NewspaperEdition(
 
     companion object {
         private val dawnImageDownloadLock = Any()
+        private const val LEGACY_DAWN_COORDINATE_WIDTH = 660
+        private const val LEGACY_DAWN_COORDINATE_HEIGHT = 1033
         private const val MAX_IMAGE_BYTES = 25L * 1024 * 1024
         private const val MAX_JANG_RESPONSE_BODY_BYTES = 16 * 1024
         private val DATE_PATTERN = Regex("\\d{2}_\\d{2}_\\d{4}")
@@ -1008,6 +1014,18 @@ data class NewspaperEdition(
                 }
                 val coordinates = item.getJSONArray("coordinates").ints()
                 require(coordinates.size >= 4) { "Dawn returned invalid hotspot coordinates." }
+                val coordinateWidth = item.optInt(
+                    "coordinateWidth",
+                    if (isJangEdition) 0 else LEGACY_DAWN_COORDINATE_WIDTH
+                )
+                val coordinateHeight = item.optInt(
+                    "coordinateHeight",
+                    if (isJangEdition) 0 else LEGACY_DAWN_COORDINATE_HEIGHT
+                )
+                require(
+                    (coordinateWidth == 0 && coordinateHeight == 0) ||
+                        (coordinateWidth > 0 && coordinateHeight > 0)
+                ) { "The newspaper returned invalid hotspot coordinate dimensions." }
                 NewspaperHotspot(
                     pageId,
                     targetId,
@@ -1015,7 +1033,9 @@ data class NewspaperEdition(
                     item.optString("label"),
                     item.optString("shape", "rect"),
                     coordinates,
-                    item.optString("imageUrl").takeIf { it.isNotBlank() }
+                    item.optString("imageUrl").takeIf { it.isNotBlank() },
+                    coordinateWidth,
+                    coordinateHeight
                 )
             }.orEmpty()
 
