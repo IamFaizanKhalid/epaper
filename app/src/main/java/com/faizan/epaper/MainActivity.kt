@@ -5,6 +5,7 @@ import android.app.AlertDialog
 import android.app.DatePickerDialog
 import android.app.ProgressDialog
 import android.graphics.Color
+import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Handler
 import android.os.Bundle
@@ -28,6 +29,7 @@ import android.widget.ScrollView
 import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
+import android.content.res.ColorStateList
 import org.json.JSONArray
 import org.json.JSONObject
 import org.json.JSONTokener
@@ -553,10 +555,11 @@ class MainActivity : Activity() {
     }
 
     private fun setPaperStatus(paper: Paper, text: String, color: Int) {
-                val displayText = if (isToday(selectedDateKey())) text else ""
+                val displayText = text.takeIf { isToday(selectedDateKey()) }.orEmpty()
                 paperHomeItems[paper.id]?.status?.apply {
                     this.text = displayText
                     setTextColor(color)
+                    visibility = if (displayText.isEmpty()) View.GONE else View.VISIBLE
                 }
     }
 
@@ -605,7 +608,17 @@ class MainActivity : Activity() {
                     text = ""
                     visibility = View.GONE
                 } else {
-                    text = "$percentage%"
+                    text = if (percentage == 100) "✓" else "$percentage%"
+                    textSize = if (percentage == 100) 20f else 14f
+                    setTextColor(
+                        if (percentage == 100) Color.rgb(30, 125, 70)
+                        else primaryTextColor()
+                    )
+                    contentDescription = if (percentage == 100) {
+                        "Download complete"
+                    } else {
+                        "$percentage% downloaded"
+                    }
                     visibility = View.VISIBLE
                 }
             }
@@ -728,37 +741,52 @@ class MainActivity : Activity() {
     private fun createReaderView() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(surfaceColor())
+            setBackgroundColor(homeBackgroundColor())
         }
         homeScreen = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(12), dp(8), dp(12), dp(8))
             setBackgroundColor(homeBackgroundColor())
         }
         dateButton = button("") { chooseDate() }
-        homeScreen.addView(dateButton)
+        dateButton.apply {
+            textSize = 16f
+            isAllCaps = false
+            minHeight = dp(52)
+            setPadding(dp(18), 0, dp(18), 0)
+            background = roundedBackground(
+                if (darkTheme) Color.rgb(45, 99, 137) else Color.rgb(31, 83, 117),
+                dp(16)
+            )
+            backgroundTintList = null
+            setTextColor(Color.WHITE)
+            elevation = dp(2).toFloat()
+        }
         val homeContent = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
+            setPadding(dp(24), dp(24), dp(24), dp(32))
         }
         val title = TextView(this).apply {
             text = "Newspapers"
-            textSize = 20f
+            textSize = 30f
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
             setTextColor(primaryTextColor())
-            setPadding(0, dp(10), 0, dp(4))
+            setPadding(0, 0, 0, dp(20))
         }
         pageLabel = TextView(this).apply {
             textSize = 14f
             setTextColor(secondaryTextColor())
-            setPadding(0, dp(4), 0, dp(6))
+            setPadding(dp(20), dp(12), dp(20), dp(12))
+            background = roundedBackground(surfaceColor(), dp(12))
         }
         paperList = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
         }
         val savedStoriesTitle = TextView(this).apply {
             text = "Saved Stories"
-            textSize = 20f
+            textSize = 22f
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
             setTextColor(primaryTextColor())
-            setPadding(0, dp(18), 0, dp(4))
+            setPadding(0, dp(28), 0, dp(12))
         }
         savedStoriesList = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -767,8 +795,10 @@ class MainActivity : Activity() {
             val row = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
-                setPadding(dp(12), dp(10), dp(12), dp(10))
-                setBackgroundColor(surfaceColor())
+                setPadding(dp(20), dp(16), dp(16), dp(16))
+                background = roundedBackground(surfaceColor(), dp(16))
+                elevation = dp(2).toFloat()
+                minimumHeight = dp(92)
                 isClickable = true
                 isFocusable = true
                 setOnClickListener { openPaper(paper) }
@@ -778,20 +808,45 @@ class MainActivity : Activity() {
             }
             val name = TextView(this).apply {
                 text = paper.id.displayName
-                textSize = 18f
+                textSize = 21f
+                setTypeface(typeface, android.graphics.Typeface.BOLD)
                 setTextColor(primaryTextColor())
             }
             val status = TextView(this).apply {
-                text = "Checking availability…"
-                textSize = 14f
+                text = if (isToday(selectedDateKey())) "Checking availability…" else ""
+                textSize = 13f
+                gravity = Gravity.CENTER
+                maxWidth = dp(160)
                 setTextColor(secondaryTextColor())
+                setPadding(dp(10), dp(5), dp(10), dp(5))
+                visibility = if (text.isEmpty()) View.GONE else View.VISIBLE
+                background = roundedBackground(
+                    if (darkTheme) Color.rgb(54, 54, 54) else Color.rgb(241, 245, 248),
+                    dp(10)
+                )
             }
             val offlinePercentage = TextView(this).apply {
-                textSize = 16f
+                textSize = 14f
                 gravity = Gravity.CENTER
                 minWidth = dp(48)
+                setPadding(dp(8), dp(5), dp(8), dp(5))
                 setTextColor(primaryTextColor())
+                background = roundedBackground(
+                    if (darkTheme) Color.rgb(54, 54, 54) else Color.rgb(241, 245, 248),
+                    dp(10)
+                )
                 visibility = View.GONE
+            }
+            val trailingLabels = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER
+                addView(status)
+                addView(offlinePercentage, LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply {
+                    topMargin = dp(6)
+                })
             }
             val downloadIndicator = ProgressBar(
                 this,
@@ -808,18 +863,22 @@ class MainActivity : Activity() {
                 setOnClickListener { toggleEditionDownload(paper.id) }
             }
             info.addView(name)
-            info.addView(status)
             row.addView(
                 info,
                 LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
             )
-            row.addView(downloadIndicator, LinearLayout.LayoutParams(dp(32), dp(32)))
+            row.addView(downloadIndicator, LinearLayout.LayoutParams(dp(36), dp(36)))
             row.addView(downloadAction, LinearLayout.LayoutParams(dp(40), dp(40)))
-            row.addView(
-                offlinePercentage,
-                LinearLayout.LayoutParams(dp(52), LinearLayout.LayoutParams.WRAP_CONTENT)
+            row.addView(trailingLabels, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ))
+            val rowParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
             )
-            paperList.addView(row)
+            rowParams.bottomMargin = dp(12)
+            paperList.addView(row, rowParams)
             paperHomeItems[paper.id] = PaperHomeItem(
                 paper,
                 status,
@@ -830,13 +889,31 @@ class MainActivity : Activity() {
         }
 
         homeContent.addView(title)
+        homeContent.addView(dateButton, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply {
+            bottomMargin = dp(20)
+        })
         homeContent.addView(paperList)
         homeContent.addView(savedStoriesTitle)
         homeContent.addView(savedStoriesList)
         homeScreen.addView(
             ScrollView(this).apply {
                 isFillViewport = true
-                addView(homeContent)
+                clipToPadding = false
+                val maxContentWidth = minOf(
+                    (resources.displayMetrics.widthPixels / resources.displayMetrics.density).toInt() - 32,
+                    760
+                ).coerceAtLeast(280)
+                addView(
+                    homeContent,
+                    FrameLayout.LayoutParams(
+                        dp(maxContentWidth),
+                        FrameLayout.LayoutParams.WRAP_CONTENT,
+                        Gravity.TOP or Gravity.CENTER_HORIZONTAL
+                    )
+                )
             },
             LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
@@ -847,10 +924,13 @@ class MainActivity : Activity() {
         updateSavedStoriesList()
         readerScreen = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(surfaceColor())
+            setBackgroundColor(homeBackgroundColor())
         }
         val pageControls = LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+            background = roundedBackground(surfaceColor(), dp(16))
+            elevation = dp(2).toFloat()
         }
         papersButton = button("Papers") { onReaderBackButton() }
         pageControls.addView(papersButton)
@@ -879,7 +959,7 @@ class MainActivity : Activity() {
                 }
             }
         }
-        pageControls.addView(pageSpinner, LinearLayout.LayoutParams(0, dp(48), 1f))
+        pageControls.addView(pageSpinner, LinearLayout.LayoutParams(0, dp(52), 1f))
         nextPageButton = button("Next") {
             val pages = readerEdition()?.readingOrder.orEmpty()
             val index = pages.indexOfFirst { it.id.endsWith("_${pageNumber.toString().padStart(3, '0')}") }
@@ -888,8 +968,19 @@ class MainActivity : Activity() {
         pageControls.addView(nextPageButton)
         saveStoryButton = button("Save") { saveCurrentStory() }
         pageControls.addView(saveStoryButton)
-        readerScreen.addView(pageLabel)
-        readerScreen.addView(pageControls)
+        pageLabel.setPadding(dp(16), dp(12), dp(16), dp(12))
+        readerScreen.addView(pageLabel, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply {
+            setMargins(dp(12), dp(12), dp(12), dp(8))
+        })
+        readerScreen.addView(pageControls, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply {
+            setMargins(dp(12), 0, dp(12), dp(12))
+        })
 
         webView = WebView(this).apply {
             settings.javaScriptEnabled = true
@@ -2569,9 +2660,10 @@ class MainActivity : Activity() {
         if (savedStories.isEmpty()) {
             savedStoriesList.addView(TextView(this).apply {
                 text = "No saved stories yet."
-                textSize = 14f
+                textSize = 15f
                 setTextColor(secondaryTextColor())
-                setPadding(0, dp(4), 0, dp(12))
+                setPadding(dp(18), dp(18), dp(18), dp(18))
+                background = roundedBackground(surfaceColor(), dp(14))
             })
             return
         }
@@ -2579,27 +2671,67 @@ class MainActivity : Activity() {
             val row = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
-                setPadding(dp(12), dp(8), dp(4), dp(8))
-                setBackgroundColor(surfaceColor())
-            }
-            val label = TextView(this).apply {
-                text = "${saved.article.title}\n${saved.paperId.displayName} · ${formatDate(saved.date)}"
-                textSize = 15f
-                setTextColor(primaryTextColor())
-                setPadding(0, 0, dp(8), 0)
+                setPadding(dp(18), dp(14), dp(10), dp(14))
+                background = roundedBackground(surfaceColor(), dp(14))
+                elevation = dp(1).toFloat()
+                isClickable = true
+                isFocusable = true
                 setOnClickListener { openSavedStory(saved) }
             }
+            val storyInfo = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                isClickable = true
+                setOnClickListener { openSavedStory(saved) }
+            }
+            val title = TextView(this).apply {
+                text = saved.article.title
+                textSize = 16f
+                maxLines = 2
+                ellipsize = android.text.TextUtils.TruncateAt.END
+                setTypeface(typeface, android.graphics.Typeface.BOLD)
+                setTextColor(primaryTextColor())
+            }
+            val metadata = TextView(this).apply {
+                text = "${saved.paperId.displayName} · ${formatDate(saved.date)}"
+                textSize = 12f
+                setTextColor(secondaryTextColor())
+                setPadding(0, dp(5), 0, 0)
+            }
+            storyInfo.addView(title)
+            storyInfo.addView(metadata)
             row.addView(
-                label,
+                storyInfo,
                 LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
             )
-            row.addView(button("Remove") {
+            val remove = ImageButton(this).apply {
+                setImageResource(android.R.drawable.ic_menu_close_clear_cancel)
+                setColorFilter(
+                    if (darkTheme) Color.rgb(255, 150, 150) else Color.rgb(170, 55, 55)
+                )
+                setBackgroundColor(Color.TRANSPARENT)
+                contentDescription = "Remove saved story"
+                setOnClickListener { confirmRemoveSavedStory(saved) }
+            }
+            row.addView(remove, LinearLayout.LayoutParams(dp(48), dp(48)))
+            savedStoriesList.addView(row, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                bottomMargin = dp(10)
+            })
+        }
+    }
+
+    private fun confirmRemoveSavedStory(saved: SavedStory) {
+        AlertDialog.Builder(this)
+            .setTitle("Remove saved story?")
+            .setMessage("Remove this story from your saved stories?")
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Remove") { _, _ ->
                 savedStories.removeAll { it.key == saved.key }
                 persistSavedStories()
-            })
-            row.setOnClickListener { openSavedStory(saved) }
-            savedStoriesList.addView(row)
-        }
+            }
+            .show()
     }
 
     private fun saveCurrentStory() {
@@ -3500,10 +3632,24 @@ class MainActivity : Activity() {
     private fun button(label: String, onClick: () -> Unit): Button =
         Button(this).apply {
             text = label
-            textSize = 12f
-            minHeight = dp(40)
-            setPadding(dp(6), 0, dp(6), 0)
+            textSize = 14f
+            isAllCaps = false
+            minHeight = dp(48)
+            setPadding(dp(12), 0, dp(12), 0)
+            backgroundTintList = ColorStateList.valueOf(
+                if (darkTheme) Color.rgb(54, 74, 88) else Color.rgb(230, 239, 245)
+            )
+            setTextColor(primaryTextColor())
             setOnClickListener { onClick() }
+        }
+
+    private fun roundedBackground(color: Int, radius: Int): GradientDrawable =
+        GradientDrawable().apply {
+            setColor(color)
+            cornerRadius = radius.toFloat()
+            if (!darkTheme && color == surfaceColor()) {
+                setStroke(dp(1), Color.rgb(230, 234, 237))
+            }
         }
 
     private fun surfaceColor(): Int = if (darkTheme) Color.rgb(30, 30, 30) else Color.WHITE
