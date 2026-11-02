@@ -105,6 +105,7 @@ class MainActivity : Activity() {
     private val availabilityWebViews = linkedMapOf<NewspaperId, WebView>()
     private val availabilityCheckDates = mutableMapOf<NewspaperId, String>()
     private val availabilityAttempts = mutableMapOf<NewspaperId, Int>()
+    private val foregroundAvailabilityChecks = mutableSetOf<Pair<NewspaperId, String>>()
     private val unavailableEditions = mutableSetOf<Pair<NewspaperId, String>>()
     private val papersToOpenWhenAvailable = mutableSetOf<NewspaperId>()
     private val downloadExecutor = Executors.newFixedThreadPool(2)
@@ -264,7 +265,28 @@ class MainActivity : Activity() {
     }
 
     private fun openPaper(paper: Paper) {
-        checkPaperAvailability(paper, openWhenAvailable = true)
+        val date = selectedDateKey()
+        val isNotAvailableYet = isToday(date) &&
+            paperHomeItems[paper.id]?.status?.text == "Not available yet"
+        if (isNotAvailableYet) {
+            if (!NewspaperAvailability.checksAreAllowed(date)) {
+                checkPaperAvailability(
+                    paper,
+                    openWhenAvailable = true,
+                    checkTodayNow = true
+                )
+                return
+            }
+            if (!foregroundAvailabilityChecks.add(paper.id to date)) {
+                showMessage("${paper.id.displayName} availability was already checked today.")
+                return
+            }
+        }
+        checkPaperAvailability(
+            paper,
+            openWhenAvailable = true,
+            checkTodayNow = isNotAvailableYet
+        )
     }
 
     private fun createPaperAvailabilityWebViews() {
@@ -326,7 +348,11 @@ class MainActivity : Activity() {
                 }
         }
 
-    private fun checkPaperAvailability(paper: Paper, openWhenAvailable: Boolean = false) {
+    private fun checkPaperAvailability(
+        paper: Paper,
+        openWhenAvailable: Boolean = false,
+        checkTodayNow: Boolean = false
+    ) {
                 val requestedDate = selectedDateKey()
                 val isToday = isToday(requestedDate)
                 val directory = paper.editionDirectory(File(filesDir, "editions"), requestedDate)
@@ -353,25 +379,27 @@ class MainActivity : Activity() {
                         showMessage(error.message ?: "Could not read the saved edition.")
                     }
                 }
-                if (isToday && (paper.id to requestedDate) in unavailableEditions) {
+                if (availabilityCheckDates[paper.id] == requestedDate) {
+                    if (openWhenAvailable) papersToOpenWhenAvailable += paper.id
+                    setPaperStatus(paper, "Checking availability…", Color.DKGRAY)
+                    return
+                }
+                if (isToday && !checkTodayNow &&
+                    (paper.id to requestedDate) in unavailableEditions
+                ) {
                     setPaperStatus(paper, "Not available", Color.GRAY)
                     if (openWhenAvailable) {
                         showMessage("${paper.id.displayName} is not available today.")
                     }
                     return
                 }
-                if (isToday) {
+                if (isToday && !checkTodayNow) {
                     setPaperStatus(paper, "Waiting for scheduled check…", Color.DKGRAY)
                     if (openWhenAvailable) {
                         showMessage(
                             "${paper.id.displayName} will be available after the next scheduled check."
                         )
                     }
-                    return
-                }
-                if (availabilityCheckDates[paper.id] == requestedDate) {
-                    if (openWhenAvailable) papersToOpenWhenAvailable += paper.id
-                    setPaperStatus(paper, "Checking availability…", Color.DKGRAY)
                     return
                 }
                 if (isToday && !NewspaperAvailability.checksAreAllowed(requestedDate)) {
