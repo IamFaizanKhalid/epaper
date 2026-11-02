@@ -122,6 +122,9 @@ class MainActivity : Activity() {
     private var readerMode = false
     private var showingJangVerificationPage = false
     private var jangVerificationDate: String? = null
+    private var jangVerificationTargetUrl: String? = null
+    private var jangVerificationReloadScheduled = false
+    private var jangVerificationRedirectAttempts = 0
     private var viewingStoryContent = false
     private var viewingSavedStory = false
     private var articleTextViewerActive = false
@@ -274,9 +277,14 @@ class MainActivity : Activity() {
                                 val date = availabilityCheckDates[paper.id] ?: return
                                 val expectedHost = Uri.parse(paper.availabilityUrl(date)).host
                                 val actualHost = Uri.parse(url).host
+                                if (paper.requiresPageVerification) {
+                                    if (paper.isAvailabilityPageUrl(url, date)) {
+                                        readPaperAvailability(paper, view, date)
+                                    }
+                                    return
+                                }
                                 if (paper.isAvailabilityPageUrl(url, date) ||
-                                    actualHost == expectedHost || actualHost == "www.$expectedHost"
-                                ) {
+                                    actualHost == expectedHost || actualHost == "www.$expectedHost") {
                                     readPaperAvailability(paper, view, date)
                                 }
                             }
@@ -383,11 +391,23 @@ class MainActivity : Activity() {
                                 val attempt = availabilityAttempts[paper.id] ?: 0
                                 if (attempt < MAX_AVAILABILITY_ATTEMPTS) {
                                     availabilityAttempts[paper.id] = attempt + 1
-                                    if (!visibleJangCheck) {
-                                        browser.postDelayed({
-                                            readPaperAvailability(paper, browser, date)
-                                        }, AVAILABILITY_RETRY_MILLIS)
-                                    }
+                                    browser.postDelayed({
+                                        if (availabilityCheckDates[paper.id] == date &&
+                                            (!visibleJangCheck ||
+                                                showingJangVerificationPage && browser === webView &&
+                                                paper.isAvailabilityPageUrl(
+                                                    browser.url.orEmpty(),
+                                                    date
+                                                ))
+                                        ) {
+                                            readPaperAvailability(
+                                                paper,
+                                                browser,
+                                                date,
+                                                visibleJangCheck
+                                            )
+                                        }
+                                    }, AVAILABILITY_RETRY_MILLIS)
                                 } else {
                                     failPaperAvailability(
                                         paper,
@@ -398,6 +418,17 @@ class MainActivity : Activity() {
                                 return@evaluateJavascript
                             }
                             "NOT_AVAILABLE" -> {
+                                if (paper.requiresPageVerification) {
+                                    if (!visibleJangCheck) {
+                                        if (!showingJangVerificationPage) {
+                                            showJangVerificationPage(paper, date)
+                                        }
+                                        return@evaluateJavascript
+                                    }
+                                    if (!showingJangVerificationPage || browser !== webView) {
+                                        return@evaluateJavascript
+                                    }
+                                }
                                 availabilityCheckDates.remove(paper.id)
                                 papersToOpenWhenAvailable.remove(paper.id)
                                 closeJangVerificationPage()
@@ -485,6 +516,10 @@ class MainActivity : Activity() {
         if (showingJangVerificationPage) return
         showingJangVerificationPage = true
         jangVerificationDate = date
+        val targetUrl = paper.pageUrl(date, "J${date}_001")
+        jangVerificationTargetUrl = targetUrl
+        jangVerificationReloadScheduled = false
+        jangVerificationRedirectAttempts = 0
         homeScreen.visibility = View.GONE
         readerScreen.visibility = View.VISIBLE
         webView.visibility = View.VISIBLE
@@ -493,13 +528,16 @@ class MainActivity : Activity() {
         pageSpinner.visibility = View.GONE
         nextPageButton.visibility = View.GONE
         saveStoryButton.visibility = View.GONE
-        webView.loadUrl(paper.availabilityUrl(date))
+        webView.loadUrl(targetUrl)
     }
 
     private fun closeJangVerificationPage() {
         if (!showingJangVerificationPage) return
         showingJangVerificationPage = false
         jangVerificationDate = null
+        jangVerificationTargetUrl = null
+        jangVerificationReloadScheduled = false
+        jangVerificationRedirectAttempts = 0
         webView.stopLoading()
         webView.visibility = View.GONE
         readerScreen.visibility = View.GONE
@@ -905,13 +943,33 @@ class MainActivity : Activity() {
                 override fun onPageFinished(view: WebView, url: String) {
                     if (showingJangVerificationPage) {
                         val date = jangVerificationDate ?: return
-                        if (Uri.parse(url).host.equals("e.jang.com.pk", ignoreCase = true)) {
-                            readPaperAvailability(
-                                Papers[NewspaperId.JANG_LAHORE],
-                                view,
-                                date,
-                                visibleJangCheck = true
-                            )
+                        val paper = Papers[NewspaperId.JANG_LAHORE]
+                        if (!Uri.parse(url).host.equals("e.jang.com.pk", ignoreCase = true)) {
+                            return
+                        }
+                        if (paper.isAvailabilityPageUrl(url, date)) {
+                            readPaperAvailability(paper, view, date, visibleJangCheck = true)
+                        } else if (Uri.parse(url).path == "/" &&
+                            !jangVerificationReloadScheduled
+                        ) {
+                            if (jangVerificationRedirectAttempts >= MAX_AVAILABILITY_ATTEMPTS) {
+                                failPaperAvailability(
+                                    paper,
+                                    date,
+                                    "Jang kept redirecting away from the requested edition page."
+                                )
+                                return
+                            }
+                            jangVerificationRedirectAttempts++
+                            jangVerificationReloadScheduled = true
+                            view.postDelayed({
+                                if (showingJangVerificationPage &&
+                                    jangVerificationDate == date
+                                ) {
+                                    jangVerificationReloadScheduled = false
+                                    jangVerificationTargetUrl?.let(view::loadUrl)
+                                }
+                            }, AVAILABILITY_RETRY_MILLIS)
                         }
                         return
                     }

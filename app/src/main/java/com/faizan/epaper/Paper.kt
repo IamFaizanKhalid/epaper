@@ -303,27 +303,30 @@ private class JangLahorePaper : Paper {
             const requested = '${date.replace('_', '-')}';
             const pages = [];
             const seen = new Set();
-            const pagePattern = /\/lahore\/(\d{2}-\d{2}-\d{4})\/page(\d+)(?:[/?#"' \s)]|$)/gi;
-            const addPages = (reference, label) => {
-                for (const match of String(reference || '').matchAll(pagePattern)) {
-                    if (match[1] !== requested) continue;
+            const pageMenus = Array.from(document.querySelectorAll('a.top_parent'))
+                .map(menu => Array.from(
+                    menu.parentElement?.querySelectorAll('ul a[href]') || []
+                ).flatMap(link => {
+                    const url = new URL(link.href, location.href);
+                    const match = url.pathname.match(
+                        /^\/lahore\/(\d{2}-\d{2}-\d{4})\/page(\d+)\/?$/i
+                    );
+                    if (url.host !== 'e.jang.com.pk' || url.hash || !match ||
+                        match[1] !== requested) return [];
                     const number = Number(match[2]);
-                    if (number < 1 || number > 99 || seen.has(number)) continue;
-                    seen.add(number);
-                    pages.push({id: 'J${date}_' + String(number).padStart(3, '0'),
-                        title: label || 'Page ' + number});
-                }
-            };
-            for (const element of document.querySelectorAll(
-                'a[href], area[href], option[value], [data-href], [data-url], [onclick]')) {
-                const label = (element.innerText || element.textContent ||
-                    element.getAttribute('aria-label') || '').trim();
-                for (const attribute of ['href', 'value', 'data-href', 'data-url', 'onclick']) {
-                    addPages(element.getAttribute(attribute), label);
-                }
+                    if (number < 1 || number > 99) return [];
+                    return [{
+                        id: 'J${date}_' + String(number).padStart(3, '0'),
+                        title: (link.innerText || link.textContent || '').trim()
+                    }];
+                }));
+            const pageMenu = pageMenus.sort((a, b) => b.length - a.length)[0] || [];
+            for (const page of pageMenu) {
+                if (seen.has(page.id)) continue;
+                seen.add(page.id);
+                pages.push(page);
             }
-            addPages(document.documentElement?.innerHTML, '');
-            if (!pages.length) return JSON.stringify({error: 'NOT_AVAILABLE'});
+            if (!pages.length) return JSON.stringify({error: 'VERIFYING'});
             pages.sort((a, b) => Number(a.id.slice(-3)) - Number(b.id.slice(-3)));
             return JSON.stringify({
                 date: '${date}',
