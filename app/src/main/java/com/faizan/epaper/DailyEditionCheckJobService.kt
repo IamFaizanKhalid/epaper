@@ -115,10 +115,17 @@ abstract class NewspaperEditionCheckJobService : JobService() {
                 val fetcher = currentPaper ?: return
                 val date = checkDate ?: return
                 if (activeJob !== params) return
-                if (fetcher.isAvailabilityPageUrl(url, date)) {
+                val uri = Uri.parse(url)
+                val isJangHomePage = fetcher.requiresPageVerification &&
+                    uri.host.equals(
+                        Uri.parse(fetcher.availabilityUrl(date)).host,
+                        ignoreCase = true
+                    ) && uri.path == "/"
+                if (fetcher.isAvailabilityPageUrl(url, date) || isJangHomePage) {
                     discoverEdition(view, params, fetcher, date)
                     return
                 }
+                if (fetcher.requiresPageVerification) return
                 val edition = backgroundEdition ?: return
                 val page = backgroundPages.getOrNull(backgroundPageIndex)
                 if (page != null && fetcher.isPageUrl(url, edition.date, page.id)) {
@@ -252,19 +259,31 @@ abstract class NewspaperEditionCheckJobService : JobService() {
                 JSONTokener(json).nextValue() as? org.json.JSONObject
             }.getOrNull()
             when (response?.optString("error")) {
-                "NOT_AVAILABLE" -> {
+                "NOT_AVAILABLE", "NOT_PUBLISHED" -> {
                     checkNextFetcher(params)
                     return@evaluateJavascript
                 }
-                "VERIFYING" -> {
+                "VERIFYING", "PENDING" -> {
                     if (verificationAttempts++ < MAX_VERIFICATION_ATTEMPTS) {
                         mainHandler.postDelayed({
                             if (activeJob === params && currentPaper == fetcher) {
-                                discoverEdition(view, params, fetcher, date)
+                                if (fetcher.requiresPageVerification &&
+                                    Uri.parse(view.url.orEmpty()).path == "/"
+                                ) {
+                                    view.loadUrl(fetcher.availabilityUrl(date))
+                                } else {
+                                    discoverEdition(view, params, fetcher, date)
+                                }
                             }
                         }, VERIFICATION_RETRY_MILLIS)
                     } else {
-                        Log.e(TAG, "${fetcher.id.displayName} verification did not finish in time.")
+                        val error = response.optString("error")
+                        val message = if (error == "VERIFYING") {
+                            "${fetcher.id.displayName} verification did not finish in time."
+                        } else {
+                            "${fetcher.id.displayName}'s edition page did not load its page list."
+                        }
+                        Log.e(TAG, message)
                         shouldRetry = true
                         checkNextFetcher(params)
                     }

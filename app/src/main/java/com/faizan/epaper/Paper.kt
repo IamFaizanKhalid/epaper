@@ -301,6 +301,27 @@ private class JangLahorePaper : Paper {
                 return JSON.stringify({error: 'VERIFYING'});
             }
             const requested = '${date.replace('_', '-')}';
+            if (location.pathname === '/') {
+                const toIso = value => {
+                    const match = value.match(/^(\d{2})-(\d{2})-(\d{4})$/);
+                    return match ? match[3] + '-' + match[2] + '-' + match[1] : '';
+                };
+                const latestDates = Array.from(document.querySelectorAll('a[href]'))
+                    .map(link => {
+                        const url = new URL(link.href, location.href);
+                        const match = url.pathname.match(
+                            /^\/lahore\/(\d{2}-\d{2}-\d{4})\/page1\/?$/i
+                        );
+                        return url.host === 'e.jang.com.pk' && match ? match[1] : '';
+                    })
+                    .filter(Boolean)
+                    .sort((a, b) => toIso(a).localeCompare(toIso(b)));
+                const latestDate = latestDates[latestDates.length - 1];
+                if (latestDate && toIso(requested) > toIso(latestDate)) {
+                    return JSON.stringify({error: 'NOT_PUBLISHED'});
+                }
+                return JSON.stringify({error: 'VERIFYING'});
+            }
             const pages = [];
             const seen = new Set();
             const pageMenus = Array.from(document.querySelectorAll('a.top_parent'))
@@ -327,7 +348,7 @@ private class JangLahorePaper : Paper {
                 seen.add(page.id);
                 pages.push(page);
             }
-            if (!pages.length) return JSON.stringify({error: 'VERIFYING'});
+            if (!pages.length) return JSON.stringify({error: 'PENDING'});
             pages.sort((a, b) => Number(a.id.slice(-3)) - Number(b.id.slice(-3)));
             return JSON.stringify({
                 date: '${date}',

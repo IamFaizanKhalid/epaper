@@ -106,6 +106,7 @@ class MainActivity : Activity() {
     private val availabilityWebViews = linkedMapOf<NewspaperId, WebView>()
     private val availabilityCheckDates = mutableMapOf<NewspaperId, String>()
     private val availabilityAttempts = mutableMapOf<NewspaperId, Int>()
+    private val unavailableEditions = mutableSetOf<Pair<NewspaperId, String>>()
     private val papersToOpenWhenAvailable = mutableSetOf<NewspaperId>()
     private val downloadExecutor = Executors.newFixedThreadPool(2)
     private val pageDownloadLock = Any()
@@ -158,6 +159,7 @@ class MainActivity : Activity() {
     private var offlineEdition: NewspaperEdition? = null
     private var offlineDirectory: File? = null
     private var jangVerificationKey: String? = null
+    private var jangVerifiedKey: String? = null
     private var jangVerificationGeneration = 0
     private val jangImageTransferLock = Any()
     private var activeJangImageRequest: JangImageRequest? = null
@@ -280,6 +282,10 @@ class MainActivity : Activity() {
                                 if (paper.requiresPageVerification) {
                                     if (paper.isAvailabilityPageUrl(url, date)) {
                                         readPaperAvailability(paper, view, date)
+                                    } else if (actualHost.equals(expectedHost, ignoreCase = true) &&
+                                        Uri.parse(url).path == "/"
+                                    ) {
+                                        readPaperAvailability(paper, view, date)
                                     }
                                     return
                                 }
@@ -347,6 +353,13 @@ class MainActivity : Activity() {
                         showMessage(error.message ?: "Could not read the saved edition.")
                     }
                 }
+                if (isToday && (paper.id to requestedDate) in unavailableEditions) {
+                    setPaperStatus(paper, "Not available", Color.GRAY)
+                    if (openWhenAvailable) {
+                        showMessage("${paper.id.displayName} is not available today.")
+                    }
+                    return
+                }
                 if (availabilityCheckDates[paper.id] == requestedDate) {
                     if (openWhenAvailable) papersToOpenWhenAvailable += paper.id
                     setPaperStatus(paper, "Checking availability…", Color.DKGRAY)
@@ -382,43 +395,52 @@ class MainActivity : Activity() {
                         val json = JSONTokener(result).nextValue() as? String
                             ?: throw IllegalStateException("Could not read availability data.")
                         val response = JSONObject(json)
-                        when (response.optString("error")) {
-                            "VERIFYING" -> {
-                                if (paper.requiresPageVerification && !visibleJangCheck) {
-                                    showJangVerificationPage(paper, date)
-                                    return@evaluateJavascript
-                                }
-                                val attempt = availabilityAttempts[paper.id] ?: 0
-                                if (attempt < MAX_AVAILABILITY_ATTEMPTS) {
-                                    availabilityAttempts[paper.id] = attempt + 1
-                                    browser.postDelayed({
-                                        if (availabilityCheckDates[paper.id] == date &&
-                                            (!visibleJangCheck ||
-                                                showingJangVerificationPage && browser === webView &&
-                                                paper.isAvailabilityPageUrl(
-                                                    browser.url.orEmpty(),
-                                                    date
-                                                ))
-                                        ) {
-                                            readPaperAvailability(
-                                                paper,
-                                                browser,
-                                                date,
-                                                visibleJangCheck
-                                            )
-                                        }
-                                    }, AVAILABILITY_RETRY_MILLIS)
-                                } else {
-                                    failPaperAvailability(
-                                        paper,
-                                        date,
-                                        "Jang's site did not finish its verification."
-                                    )
-                                }
+                        val discoveryError = response.optString("error")
+                        if (discoveryError == "VERIFYING" || discoveryError == "PENDING") {
+                            if (discoveryError == "VERIFYING" &&
+                                paper.requiresPageVerification && !visibleJangCheck
+                            ) {
+                                showJangVerificationPage(paper, date)
                                 return@evaluateJavascript
                             }
-                            "NOT_AVAILABLE" -> {
-                                if (paper.requiresPageVerification) {
+                            val attempt = availabilityAttempts[paper.id] ?: 0
+                            if (attempt < MAX_AVAILABILITY_ATTEMPTS) {
+                                availabilityAttempts[paper.id] = attempt + 1
+                                browser.postDelayed({
+                                    if (availabilityCheckDates[paper.id] == date &&
+                                        (!visibleJangCheck ||
+                                            showingJangVerificationPage && browser === webView &&
+                                            paper.isAvailabilityPageUrl(
+                                                browser.url.orEmpty(),
+                                                date
+                                            ))
+                                    ) {
+                                        readPaperAvailability(
+                                            paper,
+                                            browser,
+                                            date,
+                                            visibleJangCheck
+                                        )
+                                    }
+                                }, AVAILABILITY_RETRY_MILLIS)
+                            } else {
+                                failPaperAvailability(
+                                    paper,
+                                    date,
+                                    if (discoveryError == "VERIFYING") {
+                                        "${paper.id.displayName}'s site did not finish its verification."
+                                    } else {
+                                        "${paper.id.displayName}'s edition page did not load its page list."
+                                    }
+                                )
+                            }
+                            return@evaluateJavascript
+                        }
+                        when (discoveryError) {
+                            "NOT_AVAILABLE", "NOT_PUBLISHED" -> {
+                                if (paper.requiresPageVerification &&
+                                    discoveryError != "NOT_PUBLISHED"
+                                ) {
                                     if (!visibleJangCheck) {
                                         if (!showingJangVerificationPage) {
                                             showJangVerificationPage(paper, date)
@@ -428,6 +450,9 @@ class MainActivity : Activity() {
                                     if (!showingJangVerificationPage || browser !== webView) {
                                         return@evaluateJavascript
                                     }
+                                }
+                                if (isToday(date)) {
+                                    unavailableEditions += paper.id to date
                                 }
                                 availabilityCheckDates.remove(paper.id)
                                 papersToOpenWhenAvailable.remove(paper.id)
@@ -1058,6 +1083,7 @@ class MainActivity : Activity() {
                         } else if (Uri.parse(url).path == "/" &&
                             !jangVerificationReloadScheduled
                         ) {
+                            readPaperAvailability(paper, view, date, visibleJangCheck = true)
                             if (jangVerificationRedirectAttempts >= MAX_AVAILABILITY_ATTEMPTS) {
                                 failPaperAvailability(
                                     paper,
@@ -1492,7 +1518,8 @@ class MainActivity : Activity() {
         ) {
             if (requestedPage != null && !isSameOnDemandPage(onDemandPage, requestedPage)) return
             val key = expectedUrl
-            if (attempt == 0 && jangVerificationKey != key) {
+            if (attempt == 0) {
+                if (jangVerifiedKey == key || jangVerificationKey == key) return
                 jangVerificationKey = key
                 jangVerificationGeneration++
             }
@@ -1543,9 +1570,11 @@ class MainActivity : Activity() {
                         return@evaluateJavascript
                     }
                     jangVerificationKey = null
+                    jangVerifiedKey = key
                     jangWebView.postDelayed(onReady, 300)
                 } catch (error: Exception) {
                     jangVerificationKey = null
+                    jangVerifiedKey = null
                     onDemandPage = null
                     showMessage(error.message ?: "Could not finish Jang verification.")
                 }
@@ -1907,7 +1936,9 @@ class MainActivity : Activity() {
         DatePickerDialog(
             this,
             { _, year, month, day ->
+                val previousDate = selectedDateKey()
                 selectedDate.set(year, month, day)
+                val requestedDate = selectedDateKey()
                 pageNumber = 1
                 showHome()
                 availableEdition = null
@@ -1920,11 +1951,13 @@ class MainActivity : Activity() {
                 }
                 updateDateButton()
                 refreshDownloadIndicator()
-                availabilityWebViews.values.forEach(WebView::stopLoading)
-                availabilityCheckDates.clear()
-                availabilityAttempts.clear()
-                papersToOpenWhenAvailable.clear()
-                if (isToday(selectedDateKey())) checkPaperAvailabilities()
+                if (requestedDate != previousDate) {
+                    availabilityWebViews.values.forEach(WebView::stopLoading)
+                    availabilityCheckDates.clear()
+                    availabilityAttempts.clear()
+                    papersToOpenWhenAvailable.clear()
+                }
+                if (isToday(requestedDate)) checkPaperAvailabilities()
             },
             selectedDate.get(Calendar.YEAR),
             selectedDate.get(Calendar.MONTH),
@@ -2347,6 +2380,7 @@ class MainActivity : Activity() {
         if (isSameOnDemandPage(onDemandPage, requestedPage)) return
         onDemandPage = requestedPage
         if (Papers.forEdition(edition).requiresPageVerification) {
+            jangVerifiedKey = null
             jangWebView.loadUrl(
                 Papers.forEdition(edition).pageUrl(edition.date, page.id)
             )
@@ -2374,6 +2408,7 @@ class MainActivity : Activity() {
         if (Papers.forEdition(request.first).requiresPageVerification) {
             jangVerificationGeneration++
             jangVerificationKey = null
+            jangVerifiedKey = null
             jangWebView.stopLoading()
         } else {
             onDemandWebView.stopLoading()
