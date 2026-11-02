@@ -1091,10 +1091,13 @@ abstract class NewspaperEditionCheckJobService : JobService() {
             }
         }
 
-        fun schedule(context: Context) {
+        fun schedule(context: Context, papers: Collection<Paper> = Papers.all) {
             val scheduler = context.getSystemService(Context.JOB_SCHEDULER_SERVICE) as JobScheduler
-            Papers.all.forEach { paper ->
+            papers.forEach { paper ->
                 val registration = paper.backgroundJob
+                if (scheduler.getPendingJob(registration.periodicJobId) != null) {
+                    return@forEach
+                }
                 val job = JobInfo.Builder(
                     registration.periodicJobId,
                     ComponentName(context, registration.serviceClass)
@@ -1108,6 +1111,9 @@ abstract class NewspaperEditionCheckJobService : JobService() {
                 }
             }
         }
+
+        fun schedule(context: Context, paper: Paper) =
+            schedule(context, listOf(paper))
         private const val MAX_VERIFICATION_ATTEMPTS = 20
         private const val VERIFICATION_RETRY_MILLIS = 1_500L
         private const val MAX_JANG_IMAGE_VERIFICATION_ATTEMPTS = 60
@@ -1132,7 +1138,11 @@ class JangEditionCheckJobService : NewspaperEditionCheckJobService() {
 }
 
 object DailyEditionCheckScheduler {
-    fun schedule(context: Context) = NewspaperEditionCheckJobService.schedule(context)
+    fun schedule(context: Context, papers: Collection<Paper> = Papers.all) =
+        NewspaperEditionCheckJobService.schedule(context, papers)
+
+    fun schedule(context: Context, paper: Paper) =
+        NewspaperEditionCheckJobService.schedule(context, paper)
 }
 
 object NotificationPermission {

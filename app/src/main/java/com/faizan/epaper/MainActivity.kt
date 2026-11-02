@@ -4,6 +4,7 @@ import android.app.Activity
 import android.app.AlertDialog
 import android.app.DatePickerDialog
 import android.app.ProgressDialog
+import android.app.job.JobScheduler
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
@@ -107,6 +108,7 @@ class MainActivity : Activity() {
     private val availabilityAttempts = mutableMapOf<NewspaperId, Int>()
     private val foregroundAvailabilityChecks = mutableSetOf<Pair<NewspaperId, String>>()
     private val foregroundEditionDownloadAttempts = mutableSetOf<Pair<NewspaperId, String>>()
+    private val startupAvailabilitySchedulesPending = mutableSetOf<Pair<NewspaperId, String>>()
     private val unavailableEditions = mutableSetOf<Pair<NewspaperId, String>>()
     private val papersToOpenWhenAvailable = mutableSetOf<NewspaperId>()
     private val downloadExecutor = Executors.newFixedThreadPool(2)
@@ -212,7 +214,24 @@ class MainActivity : Activity() {
         createReaderView()
         installArticleScaleGestureDetector()
         createPaperAvailabilityWebViews()
-        DailyEditionCheckScheduler.schedule(this)
+        val today = dateFormat.format(Calendar.getInstance().time)
+        val jobScheduler = getSystemService(JOB_SCHEDULER_SERVICE) as JobScheduler
+        val unscheduledPapers = papers.filter {
+            jobScheduler.getPendingJob(it.backgroundJob.periodicJobId) == null
+        }
+        val papersToCheckImmediately = if (NewspaperAvailability.checksAreAllowed(today)) {
+            unscheduledPapers.filterNot { hasSavedEdition(it, today) }
+        } else {
+            emptyList()
+        }
+        papersToCheckImmediately.forEach {
+            startupAvailabilitySchedulesPending += it.id to today
+            foregroundAvailabilityChecks += it.id to today
+        }
+        DailyEditionCheckScheduler.schedule(
+            this,
+            papers.filterNot { paper -> papersToCheckImmediately.any { it.id == paper.id } }
+        )
         NotificationPermission.requestIfNeeded(this)
         val savedPaperId = savedInstanceState?.getString(STATE_PAPER_ID)
             ?.let { value -> NewspaperId.entries.firstOrNull { it.storageName == value } }
@@ -230,6 +249,9 @@ class MainActivity : Activity() {
         } else null
         if (restoredEdition != null) openEdition(restoredEdition)
         refreshScheduledAvailabilityStatuses()
+        papersToCheckImmediately.forEach { paper ->
+            checkPaperAvailability(paper, checkTodayNow = true, requestedDate = today)
+        }
     }
 
     override fun onResume() {
@@ -270,6 +292,14 @@ class MainActivity : Activity() {
 
     private fun openPaper(paper: Paper) {
         val date = selectedDateKey()
+        if (hasSavedEdition(paper, date)) {
+            checkPaperAvailability(
+                paper,
+                openWhenAvailable = true,
+                requestedDate = date
+            )
+            return
+        }
         val isNotAvailableYet = isToday(date) &&
             paperHomeItems[paper.id]?.status?.text == "Not available yet"
         if (isNotAvailableYet) {
@@ -282,7 +312,10 @@ class MainActivity : Activity() {
                 return
             }
             if (!foregroundAvailabilityChecks.add(paper.id to date)) {
-                showMessage("${paper.id.displayName} availability was already checked today.")
+                showMessage(
+                    "${paper.id.displayName} is not available yet. " +
+                        "It will be checked again on schedule."
+                )
                 return
             }
         }
@@ -333,6 +366,7 @@ class MainActivity : Activity() {
                                 val date = availabilityCheckDates[paper.id] ?: return
                                 if (availabilityCheckDates[paper.id] != date) return
                                 availabilityCheckDates.remove(paper.id)
+                                scheduleStartupAvailabilityCheck(paper, date)
                                 papersToOpenWhenAvailable.remove(paper.id)
                                 setPaperStatus(paper, "Could not check availability", Color.RED)
                                 showMessage(
@@ -355,9 +389,9 @@ class MainActivity : Activity() {
     private fun checkPaperAvailability(
         paper: Paper,
         openWhenAvailable: Boolean = false,
-        checkTodayNow: Boolean = false
+        checkTodayNow: Boolean = false,
+        requestedDate: String = selectedDateKey()
     ) {
-                val requestedDate = selectedDateKey()
                 val isToday = isToday(requestedDate)
                 val directory = paper.editionDirectory(File(filesDir, "editions"), requestedDate)
                 val metadata = File(directory, "edition.json")
@@ -378,6 +412,7 @@ class MainActivity : Activity() {
                         ) {
                             downloadEdition(edition)
                         }
+                        scheduleStartupAvailabilityCheck(paper, requestedDate)
                         return
                     } catch (error: Exception) {
                         showMessage(error.message ?: "Could not read the saved edition.")
@@ -495,8 +530,39 @@ class MainActivity : Activity() {
                                 if (isToday(date)) {
                                     unavailableEditions += paper.id to date
                                 }
+                                val savedDirectory = paper.editionDirectory(
+                                    File(filesDir, "editions"),
+                                    date
+                                )
+                                val saved = readSavedEdition(paper, date)
+                                if (saved != null) {
+                                    unavailableEditions.remove(paper.id to date)
+                                    availabilityCheckDates.remove(paper.id)
+                                    availabilityAttempts.remove(paper.id)
+                                    scheduleStartupAvailabilityCheck(paper, date)
+                                    val shouldOpen = papersToOpenWhenAvailable.remove(paper.id) &&
+                                        date == selectedDateKey()
+                                    closeJangVerificationPage()
+                                    if (date == selectedDateKey()) {
+                                        availableEdition = saved
+                                        updatePagePicker(saved)
+                                        updatePageLabel()
+                                    }
+                                    if (isToday(date)) {
+                                        setPaperStatus(paper, "Available", Color.rgb(30, 125, 70))
+                                    }
+                                    if (date == dateFormat.format(Calendar.getInstance().time) &&
+                                        paper.supportsForegroundEditionPrefetch &&
+                                        !File(savedDirectory, "complete").isFile
+                                    ) {
+                                        downloadEdition(saved)
+                                    }
+                                    if (shouldOpen) openEdition(saved)
+                                    return@evaluateJavascript
+                                }
                                 availabilityCheckDates.remove(paper.id)
                                 papersToOpenWhenAvailable.remove(paper.id)
+                                scheduleStartupAvailabilityCheck(paper, date)
                                 closeJangVerificationPage()
                                 if (isToday(date)) {
                                     setPaperStatus(paper, "Not available", Color.GRAY)
@@ -514,6 +580,7 @@ class MainActivity : Activity() {
                         require(discovered.paperId == paper.id && discovered.date == date) {
                             "The availability response belongs to a different edition."
                         }
+                        unavailableEditions.remove(paper.id to date)
                         val directory = paper.editionDirectory(File(filesDir, "editions"), date)
                         if (!directory.exists() && !directory.mkdirs()) {
                             throw IllegalStateException("Could not create edition storage.")
@@ -537,6 +604,7 @@ class MainActivity : Activity() {
                         offlineEditionCache.remove(paper.id to date)
                         availabilityCheckDates.remove(paper.id)
                         availabilityAttempts.remove(paper.id)
+                        scheduleStartupAvailabilityCheck(paper, date)
                         val shouldOpen = papersToOpenWhenAvailable.remove(paper.id) &&
                             date == selectedDateKey()
                         closeJangVerificationPage()
@@ -572,6 +640,7 @@ class MainActivity : Activity() {
                 )
                 availabilityCheckDates.remove(paper.id)
                 availabilityAttempts.remove(paper.id)
+                scheduleStartupAvailabilityCheck(paper, date)
                 papersToOpenWhenAvailable.remove(paper.id)
                 closeJangVerificationPage()
                 setPaperStatus(paper, "Could not check availability", Color.RED)
@@ -892,6 +961,7 @@ class MainActivity : Activity() {
                         "Saved ${paper.id.displayName} edition metadata is invalid."
                     }
                     if (today) {
+                        unavailableEditions.remove(paper.id to date)
                         availableEdition = edition
                         setPaperStatus(paper, "Available", Color.rgb(30, 125, 70))
                     } else {
@@ -915,6 +985,38 @@ class MainActivity : Activity() {
             } else {
                 setPaperStatus(paper, "", secondaryTextColor())
             }
+        }
+    }
+
+    private fun hasSavedEdition(paper: Paper, date: String): Boolean {
+        return readSavedEdition(paper, date) != null
+    }
+
+    private fun readSavedEdition(paper: Paper, date: String): NewspaperEdition? {
+        val metadata = File(
+            paper.editionDirectory(File(filesDir, "editions"), date),
+            "edition.json"
+        )
+        if (!metadata.isFile) return null
+        return try {
+            val edition = NewspaperEdition.readMetadata(metadata)
+            require(edition.paperId == paper.id && edition.date == date) {
+                "Saved ${paper.id.displayName} edition metadata is invalid."
+            }
+            edition
+        } catch (error: Exception) {
+            android.util.Log.e(
+                "MainActivity",
+                "Could not read ${paper.id.displayName}'s saved availability.",
+                error
+            )
+            null
+        }
+    }
+
+    private fun scheduleStartupAvailabilityCheck(paper: Paper, date: String) {
+        if (startupAvailabilitySchedulesPending.remove(paper.id to date)) {
+            DailyEditionCheckScheduler.schedule(this, paper)
         }
     }
 
@@ -2107,6 +2209,12 @@ class MainActivity : Activity() {
     private fun showHome() {
         cancelOnDemandPageRequest()
         if (showingJangVerificationPage) {
+            jangVerificationDate?.let { date ->
+                scheduleStartupAvailabilityCheck(
+                    Papers[NewspaperId.JANG_LAHORE],
+                    date
+                )
+            }
             availabilityCheckDates.remove(NewspaperId.JANG_LAHORE)
             availabilityAttempts.remove(NewspaperId.JANG_LAHORE)
             papersToOpenWhenAvailable.remove(NewspaperId.JANG_LAHORE)
@@ -4144,6 +4252,10 @@ class MainActivity : Activity() {
         }
         paperHomeItems.values.forEach { item ->
             val paperId = item.paper.id
+            val directory = item.paper.editionDirectory(File(filesDir, "editions"), date)
+            val savedEdition = offlineEditionCache[paperId to date]?.edition
+            val offlineDownloadPending = savedEdition != null &&
+                offlineCompletionPercentage(savedEdition, directory) != 100
             val pageDownloadActive = synchronized(pageDownloadLock) {
                 pageDownloadQueue.any {
                     it.edition.paperId == paperId && it.edition.date == date
@@ -4161,7 +4273,7 @@ class MainActivity : Activity() {
             } == true
             val availabilityCheckActive = availabilityCheckDates[paperId] == date
             val loading = availabilityCheckActive || pageDownloadActive ||
-                storyDownloadActive || editionDownloadActive
+                storyDownloadActive || editionDownloadActive || offlineDownloadPending
             item.downloadIndicator.visibility = if (
                 loading
             ) View.VISIBLE else View.GONE

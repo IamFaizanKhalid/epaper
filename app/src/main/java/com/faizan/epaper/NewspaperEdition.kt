@@ -635,65 +635,78 @@ data class NewspaperEdition(
     }
 
     private fun downloadJpeg(id: String, remoteSection: String, destination: File) {
-        val parts = id.split('_')
-        require(
-            (PAGE_PATTERN.matches(id) || STORY_PATTERN.matches(id)) &&
-                parts.take(3).joinToString("_") == date
-        ) { "Invalid Dawn image ID." }
-        val url = URL(
-            "https://e.dawn.com/${parts[2]}/${parts[1]}/${parts[0]}/$remoteSection/$id.jpg"
-        )
-        val temporaryImage = File(destination.parentFile, "$id.jpg.tmp")
-        val connection = (url.openConnection() as HttpURLConnection).apply {
-            connectTimeout = 15_000
-            readTimeout = 30_000
-            instanceFollowRedirects = true
-            setRequestProperty("User-Agent", "DawnEpaperAndroid/1.0")
-        }
+        synchronized(dawnImageDownloadLock) {
+            if (destination.isJpeg()) return
+            val parts = id.split('_')
+            require(
+                (PAGE_PATTERN.matches(id) || STORY_PATTERN.matches(id)) &&
+                    parts.take(3).joinToString("_") == date
+            ) { "Invalid Dawn image ID." }
+            val url = URL(
+                "https://e.dawn.com/${parts[2]}/${parts[1]}/${parts[0]}/$remoteSection/$id.jpg"
+            )
+            val temporaryImage = File.createTempFile(
+                "${id}_",
+                ".jpg.tmp",
+                destination.parentFile
+            )
+            val connection = (url.openConnection() as HttpURLConnection).apply {
+                connectTimeout = 15_000
+                readTimeout = 30_000
+                instanceFollowRedirects = true
+                setRequestProperty("User-Agent", "DawnEpaperAndroid/1.0")
+            }
 
-        try {
-            connection.connect()
-            if (connection.responseCode !in 200..299) {
-                throw IllegalStateException("Dawn returned HTTP ${connection.responseCode} for image $id.")
-            }
-            if (connection.contentType?.substringBefore(';')?.trim() != "image/jpeg") {
-                throw IllegalStateException("Dawn did not return a JPEG for image $id.")
-            }
-            if (connection.contentLengthLong > MAX_IMAGE_BYTES) {
-                throw IllegalStateException("Image $id is larger than expected.")
-            }
-            connection.inputStream.use { input ->
-                FileOutputStream(temporaryImage).use { output ->
-                    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-                    var totalBytes = 0L
-                    var firstByte = -1
-                    var secondByte = -1
-                    while (true) {
-                        val read = input.read(buffer)
-                        if (read < 0) break
-                        if (read == 0) continue
-                        if (firstByte < 0) firstByte = buffer[0].toInt() and 0xff
-                        if (secondByte < 0 && read > 1) secondByte = buffer[1].toInt() and 0xff
-                        totalBytes += read
-                        if (totalBytes > MAX_IMAGE_BYTES) {
-                            throw IllegalStateException("Image $id is larger than expected.")
+            try {
+                connection.connect()
+                if (connection.responseCode !in 200..299) {
+                    throw IllegalStateException(
+                        "Dawn returned HTTP ${connection.responseCode} for image $id."
+                    )
+                }
+                if (connection.contentType?.substringBefore(';')?.trim() != "image/jpeg") {
+                    throw IllegalStateException("Dawn did not return a JPEG for image $id.")
+                }
+                if (connection.contentLengthLong > MAX_IMAGE_BYTES) {
+                    throw IllegalStateException("Image $id is larger than expected.")
+                }
+                connection.inputStream.use { input ->
+                    FileOutputStream(temporaryImage).use { output ->
+                        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                        var totalBytes = 0L
+                        var firstByte = -1
+                        var secondByte = -1
+                        while (true) {
+                            val read = input.read(buffer)
+                            if (read < 0) break
+                            if (read == 0) continue
+                            if (firstByte < 0) firstByte = buffer[0].toInt() and 0xff
+                            if (secondByte < 0 && read > 1) {
+                                secondByte = buffer[1].toInt() and 0xff
+                            }
+                            totalBytes += read
+                            if (totalBytes > MAX_IMAGE_BYTES) {
+                                throw IllegalStateException("Image $id is larger than expected.")
+                            }
+                            output.write(buffer, 0, read)
                         }
-                        output.write(buffer, 0, read)
-                    }
-                    if (firstByte != 0xff || secondByte != 0xd8) {
-                        throw IllegalStateException("Dawn returned an invalid image for $id.")
+                        if (firstByte != 0xff || secondByte != 0xd8) {
+                            throw IllegalStateException("Dawn returned an invalid image for $id.")
+                        }
                     }
                 }
+                if (destination.exists() && !destination.delete()) {
+                    throw IllegalStateException("Could not replace image $id.")
+                }
+                if (!temporaryImage.renameTo(destination) && !destination.isJpeg()) {
+                    throw IllegalStateException("Could not save image $id.")
+                }
+            } catch (error: Exception) {
+                temporaryImage.delete()
+                throw error
+            } finally {
+                connection.disconnect()
             }
-            destination.delete()
-            if (!temporaryImage.renameTo(destination)) {
-                throw IllegalStateException("Could not save image $id.")
-            }
-        } catch (error: Exception) {
-            temporaryImage.delete()
-            throw error
-        } finally {
-            connection.disconnect()
         }
     }
 
@@ -927,6 +940,7 @@ data class NewspaperEdition(
     }
 
     companion object {
+        private val dawnImageDownloadLock = Any()
         private const val MAX_IMAGE_BYTES = 25L * 1024 * 1024
         private const val MAX_JANG_RESPONSE_BODY_BYTES = 16 * 1024
         private val DATE_PATTERN = Regex("\\d{2}_\\d{2}_\\d{4}")
