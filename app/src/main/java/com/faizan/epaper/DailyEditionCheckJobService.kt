@@ -1070,6 +1070,9 @@ abstract class NewspaperEditionCheckJobService : JobService() {
             val scheduler = context.getSystemService(Context.JOB_SCHEDULER_SERVICE) as JobScheduler
             Papers.all.forEach { paper ->
                 val registration = paper.backgroundJob
+                if (scheduler.getPendingJob(registration.periodicJobId) != null) {
+                    return@forEach
+                }
                 val job = JobInfo.Builder(
                     registration.nineAmJobId,
                     ComponentName(context, registration.serviceClass)

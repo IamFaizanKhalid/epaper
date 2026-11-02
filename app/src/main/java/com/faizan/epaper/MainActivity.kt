@@ -189,6 +189,7 @@ class MainActivity : Activity() {
             if (shuttingDown) return
             if (::homeScreen.isInitialized && homeScreen.visibility == View.VISIBLE) {
                 refreshDownloadIndicator()
+                refreshScheduledAvailabilityStatuses()
                 mainHandler.postDelayed(this, HOME_PROGRESS_REFRESH_MILLIS)
             }
         }
@@ -224,7 +225,7 @@ class MainActivity : Activity() {
             else null
         } else null
         if (restoredEdition != null) openEdition(restoredEdition)
-        else checkPaperAvailabilities()
+        refreshScheduledAvailabilityStatuses()
     }
 
     override fun onResume() {
@@ -357,6 +358,15 @@ class MainActivity : Activity() {
                     setPaperStatus(paper, "Not available", Color.GRAY)
                     if (openWhenAvailable) {
                         showMessage("${paper.id.displayName} is not available today.")
+                    }
+                    return
+                }
+                if (isToday) {
+                    setPaperStatus(paper, "Waiting for scheduled check…", Color.DKGRAY)
+                    if (openWhenAvailable) {
+                        showMessage(
+                            "${paper.id.displayName} will be available after the next scheduled check."
+                        )
                     }
                     return
                 }
@@ -758,9 +768,46 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun checkPaperAvailabilities() {
-        if (!isToday(selectedDateKey())) return
-        papers.forEach { paper -> checkPaperAvailability(paper) }
+    private fun refreshScheduledAvailabilityStatuses() {
+        val date = selectedDateKey()
+        val today = isToday(date)
+        availableEdition = null
+        papers.forEach { paper ->
+            val metadata = File(
+                paper.editionDirectory(File(filesDir, "editions"), date),
+                "edition.json"
+            )
+            if (metadata.isFile) {
+                try {
+                    val edition = NewspaperEdition.readMetadata(metadata)
+                    require(edition.paperId == paper.id && edition.date == date) {
+                        "Saved ${paper.id.displayName} edition metadata is invalid."
+                    }
+                    if (today) {
+                        availableEdition = edition
+                        setPaperStatus(paper, "Available", Color.rgb(30, 125, 70))
+                    } else {
+                        setPaperStatus(paper, "", secondaryTextColor())
+                    }
+                } catch (error: Exception) {
+                    android.util.Log.e(
+                        "MainActivity",
+                        "Could not read ${paper.id.displayName}'s saved availability.",
+                        error
+                    )
+                    setPaperStatus(paper, "Could not read saved edition", Color.RED)
+                }
+            } else if (today) {
+                val status = if (NewspaperAvailability.checksAreAllowed(date)) {
+                    "Waiting for scheduled check…"
+                } else {
+                    "Not available"
+                }
+                setPaperStatus(paper, status, Color.GRAY)
+            } else {
+                setPaperStatus(paper, "", secondaryTextColor())
+            }
+        }
     }
 
     private fun createReaderView() {
@@ -838,7 +885,15 @@ class MainActivity : Activity() {
                 setTextColor(primaryTextColor())
             }
             val status = TextView(this).apply {
-                text = if (isToday(selectedDateKey())) "Checking availability…" else ""
+                text = if (isToday(selectedDateKey())) {
+                    if (NewspaperAvailability.checksAreAllowed(selectedDateKey())) {
+                        "Waiting for scheduled check…"
+                    } else {
+                        "Not available"
+                    }
+                } else {
+                    ""
+                }
                 textSize = 13f
                 gravity = Gravity.CENTER
                 maxWidth = dp(160)
@@ -1941,14 +1996,6 @@ class MainActivity : Activity() {
                 val requestedDate = selectedDateKey()
                 pageNumber = 1
                 showHome()
-                availableEdition = null
-                papers.forEach {
-                    setPaperStatus(
-                        it,
-                        if (isToday(selectedDateKey())) "Checking availability…" else "",
-                        Color.DKGRAY
-                    )
-                }
                 updateDateButton()
                 refreshDownloadIndicator()
                 if (requestedDate != previousDate) {
@@ -1957,7 +2004,7 @@ class MainActivity : Activity() {
                     availabilityAttempts.clear()
                     papersToOpenWhenAvailable.clear()
                 }
-                if (isToday(requestedDate)) checkPaperAvailabilities()
+                refreshScheduledAvailabilityStatuses()
             },
             selectedDate.get(Calendar.YEAR),
             selectedDate.get(Calendar.MONTH),
