@@ -68,7 +68,6 @@ class MainActivity : Activity() {
     private data class PaperHomeItem(
         val paper: Paper,
         val status: TextView,
-        val offlinePercentage: TextView,
         val downloadIndicator: ProgressBar,
         val downloadAction: ImageButton
     )
@@ -590,16 +589,19 @@ class MainActivity : Activity() {
     }
 
     private fun setPaperStatus(paper: Paper, text: String, color: Int) {
-                val displayText = text.takeIf { isToday(selectedDateKey()) }.orEmpty()
-                paperHomeItems[paper.id]?.status?.apply {
-                    this.text = displayText
-                    setTextColor(color)
-                    visibility = if (displayText.isEmpty()) View.GONE else View.VISIBLE
-                }
+        val item = paperHomeItems[paper.id] ?: return
+        refreshPaperStatus(
+            item,
+            isChecking = text == "Checking availability…",
+            isAvailable = text == "Available",
+            unavailableColor = color
+        )
+        refreshDownloadIndicator()
     }
 
     private fun refreshOfflineProgress() {
         val date = selectedDateKey()
+        val today = isToday(date)
         paperHomeItems.values.forEach { item ->
             val directory = item.paper.editionDirectory(File(filesDir, "editions"), date)
             val metadata = File(directory, "edition.json")
@@ -638,25 +640,52 @@ class MainActivity : Activity() {
                 }
             }
             val percentage = savedEdition?.let { offlineCompletionPercentage(it, directory) }
-            item.offlinePercentage.apply {
-                if (percentage == null) {
-                    text = ""
-                    visibility = View.GONE
-                } else {
-                    text = if (percentage == 100) "✓" else "$percentage%"
+            if (!today) {
+                item.status.apply {
+                    text = when {
+                        percentage == null -> "Not opened"
+                        percentage == 100 -> "✓"
+                        else -> "$percentage%"
+                    }
                     textSize = if (percentage == 100) 20f else 14f
                     setTextColor(
                         if (percentage == 100) Color.rgb(30, 125, 70)
-                        else primaryTextColor()
+                        else secondaryTextColor()
                     )
-                    contentDescription = if (percentage == 100) {
-                        "Download complete"
-                    } else {
-                        "$percentage% downloaded for offline reading"
+                    contentDescription = when {
+                        percentage == null -> "Not opened"
+                        percentage == 100 -> "Download complete"
+                        else -> "$percentage% downloaded for offline reading"
                     }
                     visibility = View.VISIBLE
                 }
             }
+        }
+    }
+
+    private fun refreshPaperStatus(
+        item: PaperHomeItem,
+        isChecking: Boolean = false,
+        isAvailable: Boolean = false,
+        unavailableColor: Int = secondaryTextColor()
+    ) {
+        val date = selectedDateKey()
+        if (!isToday(date)) return
+        val isLoading = isChecking || availabilityCheckDates[item.paper.id] == date ||
+            item.downloadIndicator.visibility == View.VISIBLE
+        val directory = item.paper.editionDirectory(File(filesDir, "editions"), date)
+        val hasEdition = isAvailable || File(directory, "edition.json").isFile ||
+            availableEdition?.let { it.paperId == item.paper.id && it.date == date } == true
+        item.status.apply {
+            text = if (isLoading) "" else if (hasEdition) "✓" else "Not available yet"
+            textSize = if (hasEdition) 20f else 13f
+            setTextColor(
+                if (hasEdition) Color.rgb(30, 125, 70)
+                else if (unavailableColor == Color.RED) Color.RED
+                else secondaryTextColor()
+            )
+            contentDescription = if (hasEdition) "Edition available" else "Not available yet"
+            visibility = if (isLoading) View.GONE else View.VISIBLE
         }
     }
 
@@ -885,48 +914,17 @@ class MainActivity : Activity() {
                 setTextColor(primaryTextColor())
             }
             val status = TextView(this).apply {
-                text = if (isToday(selectedDateKey())) {
-                    if (NewspaperAvailability.checksAreAllowed(selectedDateKey())) {
-                        "Waiting for scheduled check…"
-                    } else {
-                        "Not available"
-                    }
-                } else {
-                    ""
-                }
+                text = if (isToday(selectedDateKey())) "Not available yet" else "Not opened"
                 textSize = 13f
                 gravity = Gravity.CENTER
                 maxWidth = dp(160)
                 setTextColor(secondaryTextColor())
                 setPadding(dp(10), dp(5), dp(10), dp(5))
-                visibility = if (text.isEmpty()) View.GONE else View.VISIBLE
+                visibility = View.VISIBLE
                 background = roundedBackground(
                     if (darkTheme) Color.rgb(54, 54, 54) else Color.rgb(241, 245, 248),
                     dp(10)
                 )
-            }
-            val offlinePercentage = TextView(this).apply {
-                textSize = 14f
-                gravity = Gravity.CENTER
-                minWidth = dp(48)
-                setPadding(dp(8), dp(5), dp(8), dp(5))
-                setTextColor(primaryTextColor())
-                background = roundedBackground(
-                    if (darkTheme) Color.rgb(54, 54, 54) else Color.rgb(241, 245, 248),
-                    dp(10)
-                )
-                visibility = View.GONE
-            }
-            val trailingLabels = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                gravity = Gravity.CENTER
-                addView(status)
-                addView(offlinePercentage, LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.WRAP_CONTENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT
-                ).apply {
-                    topMargin = dp(6)
-                })
             }
             val downloadIndicator = ProgressBar(
                 this,
@@ -949,7 +947,7 @@ class MainActivity : Activity() {
             )
             row.addView(downloadIndicator, LinearLayout.LayoutParams(dp(36), dp(36)))
             row.addView(downloadAction, LinearLayout.LayoutParams(dp(40), dp(40)))
-            row.addView(trailingLabels, LinearLayout.LayoutParams(
+            row.addView(status, LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ))
@@ -962,7 +960,6 @@ class MainActivity : Activity() {
             paperHomeItems[paper.id] = PaperHomeItem(
                 paper,
                 status,
-                offlinePercentage,
                 downloadIndicator,
                 downloadAction
             )
@@ -3852,9 +3849,13 @@ class MainActivity : Activity() {
             val editionDownloadActive = activeEdition?.let {
                 it.paperId == paperId && it.date == date
             } == true
+            val availabilityCheckActive = availabilityCheckDates[paperId] == date
+            val loading = availabilityCheckActive || pageDownloadActive ||
+                storyDownloadActive || editionDownloadActive
             item.downloadIndicator.visibility = if (
-                pageDownloadActive || storyDownloadActive || editionDownloadActive
+                loading
             ) View.VISIBLE else View.GONE
+            refreshPaperStatus(item)
             val canControlEditionDownload = editionDownloadActive &&
                 activeEdition?.paperId == paperId
             item.downloadAction.apply {
