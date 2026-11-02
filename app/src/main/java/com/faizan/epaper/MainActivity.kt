@@ -14,19 +14,18 @@ import android.util.Base64
 import android.view.ScaleGestureDetector
 import android.view.View
 import android.view.Gravity
-import android.widget.AdapterView
+import android.view.Menu
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
-import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.ImageButton
 import android.widget.LinearLayout
 import android.widget.ProgressBar
+import android.widget.PopupMenu
 import android.widget.ScrollView
-import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import android.content.res.ColorStateList
@@ -91,7 +90,8 @@ class MainActivity : Activity() {
     private lateinit var homeScreen: LinearLayout
     private lateinit var readerScreen: LinearLayout
     private lateinit var webViewContainer: FrameLayout
-    private lateinit var pageSpinner: Spinner
+    private lateinit var pagePickerButton: Button
+    private lateinit var pageActionRow: LinearLayout
     private lateinit var paperList: LinearLayout
     private lateinit var savedStoriesList: LinearLayout
     private lateinit var papersButton: Button
@@ -140,8 +140,6 @@ class MainActivity : Activity() {
     private var shuttingDown = false
     private var availableEdition: NewspaperEdition? = null
     private var darkTheme = false
-    private var pageAdapter: ArrayAdapter<String>? = null
-    private var updatingPagePicker = false
     @Volatile
     private var editionInProgress: NewspaperEdition? = null
     @Volatile
@@ -527,9 +525,10 @@ class MainActivity : Activity() {
         webView.visibility = View.VISIBLE
         pageLabel.text = "Verifying ${paper.id.displayName}…"
         previousPageButton.visibility = View.GONE
-        pageSpinner.visibility = View.GONE
+        pagePickerButton.visibility = View.GONE
         nextPageButton.visibility = View.GONE
         saveStoryButton.visibility = View.GONE
+        pageActionRow.visibility = View.GONE
         webView.loadUrl(targetUrl)
     }
 
@@ -546,8 +545,9 @@ class MainActivity : Activity() {
         homeScreen.visibility = View.VISIBLE
         pageLabel.text = ""
         previousPageButton.visibility = View.VISIBLE
-        pageSpinner.visibility = View.VISIBLE
+        pagePickerButton.visibility = View.VISIBLE
         nextPageButton.visibility = View.VISIBLE
+        pageActionRow.visibility = View.VISIBLE
         refreshSaveStoryButton()
         refreshDownloadIndicator()
         mainHandler.removeCallbacks(refreshHomeProgress)
@@ -617,7 +617,7 @@ class MainActivity : Activity() {
                     contentDescription = if (percentage == 100) {
                         "Download complete"
                     } else {
-                        "$percentage% downloaded"
+                        "$percentage% downloaded for offline reading"
                     }
                     visibility = View.VISIBLE
                 }
@@ -773,7 +773,7 @@ class MainActivity : Activity() {
             setPadding(0, 0, 0, dp(20))
         }
         pageLabel = TextView(this).apply {
-            textSize = 14f
+            textSize = 16f
             setTextColor(secondaryTextColor())
             setPadding(dp(20), dp(12), dp(20), dp(12))
             background = roundedBackground(surfaceColor(), dp(12))
@@ -927,46 +927,61 @@ class MainActivity : Activity() {
             setBackgroundColor(homeBackgroundColor())
         }
         val pageControls = LinearLayout(this).apply {
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(12), dp(8), dp(12), dp(8))
-            background = roundedBackground(surfaceColor(), dp(16))
-            elevation = dp(2).toFloat()
+        orientation = LinearLayout.HORIZONTAL
+        gravity = Gravity.CENTER_VERTICAL
+        setPadding(dp(4), dp(4), dp(4), dp(4))
+        background = roundedBackground(surfaceColor(), dp(16))
+        elevation = dp(2).toFloat()
         }
-        papersButton = button("Papers") { onReaderBackButton() }
+        pageActionRow = pageControls
+        val compactReaderControls = resources.configuration.screenWidthDp < 600
+        papersButton = button(
+        if (compactReaderControls) "Back" else "Papers",
+        android.R.drawable.ic_menu_agenda
+        ) {
+        onReaderBackButton()
+        }
+        previousPageButton = button(
+        if (compactReaderControls) "Prev" else "Previous",
+        android.R.drawable.ic_media_previous
+        ) {
+        val pages = readerEdition()?.readingOrder.orEmpty()
+        val index = pages.indexOfFirst { it.id.endsWith("_${pageNumber.toString().padStart(3, '0')}") }
+        if (index > 0) openReaderPage(pages[index - 1])
+        }
+        pagePickerButton = button(
+        "Pages",
+        android.R.drawable.arrow_down_float
+        ) {
+        showPagePicker()
+        }.apply {
+        maxLines = 1
+        ellipsize = android.text.TextUtils.TruncateAt.END
+        contentDescription = "Choose a newspaper page"
+        val arrow = getDrawable(android.R.drawable.arrow_down_float)?.mutate()?.apply {
+            setTint(primaryTextColor())
+        }
+        setCompoundDrawablesWithIntrinsicBounds(null, null, arrow, null)
+        }
+        nextPageButton = button("Next", android.R.drawable.ic_media_next) {
+        val pages = readerEdition()?.readingOrder.orEmpty()
+        val index = pages.indexOfFirst { it.id.endsWith("_${pageNumber.toString().padStart(3, '0')}") }
+        if (index >= 0 && index < pages.lastIndex) openReaderPage(pages[index + 1])
+        }
+        saveStoryButton = button(
+        if (compactReaderControls) "Save" else "Save story",
+        android.R.drawable.ic_menu_save
+        ) {
+        saveCurrentStory()
+        }
+        papersButton.contentDescription = "Return to newspapers"
+        previousPageButton.contentDescription = "Previous page"
+        nextPageButton.contentDescription = "Next page"
+        saveStoryButton.contentDescription = "Save story"
         pageControls.addView(papersButton)
-        previousPageButton = button("Prev") {
-            val pages = readerEdition()?.readingOrder.orEmpty()
-            val index = pages.indexOfFirst { it.id.endsWith("_${pageNumber.toString().padStart(3, '0')}") }
-            if (index > 0) openReaderPage(pages[index - 1])
-        }
         pageControls.addView(previousPageButton)
-        pageSpinner = Spinner(this)
-        pageAdapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, mutableListOf())
-        pageAdapter?.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
-        pageSpinner.adapter = pageAdapter
-        pageSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
-            override fun onNothingSelected(parent: AdapterView<*>?) = Unit
-            override fun onItemSelected(
-                parent: AdapterView<*>?,
-                view: View?,
-                position: Int,
-                id: Long
-            ) {
-                if (updatingPagePicker) return
-                val page = readerEdition()?.readingOrder?.getOrNull(position) ?: return
-                if (readerMode && page.id.takeLast(3).toIntOrNull() != pageNumber) {
-                    openReaderPage(page)
-                }
-            }
-        }
-        pageControls.addView(pageSpinner, LinearLayout.LayoutParams(0, dp(52), 1f))
-        nextPageButton = button("Next") {
-            val pages = readerEdition()?.readingOrder.orEmpty()
-            val index = pages.indexOfFirst { it.id.endsWith("_${pageNumber.toString().padStart(3, '0')}") }
-            if (index >= 0 && index < pages.lastIndex) openReaderPage(pages[index + 1])
-        }
+        pageControls.addView(pagePickerButton, LinearLayout.LayoutParams(0, dp(52), 1f))
         pageControls.addView(nextPageButton)
-        saveStoryButton = button("Save") { saveCurrentStory() }
         pageControls.addView(saveStoryButton)
         pageLabel.setPadding(dp(16), dp(12), dp(16), dp(12))
         readerScreen.addView(pageLabel, LinearLayout.LayoutParams(
@@ -1344,9 +1359,14 @@ class MainActivity : Activity() {
         webView.settings.builtInZoomControls = !enabled
         webView.settings.displayZoomControls = false
         papersButton.text = if (enabled) "Back" else "Papers"
+        setButtonIcon(
+            papersButton,
+            if (enabled) android.R.drawable.ic_media_previous
+            else android.R.drawable.ic_menu_agenda
+        )
         pageLabel.visibility = if (enabled) View.GONE else View.VISIBLE
         previousPageButton.visibility = if (enabled) View.GONE else View.VISIBLE
-        pageSpinner.visibility = if (enabled) View.GONE else View.VISIBLE
+        pagePickerButton.visibility = if (enabled) View.INVISIBLE else View.VISIBLE
         nextPageButton.visibility = if (enabled) View.GONE else View.VISIBLE
         saveStoryButton.visibility = if (enabled) View.VISIBLE else View.GONE
         refreshSaveStoryButton()
@@ -1900,7 +1920,6 @@ class MainActivity : Activity() {
                 }
                 updateDateButton()
                 refreshDownloadIndicator()
-                pageAdapter?.clear()
                 availabilityWebViews.values.forEach(WebView::stopLoading)
                 availabilityCheckDates.clear()
                 availabilityAttempts.clear()
@@ -1982,16 +2001,36 @@ class MainActivity : Activity() {
             .editionDirectory(File(filesDir, "editions"), edition.date)
 
     private fun updatePagePicker(edition: NewspaperEdition) {
-        val adapter = pageAdapter ?: return
-        updatingPagePicker = true
-        adapter.clear()
-        adapter.addAll(edition.readingOrder.map { it.title.ifBlank { "Page ${it.id.takeLast(3)}" } })
-        adapter.notifyDataSetChanged()
-        val index = edition.readingOrder.indexOfFirst {
+        val selectedPage = edition.readingOrder.firstOrNull {
             it.id.takeLast(3).toIntOrNull() == pageNumber
         }
-        if (index >= 0) pageSpinner.setSelection(index, false)
-        updatingPagePicker = false
+        val pageTitle = selectedPage?.title
+            ?.takeIf { it.isNotBlank() }
+            ?: selectedPage?.let { "Page ${it.id.takeLast(3)}" }
+        pagePickerButton.text = pageTitle ?: "Pages"
+        pagePickerButton.contentDescription = pageTitle?.let {
+            "Current page: $it. Tap to choose another page."
+        } ?: "Choose a newspaper page"
+    }
+
+    private fun showPagePicker() {
+        val edition = readerEdition() ?: return
+        val selectedIndex = edition.readingOrder.indexOfFirst {
+            it.id.takeLast(3).toIntOrNull() == pageNumber
+        }
+        PopupMenu(this, pagePickerButton).apply {
+            menu.setGroupCheckable(Menu.NONE, true, true)
+            edition.readingOrder.forEachIndexed { index, page ->
+                val title = page.title.ifBlank { "Page ${page.id.takeLast(3)}" }
+                menu.add(Menu.NONE, index, index, title)
+                    .setCheckable(true)
+                    .isChecked = index == selectedIndex
+            }
+            setOnMenuItemClickListener { item ->
+                edition.readingOrder.getOrNull(item.itemId)?.let(::openReaderPage)
+                true
+            }
+        }.show()
     }
 
     private fun openReaderPage(page: NewspaperPage) {
@@ -2004,10 +2043,7 @@ class MainActivity : Activity() {
         }
         viewingStoryContent = false
         pageNumber = page.id.takeLast(3).toIntOrNull() ?: 1
-        val position = edition.readingOrder.indexOfFirst { it.id == page.id }
-        if (position >= 0 && pageSpinner.selectedItemPosition != position) {
-            pageSpinner.setSelection(position, false)
-        }
+        updatePagePicker(edition)
         if (edition.hasPageImage(directory, page.id)) {
             openOfflinePage(edition, page, directory)
         } else {
@@ -2763,7 +2799,16 @@ class MainActivity : Activity() {
                     it.date == edition.date &&
                     it.article.id == articleId
             }
-        saveStoryButton.text = if (isSaved) "Saved" else "Save"
+        val compactLabel = resources.configuration.screenWidthDp < 600
+        saveStoryButton.text = when {
+            isSaved && compactLabel -> "Saved"
+            isSaved -> "Story saved"
+            compactLabel -> "Save"
+            else -> "Save story"
+        }
+        saveStoryButton.contentDescription =
+            if (isSaved) "Story is saved" else "Save story"
+        setButtonIcon(saveStoryButton, android.R.drawable.ic_menu_save)
     }
 
     private fun openSavedStory(saved: SavedStory) {
@@ -3622,26 +3667,46 @@ class MainActivity : Activity() {
 
     private fun updatePageLabel() {
         val date = SimpleDateFormat("EEE, d MMM yyyy", Locale.getDefault()).format(selectedDate.time)
-        val page = "$date  ·  Page ${pageNumber.toString().padStart(3, '0')}"
         val title = readerEdition()?.readingOrder?.firstOrNull {
             it.id.takeLast(3).toIntOrNull() == pageNumber
         }?.title
-        pageLabel.text = listOfNotNull(page, title?.takeIf { it.isNotBlank() }).joinToString("  ·  ")
+        pageLabel.text = listOfNotNull(date, title?.takeIf { it.isNotBlank() })
+            .joinToString("  ·  ")
     }
 
-    private fun button(label: String, onClick: () -> Unit): Button =
+    private fun button(
+        label: String,
+        iconResource: Int = 0,
+        onClick: () -> Unit
+    ): Button =
         Button(this).apply {
             text = label
-            textSize = 14f
+            textSize = if (resources.configuration.screenWidthDp < 600) 12f else 15f
             isAllCaps = false
             minHeight = dp(48)
-            setPadding(dp(12), 0, dp(12), 0)
+            minWidth = 0
+            setPadding(dp(2), 0, dp(2), 0)
+            if (iconResource != 0) {
+                val icon = getDrawable(iconResource)?.mutate()?.apply {
+                    setTint(primaryTextColor())
+                }
+                setCompoundDrawablesWithIntrinsicBounds(icon, null, null, null)
+                compoundDrawablePadding = dp(6)
+            }
             backgroundTintList = ColorStateList.valueOf(
                 if (darkTheme) Color.rgb(54, 74, 88) else Color.rgb(230, 239, 245)
             )
             setTextColor(primaryTextColor())
             setOnClickListener { onClick() }
         }
+
+    private fun setButtonIcon(button: Button, iconResource: Int) {
+        val icon = getDrawable(iconResource)?.mutate()?.apply {
+            setTint(primaryTextColor())
+        }
+        button.setCompoundDrawablesWithIntrinsicBounds(icon, null, null, null)
+        button.compoundDrawablePadding = dp(6)
+    }
 
     private fun roundedBackground(color: Int, radius: Int): GradientDrawable =
         GradientDrawable().apply {
