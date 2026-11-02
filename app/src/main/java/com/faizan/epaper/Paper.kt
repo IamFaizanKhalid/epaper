@@ -315,9 +315,10 @@ private class JangLahorePaper : Paper {
                         match[1] !== requested) return [];
                     const number = Number(match[2]);
                     if (number < 1 || number > 99) return [];
+                    const title = (link.innerText || link.textContent || '').trim();
                     return [{
                         id: 'J${date}_' + String(number).padStart(3, '0'),
-                        title: (link.innerText || link.textContent || '').trim()
+                        title: String(number) + '. ' + (title || 'Page ' + number)
                     }];
                 }));
             const pageMenu = pageMenus.sort((a, b) => b.length - a.length)[0] || [];
