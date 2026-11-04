@@ -11,6 +11,7 @@ import android.net.Uri
 import android.os.Handler
 import android.os.Bundle
 import android.os.Looper
+import android.text.TextUtils
 import android.util.Base64
 import android.view.ScaleGestureDetector
 import android.view.View
@@ -1078,6 +1079,8 @@ class MainActivity : Activity() {
             backgroundTintList = null
             setTextColor(Color.WHITE)
             elevation = dp(2).toFloat()
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
         }
         previousDateButton = button("") { navigateDate(-1) }
         nextDateButton = button("") { navigateDate(1) }
@@ -1204,7 +1207,9 @@ class MainActivity : Activity() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
-        val sideDateButtonWidth = dp(112)
+        val sideDateButtonWidth = dp(
+            if (resources.configuration.smallestScreenWidthDp >= 600) 112 else 88
+        )
         dateNavigation.addView(previousDateButton, LinearLayout.LayoutParams(sideDateButtonWidth, dp(52)).apply {
             marginStart = dp(4)
             marginEnd = dp(4)
