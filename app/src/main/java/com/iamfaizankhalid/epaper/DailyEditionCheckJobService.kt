@@ -1114,6 +1114,23 @@ abstract class NewspaperEditionCheckJobService : JobService() {
 
         fun schedule(context: Context, paper: Paper) =
             schedule(context, listOf(paper))
+
+        fun scheduleImmediately(context: Context, papers: Collection<Paper> = Papers.all) {
+            val scheduler = context.getSystemService(Context.JOB_SCHEDULER_SERVICE) as JobScheduler
+            papers.forEach { paper ->
+                val registration = paper.backgroundJob
+                val jobId = registration.periodicJobId + 100
+                val job = JobInfo.Builder(jobId, ComponentName(context, registration.serviceClass))
+                    .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
+                    .setPersisted(true)
+                    .setMinimumLatency(0L)
+                    .setOverrideDeadline(60_000L)
+                    .build()
+                if (scheduler.schedule(job) != JobScheduler.RESULT_SUCCESS) {
+                    Log.e(TAG, "Could not schedule the immediate check for ${paper.id.displayName}.")
+                }
+            }
+        }
         private const val MAX_VERIFICATION_ATTEMPTS = 20
         private const val VERIFICATION_RETRY_MILLIS = 1_500L
         private const val MAX_JANG_IMAGE_VERIFICATION_ATTEMPTS = 60
