@@ -87,6 +87,8 @@ class MainActivity : Activity() {
     private lateinit var detailWebView: WebView
     private lateinit var pageLabel: TextView
     private lateinit var dateButton: Button
+    private lateinit var previousDateButton: Button
+    private lateinit var nextDateButton: Button
     private lateinit var homeScreen: LinearLayout
     private lateinit var readerScreen: LinearLayout
     private lateinit var webViewContainer: FrameLayout
@@ -124,6 +126,7 @@ class MainActivity : Activity() {
     private var pageDownloadSequence = 0L
     private var pageDownloadInProgressPaperId: NewspaperId? = null
     private var selectedDate = Calendar.getInstance()
+    private var dateFollowsToday = true
     private var pageNumber = 1
     private var readerMode = false
     private var showingJangVerificationPage = false
@@ -193,6 +196,7 @@ class MainActivity : Activity() {
     private val refreshHomeProgress = object : Runnable {
         override fun run() {
             if (shuttingDown) return
+            refreshFollowingTodayDate()
             if (::homeScreen.isInitialized && homeScreen.visibility == View.VISIBLE) {
                 refreshDownloadIndicator()
                 refreshScheduledAvailabilityStatuses()
@@ -206,6 +210,9 @@ class MainActivity : Activity() {
         darkTheme = resources.getBoolean(R.bool.is_dark_theme)
         selectedDate.timeInMillis = savedInstanceState?.getLong(STATE_SELECTED_DATE)
             ?: selectedDate.timeInMillis
+        dateFollowsToday = savedInstanceState?.getBoolean(STATE_DATE_FOLLOWING_TODAY)
+            ?: isSameDay(selectedDate, Calendar.getInstance())
+        refreshFollowingTodayDate()
         pageNumber = savedInstanceState?.getInt(STATE_PAGE_NUMBER) ?: pageNumber
         articleTextScale = getSharedPreferences(PREFERENCES, MODE_PRIVATE)
             .getFloat(ARTICLE_TEXT_SCALE_KEY, DEFAULT_ARTICLE_TEXT_SCALE)
@@ -256,6 +263,7 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        refreshFollowingTodayDate()
         mainHandler.removeCallbacks(refreshHomeProgress)
         mainHandler.post(refreshHomeProgress)
     }
@@ -267,6 +275,7 @@ class MainActivity : Activity() {
 
     override fun onSaveInstanceState(outState: Bundle) {
         outState.putLong(STATE_SELECTED_DATE, selectedDate.timeInMillis)
+        outState.putBoolean(STATE_DATE_FOLLOWING_TODAY, dateFollowsToday)
         outState.putInt(STATE_PAGE_NUMBER, pageNumber)
         outState.putBoolean(STATE_READER_MODE, readerMode)
         outState.putString(STATE_PAPER_ID, readerEdition()?.paperId?.storageName)
@@ -1070,6 +1079,23 @@ class MainActivity : Activity() {
             setTextColor(Color.WHITE)
             elevation = dp(2).toFloat()
         }
+        previousDateButton = button("") { navigateDate(-1) }
+        nextDateButton = button("") { navigateDate(1) }
+        listOf(previousDateButton, nextDateButton).forEach { navigationButton ->
+            navigationButton.apply {
+                textSize = 12f
+                isAllCaps = false
+                minHeight = dp(52)
+                setPadding(dp(8), 0, dp(8), 0)
+                background = roundedBackground(
+                    if (darkTheme) Color.rgb(45, 99, 137) else Color.rgb(31, 83, 117),
+                    dp(16)
+                )
+                backgroundTintList = null
+                setTextColor(Color.WHITE)
+                elevation = dp(2).toFloat()
+            }
+        }
         val homeContent = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(24), dp(24), dp(24), dp(32))
@@ -1174,7 +1200,24 @@ class MainActivity : Activity() {
         }
 
         homeContent.addView(title)
-        homeContent.addView(dateButton, LinearLayout.LayoutParams(
+        val dateNavigation = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        dateNavigation.addView(previousDateButton, LinearLayout.LayoutParams(0, dp(52), 1f).apply {
+            marginStart = dp(4)
+            marginEnd = dp(4)
+        })
+        val dateButtonParams = LinearLayout.LayoutParams(0, dp(52), 1.4f).apply {
+            marginStart = dp(4)
+            marginEnd = dp(4)
+        }
+        dateNavigation.addView(dateButton, dateButtonParams)
+        dateNavigation.addView(nextDateButton, LinearLayout.LayoutParams(0, dp(52), 1f).apply {
+            marginStart = dp(4)
+            marginEnd = dp(4)
+        })
+        homeContent.addView(dateNavigation, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
             LinearLayout.LayoutParams.WRAP_CONTENT
         ).apply {
@@ -2198,6 +2241,7 @@ class MainActivity : Activity() {
             { _, year, month, day ->
                 val previousDate = selectedDateKey()
                 selectedDate.set(year, month, day)
+                dateFollowsToday = isSameDay(selectedDate, Calendar.getInstance())
                 val requestedDate = selectedDateKey()
                 pageNumber = 1
                 showHome()
@@ -2231,6 +2275,97 @@ class MainActivity : Activity() {
     private fun updateDateButton() {
         dateButton.text = SimpleDateFormat("EEE, d MMM yyyy", Locale.getDefault())
             .format(selectedDate.time)
+        updateAdjacentDateButtons()
+    }
+
+    private fun navigateDate(dayOffset: Int) {
+        if ((dayOffset < 0 && !canNavigateToDate(-1)) ||
+            (dayOffset > 0 && !canNavigateToDate(1))) {
+            return
+        }
+        val previousDate = selectedDateKey()
+        selectedDate.add(Calendar.DAY_OF_YEAR, dayOffset)
+        dateFollowsToday = isSameDay(selectedDate, Calendar.getInstance())
+        val requestedDate = selectedDateKey()
+        pageNumber = 1
+        showHome()
+        updateDateButton()
+        refreshDownloadIndicator()
+        if (requestedDate != previousDate) {
+            availabilityWebViews.values.forEach(WebView::stopLoading)
+            availabilityCheckDates.clear()
+            availabilityAttempts.clear()
+            papersToOpenWhenAvailable.clear()
+        }
+        refreshScheduledAvailabilityStatuses()
+    }
+
+    private fun canNavigateToDate(dayOffset: Int): Boolean {
+        val target = selectedDate.clone() as Calendar
+        target.add(Calendar.DAY_OF_YEAR, dayOffset)
+        val today = Calendar.getInstance()
+        val earliest = today.clone() as Calendar
+        earliest.add(Calendar.DAY_OF_YEAR, -(MAX_DATE_WINDOW_DAYS - 1))
+        return !target.before(startOfDay(earliest)) && !target.after(endOfDay(today))
+    }
+
+    private fun updateAdjacentDateButtons() {
+        val adjacentDateFormat = SimpleDateFormat("d MMM", Locale.getDefault())
+        val adjacentDayFormat = SimpleDateFormat("EEEE", Locale.getDefault())
+        val previousDate = selectedDate.clone() as Calendar
+        previousDate.add(Calendar.DAY_OF_YEAR, -1)
+        previousDateButton.text = if (isSameDay(selectedDate, Calendar.getInstance())) {
+            adjacentDayFormat.format(previousDate.time)
+        } else {
+            adjacentDateFormat.format(previousDate.time)
+        }
+        val canNavigatePrevious = canNavigateToDate(-1)
+        previousDateButton.isEnabled = canNavigatePrevious
+        previousDateButton.alpha = if (canNavigatePrevious) 1f else 0.45f
+
+        val nextDate = selectedDate.clone() as Calendar
+        nextDate.add(Calendar.DAY_OF_YEAR, 1)
+        nextDateButton.text = if (isSameDay(selectedDate, Calendar.getInstance())) {
+            adjacentDayFormat.format(nextDate.time)
+        } else {
+            adjacentDateFormat.format(nextDate.time)
+        }
+        val canNavigateNext = canNavigateToDate(1)
+        nextDateButton.isEnabled = canNavigateNext
+        nextDateButton.alpha = if (canNavigateNext) 1f else 0.45f
+    }
+
+    private fun isSameDay(first: Calendar, second: Calendar): Boolean =
+        first.get(Calendar.YEAR) == second.get(Calendar.YEAR) &&
+            first.get(Calendar.DAY_OF_YEAR) == second.get(Calendar.DAY_OF_YEAR)
+
+    private fun refreshFollowingTodayDate() {
+        if (!dateFollowsToday) return
+        val today = Calendar.getInstance()
+        if (isSameDay(selectedDate, today)) return
+
+        selectedDate = today
+        pageNumber = 1
+        if (::homeScreen.isInitialized && !readerMode && homeScreen.visibility == View.VISIBLE) {
+            showHome()
+            updateDateButton()
+            refreshDownloadIndicator()
+            refreshScheduledAvailabilityStatuses()
+        }
+    }
+
+    private fun startOfDay(date: Calendar): Calendar = (date.clone() as Calendar).apply {
+        set(Calendar.HOUR_OF_DAY, 0)
+        set(Calendar.MINUTE, 0)
+        set(Calendar.SECOND, 0)
+        set(Calendar.MILLISECOND, 0)
+    }
+
+    private fun endOfDay(date: Calendar): Calendar = (date.clone() as Calendar).apply {
+        set(Calendar.HOUR_OF_DAY, 23)
+        set(Calendar.MINUTE, 59)
+        set(Calendar.SECOND, 59)
+        set(Calendar.MILLISECOND, 999)
     }
 
     private fun showHome() {
@@ -4331,6 +4466,7 @@ class MainActivity : Activity() {
         const val SAVED_STORIES_KEY = "saved_stories"
         const val ARTICLE_TEXT_SCALE_KEY = "article_text_scale"
         const val STATE_SELECTED_DATE = "selected_date"
+        const val STATE_DATE_FOLLOWING_TODAY = "date_follows_today"
         const val STATE_PAGE_NUMBER = "page_number"
         const val STATE_READER_MODE = "reader_mode"
         const val STATE_PAPER_ID = "paper_id"
