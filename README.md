@@ -4,6 +4,15 @@ E-Paper is a simple Android reader for Dawn and Jang Lahore newspapers. Download
 
 This app was originally built for personal use on a Samsung Galaxy Tab S5e. It is also useful for other android users and people with limited or unreliable internet connections.
 
+## Screenshots
+
+<p align="center">
+  <img src="screenshots/epaper-1.jpg" alt="Newspaper selection and offline download screen" width="24%">
+  <img src="screenshots/epaper-2.jpg" alt="Newspaper page reader" width="24%">
+  <img src="screenshots/epaper-3.jpg" alt="Saved story reader" width="24%">
+  <img src="screenshots/epaper-4.jpg" alt="Jang Lahore newspaper page" width="24%">
+</p>
+
 ## Read offline
 
 - Choose Dawn or Jang Lahore.
