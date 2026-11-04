@@ -2274,25 +2274,26 @@ class MainActivity : Activity() {
                 dateChooserSelectedIndex = index
             }
             .setNegativeButton("Cancel", null)
-            .setPositiveButton("Select") { _, _ ->
-                val previousDate = selectedDateKey()
-                selectedDate = (dateChooserDates[dateChooserSelectedIndex].clone() as Calendar)
-                dateFollowsToday = isSameDay(selectedDate, Calendar.getInstance())
-                val requestedDate = selectedDateKey()
-                pageNumber = 1
-                showHome()
-                updateDateButton()
-                refreshDownloadIndicator()
-                if (requestedDate != previousDate) {
-                    availabilityWebViews.values.forEach(WebView::stopLoading)
-                    availabilityCheckDates.clear()
-                    availabilityAttempts.clear()
-                    papersToOpenWhenAvailable.clear()
-                }
-                refreshScheduledAvailabilityStatuses()
-            }
             .show()
             .apply {
+                listView.setOnItemClickListener { _, _, index, _ ->
+                    val previousDate = selectedDateKey()
+                    selectedDate = (dateChooserDates[index].clone() as Calendar)
+                    dateFollowsToday = isSameDay(selectedDate, Calendar.getInstance())
+                    val requestedDate = selectedDateKey()
+                    pageNumber = 1
+                    showHome()
+                    updateDateButton()
+                    refreshDownloadIndicator()
+                    if (requestedDate != previousDate) {
+                        availabilityWebViews.values.forEach(WebView::stopLoading)
+                        availabilityCheckDates.clear()
+                        availabilityAttempts.clear()
+                        papersToOpenWhenAvailable.clear()
+                    }
+                    refreshScheduledAvailabilityStatuses()
+                    dismiss()
+                }
                 setOnDismissListener {
                     openDateChooser = null
                     dateChooserAdapter = null
@@ -2525,15 +2526,17 @@ class MainActivity : Activity() {
                 return view
             }
         }
-        var chosenIndex = selectedIndex
         AlertDialog.Builder(this)
             .setTitle("Choose page")
-            .setSingleChoiceItems(adapter, selectedIndex) { _, index -> chosenIndex = index }
+            .setSingleChoiceItems(adapter, selectedIndex, null)
             .setNegativeButton("Cancel", null)
-            .setPositiveButton("Select") { _, _ ->
-                edition.readingOrder.getOrNull(chosenIndex)?.let(::openReaderPage)
-            }
             .show()
+            .apply {
+                listView.setOnItemClickListener { _, _, index, _ ->
+                    edition.readingOrder.getOrNull(index)?.let(::openReaderPage)
+                    dismiss()
+                }
+            }
     }
 
     private fun openReaderPage(page: NewspaperPage) {
