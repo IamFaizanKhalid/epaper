@@ -2,7 +2,6 @@ package com.iamfaizankhalid.epaper
 
 import android.app.Activity
 import android.app.AlertDialog
-import android.app.DatePickerDialog
 import android.app.ProgressDialog
 import android.app.job.JobScheduler
 import android.graphics.Color
@@ -17,6 +16,7 @@ import android.view.ScaleGestureDetector
 import android.view.View
 import android.view.Gravity
 import android.view.Menu
+import android.view.ViewGroup
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
@@ -30,6 +30,7 @@ import android.widget.PopupMenu
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import android.widget.ArrayAdapter
 import android.content.res.ColorStateList
 import org.json.JSONArray
 import org.json.JSONObject
@@ -128,6 +129,10 @@ class MainActivity : Activity() {
     private var pageDownloadInProgressPaperId: NewspaperId? = null
     private var selectedDate = Calendar.getInstance()
     private var dateFollowsToday = true
+    private var openDateChooser: AlertDialog? = null
+    private val dateChooserDates = mutableListOf<Calendar>()
+    private var dateChooserAdapter: ArrayAdapter<String>? = null
+    private var dateChooserSelectedIndex = 0
     private var pageNumber = 1
     private var readerMode = false
     private var showingJangVerificationPage = false
@@ -2234,19 +2239,45 @@ class MainActivity : Activity() {
     }
 
     private fun chooseDate() {
-        val today = Calendar.getInstance()
-        val earliestDate = (today.clone() as Calendar).apply {
-            add(Calendar.DAY_OF_YEAR, -(MAX_DATE_WINDOW_DAYS - 1))
-            set(Calendar.HOUR_OF_DAY, 0)
-            set(Calendar.MINUTE, 0)
-            set(Calendar.SECOND, 0)
-            set(Calendar.MILLISECOND, 0)
+        val today = startOfDay(Calendar.getInstance())
+        val fullDateFormat = SimpleDateFormat("EEEE, d MMM yyyy", Locale.getDefault())
+        dateChooserDates.clear()
+        dateChooserDates.addAll((0 until MAX_DATE_WINDOW_DAYS).map { offset ->
+            (today.clone() as Calendar).apply {
+                add(Calendar.DAY_OF_YEAR, -offset)
+            }
+        })
+        val labels = dateChooserDates.mapIndexed { index, date ->
+            if (index == 0) "Today - ${fullDateFormat.format(date.time)}"
+            else fullDateFormat.format(date.time)
         }
-        DatePickerDialog(
+        dateChooserSelectedIndex = dateChooserDates.indexOfFirst {
+            isSameDay(it, selectedDate)
+        }.coerceAtLeast(0)
+        val adapter = object : ArrayAdapter<String>(
             this,
-            { _, year, month, day ->
+            android.R.layout.simple_list_item_single_choice,
+            labels
+        ) {
+            override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+                val view = super.getView(position, convertView, parent) as TextView
+                view.textSize = 20f
+                view.minHeight = dp(56)
+                view.gravity = Gravity.CENTER_VERTICAL
+                view.setPadding(dp(16), dp(12), dp(16), dp(12))
+                return view
+            }
+        }
+        dateChooserAdapter = adapter
+        openDateChooser = AlertDialog.Builder(this)
+            .setTitle("Choose edition date")
+            .setSingleChoiceItems(adapter, dateChooserSelectedIndex) { _, index ->
+                dateChooserSelectedIndex = index
+            }
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Select") { _, _ ->
                 val previousDate = selectedDateKey()
-                selectedDate.set(year, month, day)
+                selectedDate = (dateChooserDates[dateChooserSelectedIndex].clone() as Calendar)
                 dateFollowsToday = isSameDay(selectedDate, Calendar.getInstance())
                 val requestedDate = selectedDateKey()
                 pageNumber = 1
@@ -2260,14 +2291,15 @@ class MainActivity : Activity() {
                     papersToOpenWhenAvailable.clear()
                 }
                 refreshScheduledAvailabilityStatuses()
-            },
-            selectedDate.get(Calendar.YEAR),
-            selectedDate.get(Calendar.MONTH),
-            selectedDate.get(Calendar.DAY_OF_MONTH)
-        ).apply {
-            datePicker.minDate = earliestDate.timeInMillis
-            datePicker.maxDate = today.timeInMillis
-        }.show()
+            }
+            .show()
+            .apply {
+                setOnDismissListener {
+                    openDateChooser = null
+                    dateChooserAdapter = null
+                    dateChooserDates.clear()
+                }
+            }
     }
 
     private fun isToday(date: String): Boolean =
@@ -2346,8 +2378,9 @@ class MainActivity : Activity() {
             first.get(Calendar.DAY_OF_YEAR) == second.get(Calendar.DAY_OF_YEAR)
 
     private fun refreshFollowingTodayDate() {
-        if (!dateFollowsToday) return
         val today = Calendar.getInstance()
+        refreshOpenDateChooser()
+        if (!dateFollowsToday) return
         if (isSameDay(selectedDate, today)) return
 
         selectedDate = today
@@ -2358,6 +2391,31 @@ class MainActivity : Activity() {
             refreshDownloadIndicator()
             refreshScheduledAvailabilityStatuses()
         }
+    }
+
+    private fun refreshOpenDateChooser() {
+        val dialog = openDateChooser ?: return
+        val adapter = dateChooserAdapter ?: return
+        val today = startOfDay(Calendar.getInstance())
+        if (dateChooserDates.isNotEmpty() && isSameDay(dateChooserDates.first(), today)) return
+        val fullDateFormat = SimpleDateFormat("EEEE, d MMM yyyy", Locale.getDefault())
+        dateChooserDates.clear()
+        dateChooserDates.addAll((0 until MAX_DATE_WINDOW_DAYS).map { offset ->
+            (today.clone() as Calendar).apply {
+                add(Calendar.DAY_OF_YEAR, -offset)
+            }
+        })
+        adapter.clear()
+        adapter.addAll(dateChooserDates.mapIndexed { index, date ->
+            if (index == 0) "Today - ${fullDateFormat.format(date.time)}"
+            else fullDateFormat.format(date.time)
+        })
+        adapter.notifyDataSetChanged()
+        val selectedIndex = dateChooserDates.indexOfFirst {
+            isSameDay(it, selectedDate)
+        }.coerceAtLeast(0)
+        dateChooserSelectedIndex = selectedIndex
+        dialog.listView.setItemChecked(selectedIndex, true)
     }
 
     private fun startOfDay(date: Calendar): Calendar = (date.clone() as Calendar).apply {
