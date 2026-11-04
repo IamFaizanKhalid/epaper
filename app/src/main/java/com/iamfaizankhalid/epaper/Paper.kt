@@ -46,6 +46,7 @@ interface Paper {
     fun availabilityUrl(date: String): String
     fun pageUrl(date: String, pageId: String): String
     fun articleUrl(storyId: String): String
+    fun articleImageUrl(storyId: String): String? = null
     fun isArticleUrl(url: String, storyId: String): Boolean
     fun isPageUrl(url: String, date: String, pageId: String): Boolean
     fun hotspotExtractionScript(date: String, pageId: String): String
@@ -90,6 +91,7 @@ object Papers {
 private class DawnPaper : Paper {
     override val id = NewspaperId.DAWN
     override val supportsImageDetail = false
+    override val supportsInlineArticleImages = true
     override val offlineOrigin = "https://offline.dawn/"
     override val supportsForegroundEditionPrefetch = true
     override val backgroundJob = PaperBackgroundJob(
@@ -111,6 +113,12 @@ private class DawnPaper : Paper {
 
     override fun articleUrl(storyId: String): String =
         "https://epaper.dawn.com/DetailImage.php?StoryImage=$storyId"
+
+    override fun articleImageUrl(storyId: String): String? {
+        if (!DAWN_STORY_ID_PATTERN.matches(storyId)) return null
+        val parts = storyId.split('_')
+        return "https://e.dawn.com/${parts[2]}/${parts[1]}/${parts[0]}/stories/$storyId.jpg"
+    }
 
     override fun isArticleUrl(url: String, storyId: String): Boolean =
         url.substringBefore('#').let { value ->
@@ -177,7 +185,9 @@ private class DawnPaper : Paper {
             const title = heading?.innerText.trim() ||
                 legacyArticle?.querySelector('h2')?.innerText.trim() ||
                 document.querySelector('title')?.innerText.split('|')[2]?.trim() || '';
-            if ((!article && !legacyArticle) || !title) {
+            const imageContainer = article || legacyArticle ||
+                document.querySelector('main article, main figure, figure');
+            if ((!article && !legacyArticle && !imageContainer) || !title) {
                 return JSON.stringify({error: 'Could not find the text for story $storyId.'});
             }
             const bylineParagraph = Array.from(article.parentElement?.querySelectorAll(':scope > p, p') || [])
@@ -186,7 +196,7 @@ private class DawnPaper : Paper {
             const byline = bylineParagraph?.innerText.trim() ||
                 nearbyHeading?.querySelector('p')?.innerText.trim() ||
                 legacyArticle?.querySelector(':scope > .my-3')?.innerText.trim() || '';
-            const paragraphs = Array.from(article?.querySelectorAll('p') || [])
+            const paragraphs = Array.from((article || legacyArticle)?.querySelectorAll('p') || [])
                 .map(paragraph => paragraph.innerText.trim())
                 .filter(value => value && !/^by\s/i.test(value) && value !== title);
             if (!paragraphs.length && legacyArticle) {
@@ -202,7 +212,8 @@ private class DawnPaper : Paper {
                     .filter(value => value && value !== title && value !== byline)
                     .forEach(value => paragraphs.push(value));
             }
-            const imageUrls = Array.from(article?.querySelectorAll('img') || [])
+            const imageUrls = Array.from((imageContainer || document.querySelector('main') || document)
+                .querySelectorAll('img'))
                 .map(image => image.currentSrc || image.src)
                 .filter(url => url && !url.startsWith('data:'));
             return JSON.stringify({id: '$storyId', title: title, byline: byline,
@@ -214,14 +225,20 @@ private class DawnPaper : Paper {
         val data = JSONObject(json)
         if (data.has("error")) throw IllegalStateException(data.getString("error"))
         val paragraphs = data.getJSONArray("paragraphs").toStringList()
+        val extractedImages = data.optJSONArray("imageUrls")?.toStringList().orEmpty()
         val article = NewspaperArticle(
             storyId,
             data.getString("title"),
             data.optString("byline"),
             paragraphs,
-            data.optJSONArray("imageUrls")?.toStringList().orEmpty()
+            if (paragraphs.isEmpty()) {
+                listOfNotNull(articleImageUrl(storyId))
+            } else {
+                extractedImages
+            }
         )
-        require(article.title.isNotBlank() && article.paragraphs.isNotEmpty()) {
+        require(article.title.isNotBlank() &&
+            (article.paragraphs.isNotEmpty() || article.imageUrls.isNotEmpty())) {
             "Dawn returned empty text for story $storyId."
         }
         return article

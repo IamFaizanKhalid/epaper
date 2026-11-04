@@ -3564,14 +3564,16 @@ class MainActivity : Activity() {
                         element.querySelector('.overflow-hidden'));
                 const title = titleElement?.innerText.trim() ||
                     legacyArticle?.querySelector('h2')?.innerText.trim() || '';
-                if ((!article && !legacyArticle) || !title) {
+                const imageContainer = article || legacyArticle ||
+                    document.querySelector('main article, main figure, figure');
+                if ((!article && !legacyArticle && !imageContainer) || !title) {
                     return JSON.stringify({error: 'Could not find the text for story $id.'});
                 }
                 const bylineElement = Array.from(titleElement.parentElement?.querySelectorAll('p') || [])
                     .find(element => /^by\s/i.test(element.innerText.trim()));
                 const byline = bylineElement?.innerText.trim() ||
                     legacyArticle?.querySelector(':scope > .my-3')?.innerText.trim() || '';
-                const paragraphs = Array.from(article?.querySelectorAll('p') || [])
+                const paragraphs = Array.from((article || legacyArticle)?.querySelectorAll('p') || [])
                     .map(paragraph => paragraph.innerText.trim())
                     .filter(value => value && !/^by\s/i.test(value) && value !== title);
                 if (!paragraphs.length && legacyArticle) {
@@ -3585,7 +3587,8 @@ class MainActivity : Activity() {
                         .filter(value => value && value !== title && value !== byline)
                         .forEach(value => paragraphs.push(value));
                 }
-                const imageUrls = Array.from(article?.querySelectorAll('img') || [])
+                const imageUrls = Array.from((imageContainer || document.querySelector('main') || document)
+                    .querySelectorAll('img'))
                     .map(image => image.currentSrc || image.src)
                     .filter(url => url && !url.startsWith('data:'));
                 return JSON.stringify({id: '$id', title: title, byline: byline,
@@ -3599,16 +3602,23 @@ class MainActivity : Activity() {
                 val data = JSONObject(json)
                 if (data.has("error")) throw IllegalStateException(data.getString("error"))
                 val paragraphsJson = data.getJSONArray("paragraphs")
+                val extractedImages = data.optJSONArray("imageUrls")?.let { images ->
+                    (0 until images.length()).map { images.getString(it) }
+                }.orEmpty()
                 val article = NewspaperArticle(
                     id,
                     data.getString("title"),
                     data.optString("byline"),
                     (0 until paragraphsJson.length()).map { paragraphsJson.getString(it) },
-                    data.optJSONArray("imageUrls")?.let { images ->
-                        (0 until images.length()).map { images.getString(it) }
-                    }.orEmpty()
+                    if (paragraphsJson.length() == 0) {
+                        listOfNotNull(Papers[NewspaperId.DAWN].articleImageUrl(id))
+                    } else {
+                        extractedImages
+                    }
                 )
-                if (article.title.isBlank() || article.paragraphs.isEmpty()) {
+                if (article.title.isBlank() ||
+                    (article.paragraphs.isEmpty() && article.imageUrls.isEmpty())
+                ) {
                     throw IllegalStateException("Dawn returned empty text for story $id.")
                 }
                 onArticle(article)
