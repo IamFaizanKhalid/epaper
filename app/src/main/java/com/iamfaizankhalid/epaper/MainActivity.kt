@@ -26,7 +26,6 @@ import android.widget.FrameLayout
 import android.widget.ImageButton
 import android.widget.LinearLayout
 import android.widget.ProgressBar
-import android.widget.PopupMenu
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
@@ -2507,20 +2506,34 @@ class MainActivity : Activity() {
         val edition = readerEdition() ?: return
         val selectedIndex = edition.readingOrder.indexOfFirst {
             it.id.takeLast(3).toIntOrNull() == pageNumber
+        }.coerceAtLeast(0)
+        val labels = edition.readingOrder.mapIndexed { index, page ->
+            val pageNumber = page.id.takeLast(3).toIntOrNull() ?: index + 1
+            page.title.ifBlank { "Page $pageNumber" }
         }
-        PopupMenu(this, pagePickerButton).apply {
-            menu.setGroupCheckable(Menu.NONE, true, true)
-            edition.readingOrder.forEachIndexed { index, page ->
-                val title = page.title.ifBlank { "Page ${page.id.takeLast(3)}" }
-                menu.add(Menu.NONE, index, index, title)
-                    .setCheckable(true)
-                    .isChecked = index == selectedIndex
+        val adapter = object : ArrayAdapter<String>(
+            this,
+            android.R.layout.simple_list_item_single_choice,
+            labels
+        ) {
+            override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+                val view = super.getView(position, convertView, parent) as TextView
+                view.textSize = 20f
+                view.minHeight = dp(56)
+                view.gravity = Gravity.CENTER_VERTICAL
+                view.setPadding(dp(16), dp(12), dp(16), dp(12))
+                return view
             }
-            setOnMenuItemClickListener { item ->
-                edition.readingOrder.getOrNull(item.itemId)?.let(::openReaderPage)
-                true
+        }
+        var chosenIndex = selectedIndex
+        AlertDialog.Builder(this)
+            .setTitle("Choose page")
+            .setSingleChoiceItems(adapter, selectedIndex) { _, index -> chosenIndex = index }
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Select") { _, _ ->
+                edition.readingOrder.getOrNull(chosenIndex)?.let(::openReaderPage)
             }
-        }.show()
+            .show()
     }
 
     private fun openReaderPage(page: NewspaperPage) {
