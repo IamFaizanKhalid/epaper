@@ -110,6 +110,7 @@ class MainActivity : Activity() {
     private val availabilityCheckDates = mutableMapOf<NewspaperId, String>()
     private val availabilityAttempts = mutableMapOf<NewspaperId, Int>()
     private val foregroundAvailabilityChecks = mutableSetOf<Pair<NewspaperId, String>>()
+    private val todayOpenedAvailabilityChecks = mutableSetOf<Pair<NewspaperId, String>>()
     private val foregroundEditionDownloadAttempts = mutableSetOf<Pair<NewspaperId, String>>()
     private val startupAvailabilitySchedulesPending = mutableSetOf<Pair<NewspaperId, String>>()
     private val unavailableEditions = mutableSetOf<Pair<NewspaperId, String>>()
@@ -269,6 +270,8 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         refreshFollowingTodayDate()
+        todayOpenedAvailabilityChecks.clear()
+        refreshScheduledAvailabilityStatuses()
         mainHandler.removeCallbacks(refreshHomeProgress)
         mainHandler.post(refreshHomeProgress)
     }
@@ -1023,6 +1026,12 @@ class MainActivity : Activity() {
                     "Not available"
                 }
                 setPaperStatus(paper, status, Color.GRAY)
+                if (NewspaperAvailability.checksAreAllowed(date) &&
+                    availabilityCheckDates[paper.id] != date &&
+                    todayOpenedAvailabilityChecks.add(paper.id to date)
+                ) {
+                    checkPaperAvailability(paper, checkTodayNow = true, requestedDate = date)
+                }
             } else {
                 setPaperStatus(paper, "", secondaryTextColor())
             }
