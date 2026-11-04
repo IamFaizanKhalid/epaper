@@ -3528,17 +3528,39 @@ class MainActivity : Activity() {
     private fun parseStoryText(source: WebView, id: String, onArticle: (NewspaperArticle) -> Unit) {
         val script = """
             (() => {
-                const article = Array.from(document.querySelectorAll('.px-4.font-merriweather > div'))
+                const article = document.querySelector('article');
+                const titleElement = document.querySelector('h1');
+                const legacyArticle = Array.from(document.querySelectorAll('.px-4.font-merriweather > div'))
                     .find(element => element.querySelector('h2') &&
                         element.querySelector('.overflow-hidden'));
-                if (!article) return JSON.stringify({error: 'Could not find the text for story $id.'});
-                const title = article.querySelector('h2')?.innerText.trim() || '';
-                const byline = article.querySelector(':scope > .my-3')?.innerText.trim() || '';
-                const body = article.querySelector(':scope > .overflow-hidden');
-                const paragraphs = Array.from(body.querySelectorAll('p'))
-                    .map(paragraph => paragraph.innerText.trim()).filter(Boolean);
-                if (!paragraphs.length && body.innerText.trim()) paragraphs.push(body.innerText.trim());
-                return JSON.stringify({id: '$id', title: title, byline: byline, paragraphs: paragraphs});
+                const title = titleElement?.innerText.trim() ||
+                    legacyArticle?.querySelector('h2')?.innerText.trim() || '';
+                if ((!article && !legacyArticle) || !title) {
+                    return JSON.stringify({error: 'Could not find the text for story $id.'});
+                }
+                const bylineElement = Array.from(titleElement.parentElement?.querySelectorAll('p') || [])
+                    .find(element => /^by\s/i.test(element.innerText.trim()));
+                const byline = bylineElement?.innerText.trim() ||
+                    legacyArticle?.querySelector(':scope > .my-3')?.innerText.trim() || '';
+                const paragraphs = Array.from(article?.querySelectorAll('p') || [])
+                    .map(paragraph => paragraph.innerText.trim())
+                    .filter(value => value && !/^by\s/i.test(value) && value !== title);
+                if (!paragraphs.length && legacyArticle) {
+                    Array.from(legacyArticle.querySelector('.overflow-hidden')?.querySelectorAll('p') || [])
+                        .map(paragraph => paragraph.innerText.trim())
+                        .filter(Boolean)
+                        .forEach(value => paragraphs.push(value));
+                }
+                if (!paragraphs.length) {
+                    (article || legacyArticle)?.innerText.split(/\n+/).map(value => value.trim())
+                        .filter(value => value && value !== title && value !== byline)
+                        .forEach(value => paragraphs.push(value));
+                }
+                const imageUrls = Array.from(article?.querySelectorAll('img') || [])
+                    .map(image => image.currentSrc || image.src)
+                    .filter(url => url && !url.startsWith('data:'));
+                return JSON.stringify({id: '$id', title: title, byline: byline,
+                    paragraphs: paragraphs, imageUrls: Array.from(new Set(imageUrls))});
             })()
         """.trimIndent()
         source.evaluateJavascript(script) { result ->
@@ -3552,7 +3574,10 @@ class MainActivity : Activity() {
                     id,
                     data.getString("title"),
                     data.optString("byline"),
-                    (0 until paragraphsJson.length()).map { paragraphsJson.getString(it) }
+                    (0 until paragraphsJson.length()).map { paragraphsJson.getString(it) },
+                    data.optJSONArray("imageUrls")?.let { images ->
+                        (0 until images.length()).map { images.getString(it) }
+                    }.orEmpty()
                 )
                 if (article.title.isBlank() || article.paragraphs.isEmpty()) {
                     throw IllegalStateException("Dawn returned empty text for story $id.")

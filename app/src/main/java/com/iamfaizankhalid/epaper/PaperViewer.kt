@@ -156,11 +156,6 @@ class WebPaperViewer : PaperViewer {
                 image
             }
         }.joinToString("")
-        val imageButton = paper.articleImageDetailTarget(article.id)?.let { target ->
-            """
-                <a class="image-button" href="${escape(target)}">Display as image</a>
-            """.trimIndent()
-        }.orEmpty()
         val fontFace = if (paper.articleFontFamily.contains("AliNastaliq")) {
             """
                 @font-face{font-family:'AliNastaliq';src:url('file:///android_asset/fonts/ali_nastaliq.woff') format('woff');font-weight:400;font-style:normal}
@@ -186,7 +181,7 @@ class WebPaperViewer : PaperViewer {
             .image-button{display:inline-block;margin:8px 0 18px;padding:10px 16px;
             border-radius:4px;background:#244d70;color:#fff;text-decoration:none;font:14px Arial,sans-serif}
             </style></head><body><h1>${escape(article.title)}</h1>
-            <div class="byline">${escape(article.byline)}</div>$imageButton$images$paragraphs</body></html>
+            <div class="byline">${escape(article.byline)}</div>$images$paragraphs</body></html>
         """.trimIndent()
     }
 

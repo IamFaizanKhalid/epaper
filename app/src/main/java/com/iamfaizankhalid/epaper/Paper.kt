@@ -3,6 +3,7 @@ package com.iamfaizankhalid.epaper
 import org.json.JSONArray
 import org.json.JSONObject
 import android.app.job.JobService
+import android.net.Uri
 import java.io.File
 import java.net.URL
 
@@ -88,7 +89,7 @@ object Papers {
 
 private class DawnPaper : Paper {
     override val id = NewspaperId.DAWN
-    override val supportsImageDetail = true
+    override val supportsImageDetail = false
     override val offlineOrigin = "https://offline.dawn/"
     override val supportsForegroundEditionPrefetch = true
     override val backgroundJob = PaperBackgroundJob(
@@ -96,12 +97,6 @@ private class DawnPaper : Paper {
         nineAmJobId = 2842,
         serviceClass = DailyEditionCheckJobService::class.java
     )
-    override fun articleImageDetailTarget(storyId: String): String? =
-        if (DAWN_STORY_ID_PATTERN.matches(storyId)) {
-            "${offlineOrigin}article-image/$storyId"
-        } else {
-            null
-        }
 
     override fun editionDirectory(root: File, date: String): File =
         File(root, date)
@@ -118,7 +113,13 @@ private class DawnPaper : Paper {
         "https://epaper.dawn.com/DetailImage.php?StoryImage=$storyId"
 
     override fun isArticleUrl(url: String, storyId: String): Boolean =
-        url.substringBefore('#').startsWith(articleUrl(storyId))
+        url.substringBefore('#').let { value ->
+            val uri = Uri.parse(value)
+            uri.host.equals("epaper.dawn.com", ignoreCase = true) &&
+                uri.path in setOf("/DetailText.php", "/DetailImage.php") &&
+                (uri.getQueryParameter("StoryText") == storyId ||
+                    uri.getQueryParameter("StoryImage") == storyId)
+        }
 
     override fun isPageUrl(url: String, date: String, pageId: String): Boolean =
         url.startsWith("https://e.dawn.com/") &&
@@ -151,7 +152,10 @@ private class DawnPaper : Paper {
                 if (id && id.startsWith(requestedDate + '_') &&
                     /^\d{2}_\d{2}_\d{4}_\d{3}$/.test(id) && !seen.has(id)) {
                     seen.add(id);
-                    pages.push({id: id, title: link.innerText.trim()});
+                    const title = (link.innerText || link.textContent || '')
+                        .replace(/\s+/g, ' ').trim();
+                    if (/^next$/i.test(title)) continue;
+                    pages.push({id: id, title: title});
                 }
             }
             if (!pages.length) return JSON.stringify({error: 'NOT_AVAILABLE'});
@@ -165,17 +169,44 @@ private class DawnPaper : Paper {
 
     override fun articleExtractionScript(storyId: String): String = """
         (() => {
-            const article = Array.from(document.querySelectorAll('.px-4.font-merriweather > div'))
+            const article = document.querySelector('article');
+            const heading = document.querySelector('h1');
+            const legacyArticle = Array.from(document.querySelectorAll('.px-4.font-merriweather > div'))
                 .find(element => element.querySelector('h2') &&
                     element.querySelector('.overflow-hidden'));
-            if (!article) return JSON.stringify({error: 'Could not find the text for story $storyId.'});
-            const title = article.querySelector('h2')?.innerText.trim() || '';
-            const byline = article.querySelector(':scope > .my-3')?.innerText.trim() || '';
-            const body = article.querySelector(':scope > .overflow-hidden');
-            const paragraphs = Array.from(body.querySelectorAll('p'))
-                .map(paragraph => paragraph.innerText.trim()).filter(Boolean);
-            if (!paragraphs.length && body.innerText.trim()) paragraphs.push(body.innerText.trim());
-            return JSON.stringify({id: '$storyId', title: title, byline: byline, paragraphs: paragraphs});
+            const title = heading?.innerText.trim() ||
+                legacyArticle?.querySelector('h2')?.innerText.trim() ||
+                document.querySelector('title')?.innerText.split('|')[2]?.trim() || '';
+            if ((!article && !legacyArticle) || !title) {
+                return JSON.stringify({error: 'Could not find the text for story $storyId.'});
+            }
+            const bylineParagraph = Array.from(article.parentElement?.querySelectorAll(':scope > p, p') || [])
+                .find(element => /^by\s/i.test(element.innerText.trim()));
+            const nearbyHeading = heading?.parentElement;
+            const byline = bylineParagraph?.innerText.trim() ||
+                nearbyHeading?.querySelector('p')?.innerText.trim() ||
+                legacyArticle?.querySelector(':scope > .my-3')?.innerText.trim() || '';
+            const paragraphs = Array.from(article?.querySelectorAll('p') || [])
+                .map(paragraph => paragraph.innerText.trim())
+                .filter(value => value && !/^by\s/i.test(value) && value !== title);
+            if (!paragraphs.length && legacyArticle) {
+                const legacyBody = legacyArticle.querySelector('.overflow-hidden');
+                Array.from(legacyBody?.querySelectorAll('p') || [])
+                    .map(paragraph => paragraph.innerText.trim())
+                    .filter(Boolean)
+                    .forEach(value => paragraphs.push(value));
+            }
+            if (!paragraphs.length) {
+                Array.from((article || legacyArticle)?.innerText.split(/\n+/) || [])
+                    .map(value => value.trim())
+                    .filter(value => value && value !== title && value !== byline)
+                    .forEach(value => paragraphs.push(value));
+            }
+            const imageUrls = Array.from(article?.querySelectorAll('img') || [])
+                .map(image => image.currentSrc || image.src)
+                .filter(url => url && !url.startsWith('data:'));
+            return JSON.stringify({id: '$storyId', title: title, byline: byline,
+                paragraphs: paragraphs, imageUrls: Array.from(new Set(imageUrls))});
         })()
     """.trimIndent()
 
@@ -187,7 +218,8 @@ private class DawnPaper : Paper {
             storyId,
             data.getString("title"),
             data.optString("byline"),
-            paragraphs
+            paragraphs,
+            data.optJSONArray("imageUrls")?.toStringList().orEmpty()
         )
         require(article.title.isNotBlank() && article.paragraphs.isNotEmpty()) {
             "Dawn returned empty text for story $storyId."

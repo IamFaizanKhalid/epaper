@@ -987,7 +987,11 @@ data class NewspaperEdition(
                 require(isValidPageId(id, date, isJangEdition)) {
                     "The newspaper returned an invalid page ID."
                 }
-                NewspaperPage(id, item.optString("title").ifBlank { "Page ${id.takeLast(3)}" })
+                NewspaperPage(
+                    id,
+                    item.optString("title").replace(Regex("\\s+"), " ").trim()
+                        .ifBlank { "Page ${id.takeLast(3)}" }
+                )
             }.distinctBy { it.id }
             require(pages.isNotEmpty()) { "No pages were listed for this edition." }
 
