@@ -1204,16 +1204,17 @@ class MainActivity : Activity() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
-        dateNavigation.addView(previousDateButton, LinearLayout.LayoutParams(0, dp(52), 1f).apply {
+        val sideDateButtonWidth = dp(112)
+        dateNavigation.addView(previousDateButton, LinearLayout.LayoutParams(sideDateButtonWidth, dp(52)).apply {
             marginStart = dp(4)
             marginEnd = dp(4)
         })
-        val dateButtonParams = LinearLayout.LayoutParams(0, dp(52), 1.4f).apply {
+        val dateButtonParams = LinearLayout.LayoutParams(0, dp(52), 1f).apply {
             marginStart = dp(4)
             marginEnd = dp(4)
         }
         dateNavigation.addView(dateButton, dateButtonParams)
-        dateNavigation.addView(nextDateButton, LinearLayout.LayoutParams(0, dp(52), 1f).apply {
+        dateNavigation.addView(nextDateButton, LinearLayout.LayoutParams(sideDateButtonWidth, dp(52)).apply {
             marginStart = dp(4)
             marginEnd = dp(4)
         })
