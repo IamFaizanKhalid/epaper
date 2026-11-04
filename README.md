@@ -1,32 +1,45 @@
-# Dawn E-Paper for Android
+# E-Paper
 
-A native Android reader for Dawn and Jang Lahore e-paper, designed with the Galaxy Tab S5e in mind.
+E-Paper is a simple Android reader for Dawn and Jang Lahore newspapers. Download an edition once and read it even when the internet is unavailable.
 
-## What it does
+This app was originally built for personal use on a Samsung Galaxy Tab S5e. It is also useful for other tablet users and people with limited or unreliable internet connections.
 
-- Starts on a dedicated newspaper-selection screen with today's date selected. Changing the date displays saved edition data when available.
-- Shows Dawn and Jang Lahore in the newspaper list. Today's availability is checked by persisted 15-minute Android background jobs; if the app opens without an existing periodic job, it immediately checks only today's papers that do not yet have saved availability, then schedules the periodic job. Existing periodic schedules are preserved, and merely reopening the app or today's date does not trigger another check. Tapping a current-day “Not available yet” row triggers one immediate check per session and opens the edition if it is available. Once today's edition is confirmed, the app automatically downloads it for offline use, resuming an incomplete saved download when needed. A check mark is shown only when the full edition download is complete. Before 9:00 AM device-local time, today's edition is shown as unavailable. The app reads saved metadata for display, and historical editions can be checked when explicitly opened. Saved editions remain available offline. Dawn and Jang have independent background jobs and can be fetched concurrently, each with its own WebView, verification retries, and saved progress. Each current-day download scans pages in front-page, back-page, opinions/editorials, then remaining-page order; saves all discovered story text first; and downloads linked image stories, Jang article photos, and supported Dawn article-detail images afterward. This order is used by both background and in-app full-edition downloads. Android may defer jobs based on system conditions.
-- Opens either paper on a separate reader screen showing the downloaded page image and page selector/navigation controls. Jang availability reads the dated page links from its Pages menu; if verification redirects to the site root, the app checks the latest Lahore date there and reports the requested edition unavailable when it has not been published, otherwise it returns to the requested dated page before reading the menu. A page menu that has not finished populating is retried in place rather than treated as another verification challenge. Jang page and story scans resume saved progress. If a story request remains behind the site's verification challenge in a hidden WebView, the app brings that story into view for verification and resumes the download afterward; a failed or canceled verification leaves the edition incomplete rather than marking it offline-ready.
-- Shows one right-aligned state in each newspaper row: today uses “Not available yet”, a loading spinner, or a check mark; while today's edition downloads, the spinner is accompanied by its current offline completion percentage. Historical dates use “Not opened”, offline completion percentage, or a check mark. Every page contributes equally to historical progress; each page's share is divided among its scan and associated story text, tappable image areas, and Jang article photos. Optional Dawn story-detail images, fetched only on request, are excluded. The current day's in-app edition download can be paused and resumed from that row.
-- Prefetches pages in front-page, back-page, editorial, then remaining-page order. Opening a page moves it ahead of queued downloads.
-- Makes stories and image areas tappable directly on either newspaper page. A tapped story opens its saved text or is fetched and saved on demand; Jang story text retains images embedded in the article, which can be tapped to view enlarged. Jang page images marked with `window.open` are also tappable and cached for offline viewing; older Jang editions refresh their clickable-area metadata to include these image links. No separate story buttons are shown.
-- Briefly highlights a tapped story area before opening it. Text stories include an optional “Display as image” action only for supported newspapers (currently Dawn); the Dawn story image is fetched only when requested and then stored with the edition for offline viewing.
-- Keeps the current page and zoom position intact while new story hotspots arrive. Opening a page in a partially saved edition prefetches that page's missing story text first, then its tappable page images and Jang article photos; full-edition downloads handle the same content across all pages.
-- Makes the “Opening story…” dialog dismissible with Back, returning to the current paper page.
-- Download progress and storage mode are handled internally.
-- Notifies when a supported newspaper's current-day edition is detected and starts downloading its pages. Previously unsaved historical editions download only the page the user opens, and saved edition metadata avoids another availability request.
-- Uses the newspaper websites temporarily to check availability and extract page/story data; full website HTML is not archived.
+## Read offline
 
-Android permits cleartext traffic only to `e.jang.com.pk` because Jang's e-paper flow uses HTTP; all other hosts retain the platform's default cleartext policy.
+- Choose Dawn or Jang Lahore.
+- Browse newspapers by date.
+- Download complete editions or open individual pages.
+- Read saved pages and stories without internet access.
+- Tap a story to read the full text.
+- Zoom newspaper pages and article images.
+- Receive a notification when today's newspaper becomes available.
 
-Downloaded editions live in the app's private storage. Dawn editions use `editions/<date>/`; Jang Lahore editions use `editions/jang/<date>/`. Each stores downloaded page images (Dawn JPEG; Jang JPEG or PNG) and `edition.json` for page metadata, clickable areas, and article text. Full-size images are stored under `images/`, including Jang page images opened from clickable areas. Jang article photos are stored under `article-images/` and displayed from local storage when available. Jang story text uses the bundled Ali Nastaliq font from `app/src/main/assets/fonts/`.
+Downloaded editions remain on your device until you remove them.
 
-## Paper architecture
+## Installation
 
-`Paper` defines provider operations and capabilities; `DawnPaper` and `JangLahorePaper` implement the source-specific URLs, extraction scripts, parsing, edition directories, and background-job registration. Dawn hotspot coordinates retain their source map dimensions so clickable areas remain aligned when the scan image has a different aspect ratio. `Papers.all` is the registry used to populate the home-screen list, start availability checks, route editions, and schedule independent background jobs. Saved editions include a paper ID; old metadata without one is migrated from its legacy Jang flag.
+Install the app on an Android device running Android 8.0 (API 26) or newer. A tablet works especially well for the full newspaper-page view.
 
-`MainActivity` coordinates user actions and WebViews. `PaperViewer` renders scanned pages, interactive hotspots, loading states, and story views while querying paper capabilities for optional image actions. Dawn and Jang still have some specialized reader interactions (for example, Jang verification and inline-photo routes), and the shared edition image model retains provider-specific file validation. To add a paper, implement `Paper`, register it in `Papers.all`, assign its background-job registration and Android job service, and add its `NewspaperId`; provider-specific model validation or reader interactions may also need extending when its formats differ.
+An internet connection is needed to download a newspaper edition. After it is downloaded, you can read it offline.
 
-## Build
+## Privacy and storage
 
-Open this directory in Android Studio and sync the Gradle project, or run `gradle assembleDebug` with an Android SDK installed. The project targets Android 8.0 (API 26) and newer.
+The app checks the newspapers' websites for new editions and saves downloaded pages and stories only in its private storage on your device. It does not upload your reading activity.
+
+## License
+
+This project is licensed under the Apache License 2.0. See [LICENSE](LICENSE).
+
+## Development
+
+Open the project in Android Studio and sync Gradle, or build it from the command line:
+
+```sh
+./build_debug.sh
+```
+
+The resulting debug APK is written to:
+
+```text
+app/build/outputs/apk/debug/app-debug.apk
+```
