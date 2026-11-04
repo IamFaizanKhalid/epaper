@@ -17,10 +17,12 @@ import android.view.View
 import android.view.Gravity
 import android.view.Menu
 import android.view.ViewGroup
+import android.view.MotionEvent
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.webkit.JavascriptInterface
 import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.ImageButton
@@ -148,6 +150,7 @@ class MainActivity : Activity() {
     private var articleTextViewerActive = false
     private var articleTextScale = 1f
     private lateinit var articleScaleGestureDetector: ScaleGestureDetector
+    private var touchingStoryImage = false
     private var displayedPageId: String? = null
     private var displayedEditionDate: String? = null
     private var displayedArticleId: String? = null
@@ -1351,6 +1354,7 @@ class MainActivity : Activity() {
             settings.builtInZoomControls = true
             settings.displayZoomControls = false
             settings.allowFileAccess = true
+            addJavascriptInterface(StoryImageTouchBridge(), "StoryImageTouch")
             webViewClient = object : WebViewClient() {
                 override fun shouldInterceptRequest(
                     view: WebView,
@@ -1696,7 +1700,20 @@ class MainActivity : Activity() {
             }
         )
         webView.setOnTouchListener { _, event ->
-            if (articleTextViewerActive) articleScaleGestureDetector.onTouchEvent(event)
+            if (articleTextViewerActive) {
+                if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+                    val hitTest = webView.hitTestResult
+                    touchingStoryImage =
+                        hitTest.type == android.webkit.WebView.HitTestResult.IMAGE_TYPE ||
+                        hitTest.type == android.webkit.WebView.HitTestResult.SRC_IMAGE_ANCHOR_TYPE
+                }
+                if (!touchingStoryImage) articleScaleGestureDetector.onTouchEvent(event)
+                if (event.actionMasked == MotionEvent.ACTION_UP ||
+                    event.actionMasked == MotionEvent.ACTION_CANCEL
+                ) {
+                    touchingStoryImage = false
+                }
+            }
             false
         }
     }
@@ -1718,6 +1735,18 @@ class MainActivity : Activity() {
         nextPageButton.visibility = if (enabled) View.GONE else View.VISIBLE
         saveStoryButton.visibility = if (enabled) View.VISIBLE else View.GONE
         refreshSaveStoryButton()
+    }
+
+    inner class StoryImageTouchBridge {
+        @JavascriptInterface
+        fun beginTouch() {
+            touchingStoryImage = true
+        }
+
+        @JavascriptInterface
+        fun endTouch() {
+            touchingStoryImage = false
+        }
     }
 
     private fun onReaderBackButton() {

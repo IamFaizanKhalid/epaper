@@ -178,10 +178,88 @@ class WebPaperViewer : PaperViewer {
             h1{font-size:${if (paper.articleTextDirection == "rtl") "1.36em" else "1.67em"};line-height:$headingLineHeight}
             .byline{color:${if (darkTheme) "#aaa" else "#666"};font-size:.85em;margin:12px 0 24px}
             p{margin:0 0 1em}img{display:block;max-width:100%;height:auto;margin:20px auto}
+            img.story-image{cursor:zoom-in}
+            #image-viewer{display:none;position:fixed;inset:0;z-index:1000;background:rgba(0,0,0,.96);
+            align-items:center;justify-content:center;overflow:auto;padding:16px;touch-action:none}
+            #image-viewer.open{display:flex}
+            #image-viewer img{display:block;max-width:none;width:auto;height:auto;margin:0;
+            transform-origin:center;touch-action:none}
+            #image-viewer .close{position:fixed;right:18px;top:18px;width:44px;height:44px;
+            border:0;border-radius:22px;background:#fff;color:#111;font:28px Arial;z-index:1001}
             .image-button{display:inline-block;margin:8px 0 18px;padding:10px 16px;
             border-radius:4px;background:#244d70;color:#fff;text-decoration:none;font:14px Arial,sans-serif}
             </style></head><body><h1>${escape(article.title)}</h1>
-            <div class="byline">${escape(article.byline)}</div>$images$paragraphs</body></html>
+            <div class="byline">${escape(article.byline)}</div>$images$paragraphs
+            <div id="image-viewer" role="dialog" aria-label="Zoomed article image">
+            <button class="close" aria-label="Close image">&times;</button><img alt=""></div>
+            <script>
+            (() => {
+              const viewer = document.getElementById('image-viewer');
+              const zoomed = viewer.querySelector('img');
+              let scale = 1, startDistance = 0, startScale = 1;
+              let panX = 0, panY = 0, startPanX = 0, startPanY = 0;
+              let lastTouchX = 0, lastTouchY = 0;
+              const applyTransform = () => {
+                zoomed.style.transform = 'translate(' + panX + 'px,' + panY + 'px) scale(' + scale + ')';
+              };
+              const resetImage = () => {scale = 1; panX = 0; panY = 0; applyTransform();};
+              const closeViewer = () => {viewer.classList.remove('open'); resetImage();};
+              const openViewer = source => {
+                zoomed.src = source; scale = 1; panX = 0; panY = 0; zoomed.style.transform = '';
+                viewer.classList.add('open');
+                zoomed.onload = () => {
+                  const fittedWidth = Math.min(zoomed.naturalWidth, viewer.clientWidth - 32);
+                  zoomed.style.maxWidth = fittedWidth + 'px';
+                  resetImage();
+                };
+              };
+              document.querySelectorAll('img').forEach((image, index) => {
+                image.classList.add('story-image');
+                image.setAttribute('tabindex', '0');
+                image.addEventListener('click', () => openViewer(image.currentSrc || image.src));
+                image.addEventListener('keydown', event => {
+                  if (event.key === 'Enter' || event.key === ' ') openViewer(image.currentSrc || image.src);
+                });
+              });
+              viewer.querySelector('.close').addEventListener('click', closeViewer);
+              viewer.addEventListener('click', event => {if (event.target === viewer) closeViewer();});
+              const distance = touches => Math.hypot(
+                touches[0].clientX - touches[1].clientX,
+                touches[0].clientY - touches[1].clientY);
+              viewer.addEventListener('touchstart', event => {
+                if (window.StoryImageTouch) StoryImageTouch.beginTouch();
+                if (event.touches.length === 2) {
+                  startDistance = distance(event.touches); startScale = scale;
+                }
+                if (event.touches.length === 1 && scale > 1) {
+                  lastTouchX = event.touches[0].clientX;
+                  lastTouchY = event.touches[0].clientY;
+                  startPanX = panX; startPanY = panY;
+                }
+              }, {passive: true});
+              viewer.addEventListener('touchmove', event => {
+                event.preventDefault();
+                if (event.touches.length === 2 && startDistance) {
+                  scale = Math.min(5, Math.max(1, startScale * distance(event.touches) / startDistance));
+                  applyTransform();
+                } else if (event.touches.length === 1 && scale > 1) {
+                  panX = startPanX + event.touches[0].clientX - lastTouchX;
+                  panY = startPanY + event.touches[0].clientY - lastTouchY;
+                  applyTransform();
+                }
+              }, {passive: false});
+              viewer.addEventListener('touchend', event => {
+                if (window.StoryImageTouch) StoryImageTouch.endTouch();
+                if (event.touches.length === 0 && scale === 1) {
+                  panX = 0; panY = 0; applyTransform();
+                }
+              }, {passive: true});
+              zoomed.addEventListener('dblclick', event => {
+                event.preventDefault();
+                resetImage();
+              });
+            })();
+            </script></body></html>
         """.trimIndent()
     }
 
