@@ -14,5 +14,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "DawnEpaper"
+rootProject.name = "e-Paper"
 include(":app")

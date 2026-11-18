@@ -654,11 +654,12 @@ data class NewspaperEdition(
                 ".jpg.tmp",
                 destination.parentFile
             )
+            val userAgent = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36"
             val connection = (url.openConnection() as HttpURLConnection).apply {
                 connectTimeout = 15_000
                 readTimeout = 30_000
                 instanceFollowRedirects = true
-                setRequestProperty("User-Agent", "DawnEpaperAndroid/1.0")
+                setRequestProperty("User-Agent", userAgent)
             }
 
             try {
