@@ -1056,7 +1056,7 @@ class MainActivity : Activity() {
         }
         dateButton = button("") { chooseDate() }
         dateButton.apply {
-            textSize = 16f
+            textSize = 18f
             isAllCaps = false
             minHeight = dp(52)
             setPadding(dp(18), 0, dp(18), 0)
@@ -1074,7 +1074,7 @@ class MainActivity : Activity() {
         nextDateButton = button("") { navigateDate(1) }
         listOf(previousDateButton, nextDateButton).forEach { navigationButton ->
             navigationButton.apply {
-                textSize = 14f
+                textSize = 16f
                 isAllCaps = false
                 minHeight = dp(52)
                 setPadding(dp(8), 0, dp(8), 0)
@@ -1093,13 +1093,13 @@ class MainActivity : Activity() {
         }
         val title = TextView(this).apply {
             text = "Newspapers"
-            textSize = 32f
+            textSize = 36f
             setTypeface(typeface, android.graphics.Typeface.BOLD)
             setTextColor(primaryTextColor())
             setPadding(0, 0, 0, dp(20))
         }
         pageLabel = TextView(this).apply {
-            textSize = 18f
+            textSize = 20f
             setTextColor(secondaryTextColor())
             setPadding(dp(20), dp(12), dp(20), dp(12))
             background = roundedBackground(surfaceColor(), dp(12))
@@ -1109,7 +1109,7 @@ class MainActivity : Activity() {
         }
         val savedStoriesTitle = TextView(this).apply {
             text = "Saved Stories"
-            textSize = 22f
+            textSize = 26f
             setTypeface(typeface, android.graphics.Typeface.BOLD)
             setTextColor(primaryTextColor())
             setPadding(0, dp(28), 0, dp(12))
@@ -1124,7 +1124,7 @@ class MainActivity : Activity() {
                 setPadding(dp(20), dp(16), dp(16), dp(16))
                 background = roundedBackground(surfaceColor(), dp(16))
                 elevation = dp(2).toFloat()
-                minimumHeight = dp(92)
+                minimumHeight = dp(108)
                 isClickable = true
                 isFocusable = true
                 setOnClickListener { openPaper(paper) }
@@ -1134,17 +1134,17 @@ class MainActivity : Activity() {
             }
             val name = TextView(this).apply {
                 text = paper.id.displayName
-                textSize = 24f
+                textSize = 28f
                 setTypeface(typeface, android.graphics.Typeface.BOLD)
                 setTextColor(primaryTextColor())
             }
             val status = TextView(this).apply {
                 text = if (isToday(selectedDateKey())) "Not available yet" else "Not opened"
-                textSize = 15f
+                textSize = 18f
                 gravity = Gravity.CENTER
-                maxWidth = dp(180)
+                maxWidth = dp(210)
                 setTextColor(secondaryTextColor())
-                setPadding(dp(10), dp(5), dp(10), dp(5))
+                setPadding(dp(12), dp(6), dp(12), dp(6))
                 visibility = View.VISIBLE
                 background = roundedBackground(
                     if (darkTheme) Color.rgb(54, 54, 54) else Color.rgb(241, 245, 248),
@@ -3213,7 +3213,7 @@ class MainActivity : Activity() {
         if (savedStories.isEmpty()) {
             savedStoriesList.addView(TextView(this).apply {
                 text = "No saved stories yet."
-                textSize = 15f
+                textSize = 17f
                 setTextColor(secondaryTextColor())
                 setPadding(dp(18), dp(18), dp(18), dp(18))
                 background = roundedBackground(surfaceColor(), dp(14))
@@ -3238,7 +3238,7 @@ class MainActivity : Activity() {
             }
             val title = TextView(this).apply {
                 text = saved.article.title
-                textSize = 16f
+                textSize = 20f
                 maxLines = 2
                 ellipsize = android.text.TextUtils.TruncateAt.END
                 setTypeface(typeface, android.graphics.Typeface.BOLD)
@@ -3246,7 +3246,7 @@ class MainActivity : Activity() {
             }
             val metadata = TextView(this).apply {
                 text = "${saved.paperId.displayName} · ${formatDate(saved.date)}"
-                textSize = 12f
+                textSize = 15f
                 setTextColor(secondaryTextColor())
                 setPadding(0, dp(5), 0, 0)
             }
