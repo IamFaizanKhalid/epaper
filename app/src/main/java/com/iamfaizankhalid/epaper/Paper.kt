@@ -41,6 +41,7 @@ interface Paper {
     fun articleImageDetailTarget(storyId: String): String? = null
     fun inlineArticleImageTarget(articleId: String, imageIndex: Int): String? = null
     fun localArticleImageUrl(articleId: String, imageIndex: Int): String? = null
+    fun validatedArticleImageUrl(source: String): URL? = null
 
     fun editionDirectory(root: File, date: String): File
     fun availabilityUrl(date: String): String
@@ -99,6 +100,24 @@ private class DawnPaper : Paper {
         nineAmJobId = 2842,
         serviceClass = DailyEditionCheckJobService::class.java
     )
+
+    override fun inlineArticleImageTarget(articleId: String, imageIndex: Int): String =
+        "${offlineOrigin}article-image/$articleId/$imageIndex"
+
+    override fun localArticleImageUrl(articleId: String, imageIndex: Int): String =
+        "${offlineOrigin}article-asset/${Uri.encode(articleId)}/$imageIndex"
+
+    override fun validatedArticleImageUrl(source: String): URL? {
+        val url = runCatching { URL(source) }.getOrNull() ?: return null
+        val host = url.host.lowercase()
+        if (url.protocol != "https" || (host != "dawn.com" && !host.endsWith(".dawn.com"))) {
+            return null
+        }
+        if (url.path.substringAfterLast('.', "").lowercase() !in setOf("jpg", "jpeg", "png")) {
+            return null
+        }
+        return url
+    }
 
     override fun editionDirectory(root: File, date: String): File =
         File(root, date)
@@ -320,6 +339,17 @@ private class JangLahorePaper : Paper {
 
     override fun localArticleImageUrl(articleId: String, imageIndex: Int): String =
         "${offlineOrigin}article-asset/${android.net.Uri.encode(articleId)}/$imageIndex"
+
+    override fun validatedArticleImageUrl(source: String): URL? {
+        val url = runCatching { URL(source) }.getOrNull() ?: return null
+        if (url.protocol != "https" || !url.host.equals("e.jang.com.pk", ignoreCase = true) ||
+            !url.path.startsWith("/assets/uploads/") ||
+            url.path.substringAfterLast('.').lowercase() !in setOf("jpg", "jpeg", "png")
+        ) {
+            return null
+        }
+        return url
+    }
 
     override fun editionDirectory(root: File, date: String): File =
         File(File(root, id.storageName), date)

@@ -132,9 +132,8 @@ data class NewspaperEdition(
     }
 
     fun articleImageFile(directory: File, article: NewspaperArticle, index: Int): File? {
-        if (!isJangEdition) return null
         val source = article.imageUrls.getOrNull(index) ?: return null
-        val url = validatedJangArticleImageUrl(source)
+        val url = Papers[paperId].validatedArticleImageUrl(source) ?: return null
         val extension = url.path.substringAfterLast('.').lowercase()
         val safeArticleId = article.id.replace(Regex("[^A-Za-z0-9_-]"), "_")
         return File(File(directory, "article-images"), "$safeArticleId-$index.$extension")
@@ -160,7 +159,7 @@ data class NewspaperEdition(
         articlesToDownload: List<NewspaperArticle>,
         jangImageDownloader: JangImageDownloader? = null
     ) {
-        if (!isJangEdition) return
+        val paper = Papers[paperId]
         val imageDirectory = File(directory, "article-images")
         if (articlesToDownload.any { it.imageUrls.isNotEmpty() } &&
             !imageDirectory.exists() && !imageDirectory.mkdirs()
@@ -170,13 +169,22 @@ data class NewspaperEdition(
         articlesToDownload.forEach { article ->
             article.imageUrls.indices.forEach { index ->
                 val destination = articleImageFile(directory, article, index)
-                    ?: throw IllegalStateException("Jang article image has no saved source URL.")
-                if (!destination.isImageFile()) {
+                    ?: return@forEach
+                if (destination.isImageFile()) return@forEach
+                val url = paper.validatedArticleImageUrl(article.imageUrls[index])
+                    ?: return@forEach
+                if (paper.requiresPageVerification) {
                     downloadJangArticleImage(
-                        validatedJangArticleImageUrl(article.imageUrls[index]),
+                        url,
                         article.id,
                         destination,
                         jangImageDownloader
+                    )
+                } else {
+                    downloadArticleImageOnce(
+                        url,
+                        paper.articleUrl(article.id),
+                        destination
                     )
                 }
             }
@@ -330,6 +338,69 @@ data class NewspaperEdition(
             }
         }
         throw IllegalStateException("Could not download the Jang article image.", lastFailure)
+    }
+
+    private fun downloadArticleImageOnce(url: URL, referer: String, destination: File) {
+        val temporaryImage = File(destination.parentFile, "${destination.name}.tmp")
+        val connection = (url.openConnection() as HttpURLConnection).apply {
+            connectTimeout = 15_000
+            readTimeout = 30_000
+            instanceFollowRedirects = true
+            setRequestProperty(
+                "User-Agent",
+                "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36"
+            )
+            setRequestProperty("Referer", referer)
+            setRequestProperty("Accept", "image/*")
+        }
+        try {
+            connection.connect()
+            require(connection.url.protocol == "https") {
+                "Article image was redirected to an insecure host."
+            }
+            if (connection.responseCode !in 200..299) {
+                throw IllegalStateException(
+                    "Image host returned HTTP ${connection.responseCode} for the article image."
+                )
+            }
+            val contentType = connection.contentType?.substringBefore(';')?.trim()?.lowercase()
+            require(contentType != null && contentType.startsWith("image/")) {
+                "Image host returned ${contentType ?: "no content type"} instead of an article image."
+            }
+            if (connection.contentLengthLong > MAX_IMAGE_BYTES) {
+                throw IllegalStateException("Article image is larger than expected.")
+            }
+            connection.inputStream.use { input ->
+                FileOutputStream(temporaryImage).use { output ->
+                    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                    var totalBytes = 0L
+                    while (true) {
+                        val read = input.read(buffer)
+                        if (read < 0) break
+                        if (read == 0) continue
+                        totalBytes += read
+                        if (totalBytes > MAX_IMAGE_BYTES) {
+                            throw IllegalStateException("Article image is larger than expected.")
+                        }
+                        output.write(buffer, 0, read)
+                    }
+                }
+            }
+            require(temporaryImage.isImageFile()) {
+                "Image host returned invalid article image data."
+            }
+            if (destination.exists() && !destination.delete()) {
+                throw IllegalStateException("Could not replace the saved article image.")
+            }
+            if (!temporaryImage.renameTo(destination)) {
+                throw IllegalStateException("Could not save the article image.")
+            }
+        } catch (error: Exception) {
+            temporaryImage.delete()
+            throw error
+        } finally {
+            connection.disconnect()
+        }
     }
 
     private fun downloadJangArticleImageOnce(url: URL, articleId: String, destination: File) {

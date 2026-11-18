@@ -852,9 +852,12 @@ abstract class NewspaperEditionCheckJobService : JobService() {
             return
         }
         backgroundEdition = updated
-        val hasJangArticleImages = updated.isJangEdition &&
-            updated.articles.any { it.imageUrls.isNotEmpty() }
-        if (imageIds.isEmpty() && !hasJangArticleImages) {
+        val hasPendingArticleImages = updated.articles.any { article ->
+            article.imageUrls.indices.any { index ->
+                !updated.hasArticleImage(directory, article, index)
+            }
+        }
+        if (imageIds.isEmpty() && !hasPendingArticleImages) {
             completeBackgroundEdition(params, fetcher, updated, directory)
             return
         }
