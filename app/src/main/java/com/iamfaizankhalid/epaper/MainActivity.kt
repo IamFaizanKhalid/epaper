@@ -2495,6 +2495,9 @@ class MainActivity : Activity() {
         viewingSavedStory = false
         viewingStoryContent = false
         setArticleTextViewerMode(false)
+        displayedPageId = null
+        displayedEditionDate = null
+        paperPageReady = false
         readerMode = false
         homeScreen.visibility = View.VISIBLE
         readerScreen.visibility = View.GONE
@@ -3489,8 +3492,6 @@ class MainActivity : Activity() {
             articles = storedEdition.articles.filterNot { it.id == saved.article.id } +
                 saved.article
         )
-        selectedDate.time = dateFormat.parse(saved.date) ?: selectedDate.time
-        updateDateButton()
         availableEdition = edition
         offlineEdition = edition
         offlineDirectory = directory
@@ -3498,6 +3499,9 @@ class MainActivity : Activity() {
         viewingStoryContent = true
         viewingSavedStory = true
         viewingArticleImage = false
+        displayedPageId = null
+        displayedEditionDate = null
+        paperPageReady = false
         displayedArticleId = saved.article.id
         homeScreen.visibility = View.GONE
         readerScreen.visibility = View.VISIBLE
