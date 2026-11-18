@@ -4330,26 +4330,12 @@ class MainActivity : Activity() {
             ?.takeIf { it.isFile }
             ?.let { paper.localArticleImageUrl(article.id, imageIndex) }
         val displayedImageUrl = localImage ?: imageUrl
-        val html = """
-            <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-            <style>html,body{margin:0;width:100%;height:100%;background:#111;color:#fff;font:16px sans-serif}
-            header{height:48px;display:flex;align-items:center;padding:0 12px}
-            a{color:#fff}main{height:calc(100% - 48px);display:flex;align-items:center;
-            justify-content:center;overflow:hidden;background:#111}
-            img{display:block;width:auto;height:auto;max-width:100%;max-height:100%;
-            object-fit:contain;background:#fff}
-            #error{padding:24px;text-align:center}</style></head>
-            <body><header><a href="${paper.offlineOrigin}article/${article.id}">Back to story text</a></header>
-            <main><img src="${htmlEscape(displayedImageUrl)}" alt="${htmlEscape(article.title)}"
-                onerror="this.hidden=true;document.getElementById('error').hidden=false">
-            <div id="error" hidden>Image could not be displayed.</div></main></body></html>
-        """.trimIndent()
-        webView.loadDataWithBaseURL(
+        loadImageViewerPage(
             imageTarget,
-            html,
-            "text/html",
-            "UTF-8",
-            null
+            "${paper.offlineOrigin}article/${article.id}",
+            "Back to story text",
+            displayedImageUrl,
+            article.title
         )
     }
 
@@ -4362,21 +4348,13 @@ class MainActivity : Activity() {
         val paper = Papers.forEdition(edition)
         setArticleTextViewerMode(false)
         viewingStoryContent = true
-        val html = """
-            <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-            <style>html,body{margin:0;width:100%;height:100%;background:#111;color:#fff;font:16px sans-serif}
-            header{height:48px;display:flex;align-items:center;padding:0 12px}
-            a{color:#fff}main{height:calc(100% - 48px);display:flex;align-items:center;
-            justify-content:center;overflow:hidden;background:#111}
-            img{display:block;width:auto;height:auto;max-width:100%;max-height:100%;
-            object-fit:contain;background:#fff}
-            #error{padding:24px;text-align:center}</style></head>
-            <body><header><a href="${paper.offlineOrigin}page/$sourcePage">Back to paper</a></header>
-            <main><img src="images/${htmlEscape(imageFile.name)}" alt="Full-size newspaper image"
-                onerror="this.hidden=true;document.getElementById('error').hidden=false">
-            <div id="error" hidden>Image could not be displayed.</div></main></body></html>
-        """.trimIndent()
-        webView.loadDataWithBaseURL(baseUrl, html, "text/html", "UTF-8", null)
+        loadImageViewerPage(
+            baseUrl,
+            "${paper.offlineOrigin}page/$sourcePage",
+            "Back to paper",
+            "images/${imageFile.name}",
+            "Full-size newspaper image"
+        )
     }
 
     private fun showArticleImage(edition: NewspaperEdition, directory: File, id: String) {
@@ -4385,19 +4363,46 @@ class MainActivity : Activity() {
         viewingStoryContent = true
         viewingArticleImage = true
         displayedArticleId = id
+        loadImageViewerPage(
+            baseUrl,
+            "${Papers.forEdition(edition).offlineOrigin}article/$id",
+            "Back to story text",
+            "images/$id.jpg",
+            edition.articles.firstOrNull { it.id == id }?.title ?: "Story image"
+        )
+    }
+
+    private fun loadImageViewerPage(
+        baseUrl: String,
+        backHref: String,
+        backLabel: String,
+        imageSrc: String,
+        imageAlt: String
+    ) {
         val html = """
             <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
             <style>html,body{margin:0;width:100%;height:100%;background:#111;color:#fff;font:16px sans-serif}
-            header{height:48px;display:flex;align-items:center;padding:0 12px}
-            a{color:#fff}main{height:calc(100% - 48px);display:flex;align-items:center;
+            header{height:64px;display:flex;align-items:center;padding:0 16px}
+            a{color:#fff;text-decoration:none;font-size:17px;font-weight:600;padding:10px 16px;
+            border-radius:12px;background:rgba(255,255,255,.14)}
+            main{height:calc(100% - 64px);display:flex;align-items:center;
             justify-content:center;overflow:hidden;background:#111}
             img{display:block;width:auto;height:auto;max-width:100%;max-height:100%;
             object-fit:contain;background:#fff}
             #error{padding:24px;text-align:center}</style></head>
-            <body><header><a href="${Papers.forEdition(edition).offlineOrigin}article/$id">Back to story text</a></header>
-            <main><img src="images/$id.jpg" alt="${htmlEscape(edition.articles.firstOrNull { it.id == id }?.title ?: "Story image")}"
+            <body><header><a href="${htmlEscape(backHref)}">&#8592; ${htmlEscape(backLabel)}</a></header>
+            <main><img src="${htmlEscape(imageSrc)}" alt="${htmlEscape(imageAlt)}"
                 onerror="this.hidden=true;document.getElementById('error').hidden=false">
-            <div id="error" hidden>Image could not be displayed.</div></main></body></html>
+            <div id="error" hidden>Image could not be displayed.</div></main>
+            <script>
+            (() => {
+              const back = document.querySelector('header a').href;
+              document.body.addEventListener('click', event => {
+                if (event.target.closest('img') || event.target.closest('header a')) return;
+                location.href = back;
+              });
+            })();
+            </script></body></html>
         """.trimIndent()
         webView.loadDataWithBaseURL(baseUrl, html, "text/html", "UTF-8", null)
     }
