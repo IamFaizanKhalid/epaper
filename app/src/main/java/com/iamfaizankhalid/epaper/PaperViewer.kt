@@ -138,11 +138,16 @@ class WebPaperViewer : PaperViewer {
         val paragraphs = article.paragraphs.joinToString("") {
             "<p>${escape(it)}</p>"
         }
-        val images = article.imageUrls.mapIndexed { index, imageUrl ->
+        val articleWithImages = if (article.imageUrls.isEmpty()) {
+            article.copy(imageUrls = listOfNotNull(paper.articleImageUrl(article.id)))
+        } else {
+            article
+        }
+        val images = articleWithImages.imageUrls.mapIndexed { index, imageUrl ->
             val localImage = directory?.let {
-                edition.articleImageFile(it, article, index)
+                edition.articleImageFile(it, articleWithImages, index)
             }?.takeIf { it.isFile }?.let {
-                paper.localArticleImageUrl(article.id, index)
+                paper.localArticleImageUrl(articleWithImages.id, index)
             }
             val image = """<img src="${escape(localImage ?: imageUrl)}" alt="" loading="lazy">"""
             val target = if (paper.supportsInlineArticleImages) {

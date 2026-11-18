@@ -245,16 +245,13 @@ private class DawnPaper : Paper {
         if (data.has("error")) throw IllegalStateException(data.getString("error"))
         val paragraphs = data.getJSONArray("paragraphs").toStringList()
         val extractedImages = data.optJSONArray("imageUrls")?.toStringList().orEmpty()
+        val images = extractedImages.ifEmpty { listOfNotNull(articleImageUrl(storyId)) }
         val article = NewspaperArticle(
             storyId,
             data.getString("title"),
             data.optString("byline"),
             paragraphs,
-            if (paragraphs.isEmpty()) {
-                listOfNotNull(articleImageUrl(storyId))
-            } else {
-                extractedImages
-            }
+            images
         )
         require(article.title.isNotBlank() &&
             (article.paragraphs.isNotEmpty() || article.imageUrls.isNotEmpty())) {

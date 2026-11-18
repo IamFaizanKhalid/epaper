@@ -1095,6 +1095,9 @@ class MainActivity : Activity() {
                 elevation = dp(2).toFloat()
             }
         }
+        dateButton.contentDescription = "Choose newspaper date"
+        previousDateButton.contentDescription = "Previous date"
+        nextDateButton.contentDescription = "Next date"
         val homeContent = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(24), dp(24), dp(24), dp(32))
@@ -1727,6 +1730,8 @@ class MainActivity : Activity() {
         webView.settings.builtInZoomControls = !enabled
         webView.settings.displayZoomControls = false
         papersButton.text = if (enabled) "Back" else "Papers"
+        papersButton.contentDescription =
+            if (enabled) "Back to newspaper page" else "Return to newspapers"
         setButtonIcon(
             papersButton,
             if (enabled) android.R.drawable.ic_media_previous
@@ -3341,7 +3346,7 @@ class MainActivity : Activity() {
             contentDescription = "Remove saved story"
             setOnClickListener { confirmRemoveSavedStory(saved) }
         }
-        metadataRow.addView(remove, LinearLayout.LayoutParams(dp(40), dp(40)))
+        metadataRow.addView(remove, LinearLayout.LayoutParams(dp(48), dp(48)))
         card.addView(storyTitle)
         card.addView(metadataRow)
         return card
@@ -4591,22 +4596,29 @@ class MainActivity : Activity() {
     ): Button =
         Button(this).apply {
             text = label
-            textSize = if (resources.configuration.screenWidthDp < 600) 12f else 15f
+            textSize = if (resources.configuration.screenWidthDp < 600) 13f else 16f
             isAllCaps = false
-            minHeight = dp(48)
-            minWidth = 0
-            setPadding(dp(2), 0, dp(2), 0)
+            minHeight = dp(52)
+            minWidth = dp(48)
+            setPadding(dp(12), dp(4), dp(12), dp(4))
+            gravity = Gravity.CENTER
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
             if (iconResource != 0) {
                 val icon = getDrawable(iconResource)?.mutate()?.apply {
                     setTint(primaryTextColor())
                 }
                 setCompoundDrawablesWithIntrinsicBounds(icon, null, null, null)
-                compoundDrawablePadding = dp(6)
+                compoundDrawablePadding = dp(8)
             }
-            backgroundTintList = ColorStateList.valueOf(
-                if (darkTheme) Color.rgb(54, 74, 88) else Color.rgb(230, 239, 245)
+            val fill = if (darkTheme) Color.rgb(54, 74, 88) else Color.rgb(230, 239, 245)
+            background = android.graphics.drawable.RippleDrawable(
+                ColorStateList.valueOf(if (darkTheme) 0x33FFFFFF else 0x22000000),
+                roundedBackground(fill, dp(14)),
+                null
             )
             setTextColor(primaryTextColor())
+            if (label.isNotBlank()) contentDescription = label
             setOnClickListener { onClick() }
         }
 
