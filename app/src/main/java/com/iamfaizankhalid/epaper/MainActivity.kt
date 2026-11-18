@@ -8,6 +8,7 @@ import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
+import android.os.Build
 import android.os.Handler
 import android.os.Bundle
 import android.os.Looper
@@ -219,6 +220,11 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         darkTheme = resources.getBoolean(R.bool.is_dark_theme)
+        if (Build.VERSION.SDK_INT == Build.VERSION_CODES.O && !darkTheme) {
+            @Suppress("DEPRECATION")
+            window.decorView.systemUiVisibility =
+                window.decorView.systemUiVisibility or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
+        }
         selectedDate.timeInMillis = savedInstanceState?.getLong(STATE_SELECTED_DATE)
             ?: selectedDate.timeInMillis
         dateFollowsToday = savedInstanceState?.getBoolean(STATE_DATE_FOLLOWING_TODAY)
