@@ -131,13 +131,8 @@ data class NewspaperEdition(
         )
     }
 
-    fun articleImageFile(directory: File, article: NewspaperArticle, index: Int): File? {
-        val source = article.imageUrls.getOrNull(index) ?: return null
-        val url = Papers[paperId].validatedArticleImageUrl(source) ?: return null
-        val extension = url.path.substringAfterLast('.').lowercase()
-        val safeArticleId = article.id.replace(Regex("[^A-Za-z0-9_-]"), "_")
-        return File(File(directory, "article-images"), "$safeArticleId-$index.$extension")
-    }
+    fun articleImageFile(directory: File, article: NewspaperArticle, index: Int): File? =
+        articleImageFile(paperId, directory, article, index)
 
     fun hasArticleImages(directory: File): Boolean =
         articles.all { article ->
@@ -1181,6 +1176,19 @@ data class NewspaperEdition(
             isFile && length() > 2 && inputStream().use {
                 it.read() == 0xff && it.read() == 0xd8
             }
+
+        fun articleImageFile(
+            paperId: NewspaperId,
+            directory: File,
+            article: NewspaperArticle,
+            index: Int
+        ): File? {
+            val source = article.imageUrls.getOrNull(index) ?: return null
+            val url = Papers[paperId].validatedArticleImageUrl(source) ?: return null
+            val extension = url.path.substringAfterLast('.').lowercase()
+            val safeArticleId = article.id.replace(Regex("[^A-Za-z0-9_-]"), "_")
+            return File(File(directory, "article-images"), "$safeArticleId-$index.$extension")
+        }
 
         private fun File.isImageFile(): Boolean =
             isJpeg() || (isFile && extension == "png" && inputStream().use {

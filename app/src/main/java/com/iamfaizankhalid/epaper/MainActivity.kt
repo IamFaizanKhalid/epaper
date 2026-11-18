@@ -27,7 +27,6 @@ import android.webkit.WebViewClient
 import android.webkit.JavascriptInterface
 import android.widget.Button
 import android.widget.FrameLayout
-import android.widget.GridLayout
 import android.widget.ImageButton
 import android.widget.ImageView
 import android.widget.LinearLayout
@@ -3260,113 +3259,145 @@ class MainActivity : Activity() {
             })
             return
         }
-        val grid = GridLayout(this).apply {
-            columnCount = 2
-        }
-        savedStories.forEach { saved ->
-            val card = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                setPadding(dp(10), dp(10), dp(10), dp(10))
-                background = roundedBackground(surfaceColor(), dp(14))
-                elevation = dp(1).toFloat()
-                isClickable = true
-                isFocusable = true
-                setOnClickListener { openSavedStory(saved) }
-            }
-            val thumbnail = ImageView(this).apply {
-                scaleType = ImageView.ScaleType.CENTER_CROP
-                background = roundedBackground(Color.LTGRAY, dp(10))
-                clipToOutline = true
-                setImageResource(R.drawable.ic_story_placeholder)
-                contentDescription = saved.article.title
-            }
-            card.addView(thumbnail, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                dp(150)
-            ))
-            loadSavedStoryThumbnail(saved, thumbnail)
-            val storyTitle = TextView(this).apply {
-                text = saved.article.title
-                textSize = 18f
-                maxLines = 2
-                ellipsize = android.text.TextUtils.TruncateAt.END
-                setTypeface(typeface, android.graphics.Typeface.BOLD)
-                setTextColor(primaryTextColor())
-                setPadding(0, dp(10), 0, 0)
-            }
-            val metadataRow = LinearLayout(this).apply {
+        savedStories.chunked(2).forEach { rowStories ->
+            val row = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                setPadding(0, dp(4), 0, 0)
             }
-            val metadata = TextView(this).apply {
-                text = "${saved.paperId.displayName} · ${formatDate(saved.date)}"
-                textSize = 14f
-                setTextColor(secondaryTextColor())
-            }
-            metadataRow.addView(
-                metadata,
-                LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-            )
-            val remove = ImageButton(this).apply {
-                setImageResource(android.R.drawable.ic_menu_close_clear_cancel)
-                setColorFilter(
-                    if (darkTheme) Color.rgb(255, 150, 150) else Color.rgb(170, 55, 55)
+            rowStories.forEach { saved ->
+                row.addView(
+                    buildSavedStoryCard(saved),
+                    LinearLayout.LayoutParams(
+                        0,
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                        1f
+                    ).apply {
+                        setMargins(dp(5), dp(5), dp(5), dp(5))
+                    }
                 )
-                setBackgroundColor(Color.TRANSPARENT)
-                contentDescription = "Remove saved story"
-                setOnClickListener { confirmRemoveSavedStory(saved) }
             }
-            metadataRow.addView(remove, LinearLayout.LayoutParams(dp(40), dp(40)))
-            card.addView(storyTitle)
-            card.addView(metadataRow)
-            grid.addView(
-                card,
-                GridLayout.LayoutParams().apply {
-                    width = 0
-                    height = GridLayout.LayoutParams.WRAP_CONTENT
-                    columnSpec = GridLayout.spec(GridLayout.UNDEFINED, 1, 1f)
-                    setMargins(dp(5), dp(5), dp(5), dp(5))
-                }
-            )
+            if (rowStories.size == 1) {
+                row.addView(
+                    View(this),
+                    LinearLayout.LayoutParams(0, 1, 1f).apply {
+                        setMargins(dp(5), dp(5), dp(5), dp(5))
+                    }
+                )
+            }
+            savedStoriesList.addView(row)
         }
-        savedStoriesList.addView(grid)
+    }
+
+    private fun buildSavedStoryCard(saved: SavedStory): LinearLayout {
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(10), dp(10), dp(10), dp(10))
+            background = roundedBackground(surfaceColor(), dp(14))
+            elevation = dp(1).toFloat()
+            isClickable = true
+            isFocusable = true
+            setOnClickListener { openSavedStory(saved) }
+        }
+        val thumbnail = ImageView(this).apply {
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            background = roundedBackground(Color.LTGRAY, dp(10))
+            clipToOutline = true
+            setImageResource(R.drawable.ic_story_placeholder)
+            contentDescription = saved.article.title
+        }
+        card.addView(thumbnail, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            dp(150)
+        ))
+        loadSavedStoryThumbnail(saved, thumbnail)
+        val storyTitle = TextView(this).apply {
+            text = saved.article.title
+            textSize = 18f
+            maxLines = 2
+            ellipsize = android.text.TextUtils.TruncateAt.END
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+            setTextColor(primaryTextColor())
+            setPadding(0, dp(10), 0, 0)
+        }
+        val metadataRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(4), 0, 0)
+        }
+        val metadata = TextView(this).apply {
+            text = "${saved.paperId.displayName} · ${formatDate(saved.date)}"
+            textSize = 14f
+            setTextColor(secondaryTextColor())
+        }
+        metadataRow.addView(
+            metadata,
+            LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        )
+        val remove = ImageButton(this).apply {
+            setImageResource(android.R.drawable.ic_menu_close_clear_cancel)
+            setColorFilter(
+                if (darkTheme) Color.rgb(255, 150, 150) else Color.rgb(170, 55, 55)
+            )
+            setBackgroundColor(Color.TRANSPARENT)
+            contentDescription = "Remove saved story"
+            setOnClickListener { confirmRemoveSavedStory(saved) }
+        }
+        metadataRow.addView(remove, LinearLayout.LayoutParams(dp(40), dp(40)))
+        card.addView(storyTitle)
+        card.addView(metadataRow)
+        return card
     }
 
     private fun loadSavedStoryThumbnail(saved: SavedStory, image: ImageView) {
-        val edition = offlineEditionCache[saved.paperId to saved.date]?.edition
-            ?: offlineEdition?.takeIf {
-                it.paperId == saved.paperId && it.date == saved.date
-            }
         val directory = Papers[saved.paperId].editionDirectory(
             File(filesDir, "editions"),
             saved.date
         )
-        val localImage = edition?.let {
-            saved.article.imageUrls.indices.firstNotNullOfOrNull { index ->
-                it.articleImageFile(directory, saved.article, index)?.takeIf(File::isFile)
-            }
+        val localImage = saved.article.imageUrls.indices.firstNotNullOfOrNull { index ->
+            NewspaperEdition.articleImageFile(
+                saved.paperId,
+                directory,
+                saved.article,
+                index
+            )?.takeIf(File::isFile)
         }
         if (localImage != null) {
             image.setImageBitmap(BitmapFactory.decodeFile(localImage.absolutePath))
             return
         }
-        val url = saved.article.imageUrls.firstOrNull()?.takeIf {
-            it.startsWith("https://")
+        val remote = saved.article.imageUrls.indices.firstNotNullOfOrNull { index ->
+            saved.article.imageUrls[index].takeIf { it.startsWith("https://") }
+                ?.let { index to it }
         } ?: return
+        val (imageIndex, url) = remote
         image.tag = url
         downloadExecutor.execute {
-            val bitmap = try {
+            val bytes = try {
                 val connection = java.net.URL(url).openConnection() as java.net.HttpURLConnection
                 connection.connectTimeout = 10_000
                 connection.readTimeout = 15_000
                 connection.instanceFollowRedirects = true
                 connection.setRequestProperty("User-Agent", "Mozilla/5.0")
-                connection.inputStream.use { BitmapFactory.decodeStream(it) }
+                connection.inputStream.use { it.readBytes() }
             } catch (error: Exception) {
                 null
+            } ?: return@execute
+            val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return@execute
+            if (bytes.size <= 25 * 1024 * 1024) {
+                NewspaperEdition.articleImageFile(
+                    saved.paperId,
+                    directory,
+                    saved.article,
+                    imageIndex
+                )?.let { cacheFile ->
+                    runCatching {
+                        cacheFile.parentFile?.mkdirs()
+                        val temporary = File(cacheFile.parentFile, "${cacheFile.name}.tmp")
+                        temporary.writeBytes(bytes)
+                        if (cacheFile.exists()) cacheFile.delete()
+                        temporary.renameTo(cacheFile)
+                    }
+                }
             }
-            if (bitmap == null) return@execute
             runOnUiThread {
                 if (image.tag == url) image.setImageBitmap(bitmap)
             }
