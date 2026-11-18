@@ -72,8 +72,7 @@ class MainActivity : Activity() {
     private data class PaperHomeItem(
         val paper: Paper,
         val status: TextView,
-        val downloadIndicator: ProgressBar,
-        val downloadAction: ImageButton
+        val downloadIndicator: ProgressBar
     )
 
     private data class OfflineEditionCache(
@@ -939,33 +938,6 @@ class MainActivity : Activity() {
             edition.hasArticleImages(directory)
     }
 
-    private fun toggleEditionDownload(paperId: NewspaperId) {
-        val edition = editionInProgress ?: return
-        if (edition.paperId != paperId || edition.date != selectedDateKey() ||
-            !isToday(edition.date)
-        ) return
-        if (editionDownloadPaused) {
-            synchronized(editionDownloadMonitor) {
-                editionDownloadPaused = false
-                editionResumeLatch.countDown()
-            }
-            synchronized(pageDownloadLock) {
-                startPageDownloadWorkerLocked()
-            }
-            if (editionScanWaitingForResume) {
-                editionScanWaitingForResume = false
-                loadNextEditionPage()
-            }
-            startNextTextStory()
-        } else {
-            synchronized(editionDownloadMonitor) {
-                editionResumeLatch = CountDownLatch(1)
-                editionDownloadPaused = true
-            }
-        }
-        refreshDownloadIndicator()
-    }
-
     private fun clearEditionDownloadPause() {
         synchronized(editionDownloadMonitor) {
             editionDownloadPaused = false
@@ -1102,7 +1074,7 @@ class MainActivity : Activity() {
         nextDateButton = button("") { navigateDate(1) }
         listOf(previousDateButton, nextDateButton).forEach { navigationButton ->
             navigationButton.apply {
-                textSize = 12f
+                textSize = 14f
                 isAllCaps = false
                 minHeight = dp(52)
                 setPadding(dp(8), 0, dp(8), 0)
@@ -1121,13 +1093,13 @@ class MainActivity : Activity() {
         }
         val title = TextView(this).apply {
             text = "Newspapers"
-            textSize = 30f
+            textSize = 32f
             setTypeface(typeface, android.graphics.Typeface.BOLD)
             setTextColor(primaryTextColor())
             setPadding(0, 0, 0, dp(20))
         }
         pageLabel = TextView(this).apply {
-            textSize = 16f
+            textSize = 18f
             setTextColor(secondaryTextColor())
             setPadding(dp(20), dp(12), dp(20), dp(12))
             background = roundedBackground(surfaceColor(), dp(12))
@@ -1162,15 +1134,15 @@ class MainActivity : Activity() {
             }
             val name = TextView(this).apply {
                 text = paper.id.displayName
-                textSize = 21f
+                textSize = 24f
                 setTypeface(typeface, android.graphics.Typeface.BOLD)
                 setTextColor(primaryTextColor())
             }
             val status = TextView(this).apply {
                 text = if (isToday(selectedDateKey())) "Not available yet" else "Not opened"
-                textSize = 13f
+                textSize = 15f
                 gravity = Gravity.CENTER
-                maxWidth = dp(160)
+                maxWidth = dp(180)
                 setTextColor(secondaryTextColor())
                 setPadding(dp(10), dp(5), dp(10), dp(5))
                 visibility = View.VISIBLE
@@ -1187,12 +1159,6 @@ class MainActivity : Activity() {
                 visibility = View.GONE
                 isIndeterminate = true
             }
-            val downloadAction = ImageButton(this).apply {
-                visibility = View.GONE
-                contentDescription = "Pause edition download"
-                setBackgroundColor(Color.TRANSPARENT)
-                setOnClickListener { toggleEditionDownload(paper.id) }
-            }
             info.addView(name)
             row.addView(
                 info,
@@ -1203,7 +1169,6 @@ class MainActivity : Activity() {
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ))
-            row.addView(downloadAction, LinearLayout.LayoutParams(dp(40), dp(40)))
             val rowParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
@@ -1213,8 +1178,7 @@ class MainActivity : Activity() {
             paperHomeItems[paper.id] = PaperHomeItem(
                 paper,
                 status,
-                downloadIndicator,
-                downloadAction
+                downloadIndicator
             )
         }
 
@@ -4558,7 +4522,6 @@ class MainActivity : Activity() {
         if (!isToday(date)) {
             paperHomeItems.values.forEach {
                 it.downloadIndicator.visibility = View.GONE
-                it.downloadAction.visibility = View.GONE
             }
             return
         }
@@ -4593,24 +4556,6 @@ class MainActivity : Activity() {
                 loading
             ) View.VISIBLE else View.GONE
             refreshPaperStatus(item)
-            val canControlEditionDownload = editionDownloadActive &&
-                activeEdition?.paperId == paperId
-            item.downloadAction.apply {
-                visibility = if (canControlEditionDownload) View.VISIBLE else View.GONE
-                setImageResource(
-                    if (editionDownloadPaused) {
-                        android.R.drawable.ic_media_play
-                    } else {
-                        android.R.drawable.ic_media_pause
-                    }
-                )
-                setColorFilter(primaryTextColor())
-                contentDescription = if (editionDownloadPaused) {
-                    "Resume ${item.paper.id.displayName} download"
-                } else {
-                    "Pause ${item.paper.id.displayName} download"
-                }
-            }
         }
     }
 
